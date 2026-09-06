@@ -1,0 +1,83 @@
+/* SPDX-License-Identifier: CC0-1.0
+ * SPDX-FileCopyrightText: 2026 RVLab Student Project
+ *
+ * Host-side harness: runs the exact same engine sources natively so the
+ * quantised result can be compared against the PyTorch golden reference
+ * without waiting for the FPGA.
+ *
+ * Because every inner loop is integer, the host and RISC-V builds are expected
+ * to produce bit-identical output; comparing them is how the port is verified
+ * on hardware.
+ *
+ * Build:  make -C src/sw/project/host
+ * Run:    ./dav2_host build/dav2/dav2_weights.bin out.bin
+ */
+
+#include "../dav2.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+void dav2_progress(const char *stage)
+{
+    printf("  [%s]\n", stage);
+    fflush(stdout);
+}
+
+int main(int argc, char **argv)
+{
+    if (argc < 3) {
+        fprintf(stderr, "usage: %s <dav2_weights.bin> <out.bin> [arena_mb]\n", argv[0]);
+        return 2;
+    }
+    const size_t arena_mb = (argc > 3) ? (size_t)atoi(argv[3]) : 256;
+
+    FILE *f = fopen(argv[1], "rb");
+    if (!f) { perror(argv[1]); return 1; }
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    void *blob = malloc((size_t)n);
+    if (fread(blob, 1, (size_t)n, f) != (size_t)n) { perror("read"); return 1; }
+    fclose(f);
+    printf("loaded %ld bytes of weights\n", n);
+
+    void *arena = malloc(arena_mb << 20);
+    if (!arena) { fprintf(stderr, "arena alloc failed\n"); return 1; }
+
+    dav2_blob_init(blob);
+    dav2_arena_init(arena, arena_mb << 20);
+
+    /* configuration comes from the generated header */
+#include "dav2_blob_config.h"
+    dav2_cfg_t cfg = { DAV2_INPUT_SIZE, DAV2_PATCH_GRID, DAV2_N_TOKENS };
+
+    const int out_size = cfg.grid * DAV2_PATCH;
+    float *depth = (float *)malloc((size_t)out_size * out_size * sizeof(float));
+
+    printf("running inference at %dx%d (%d patches)\n",
+           cfg.size, cfg.size, cfg.grid * cfg.grid);
+    dav2_infer(&cfg, depth);
+
+    printf("arena peak: %.2f MB\n", (double)dav2_arena_peak() / 1e6);
+#ifdef DAV2_TRACE
+    {
+        extern double dav2_mac_count, dav2_elem_count;
+        printf("total MACs: %.3f G   requantised elements: %.3f M\n",
+               dav2_mac_count / 1e9, dav2_elem_count / 1e6);
+        /* CV32E40P is single-issue in-order: each MAC costs one lw (int16
+         * activation from BRAM tile), one lb (int8 weight from DDR3), one mul
+         * and one add, and the loop is unrolled by 4. */
+        for (int cpm = 4; cpm <= 8; cpm += 2)
+            printf("  at %d cycles/MAC and 100 MHz: %.1f s/frame\n",
+                   cpm, dav2_mac_count * cpm / 1e8);
+    }
+#endif
+
+    FILE *o = fopen(argv[2], "wb");
+    fwrite(depth, sizeof(float), (size_t)out_size * out_size, o);
+    fclose(o);
+    printf("wrote %s (%dx%d floats)\n", argv[2], out_size, out_size);
+    return 0;
+}

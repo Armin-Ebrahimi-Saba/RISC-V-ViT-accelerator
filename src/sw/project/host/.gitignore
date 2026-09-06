@@ -1,0 +1,5 @@
+# Host verification binaries (build with `make`)
+dav2_host
+dav2_selftest
+dav2_trace
+dav2_cost

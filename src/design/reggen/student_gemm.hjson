@@ -1,0 +1,193 @@
+// SPDX-License-Identifier: CC0-1.0
+// SPDX-FileCopyrightText: 2026 RVLab Student Project
+
+// Register interface of the int8 GEMM accelerator (student_gemm.sv).
+//
+// One job computes, for a tile of N_ROWS activation rows and M weight rows:
+//
+//   C[m][t] = sum_{k=0}^{K-1} A[t][k] * W[m][k]
+//
+//   A : N_ROWS x K  int16   at A_ADDR, row-major, contiguous (stride K*2 bytes)
+//   W : M      x K  int8    at W_ADDR, row-major, contiguous (stride K   bytes)
+//   C : M x N_ROWS  int32   at C_ADDR, one contiguous run of N_ROWS words per
+//                           m, consecutive m separated by C_STRIDE bytes
+//
+// The transposed C layout keeps every burst the accelerator writes contiguous,
+// which matters because the DDR3 last-level cache is direct-mapped.
+//
+// Constraints (software must check CAPS and fall back to the C kernel):
+//   K   multiple of 4, 4 <= K <= CAPS.KMAX
+//   N   1 <= N_ROWS <= CAPS.NROWS
+//   all three addresses 4-byte aligned
+
+{
+  name: "student_gemm"
+  clock_primary: sys_clk
+  bus_device: tlul
+  bus_host: none
+  available_input_list: []
+  available_output_list: []
+  regwidth: "32"
+  registers:
+  [
+    {
+      name: status
+      desc: "Status flags"
+      swaccess: ro
+      hwaccess: hwo
+      hwext: "true"
+      fields:
+      [
+        {
+          bits: 2:0
+          name: "val"
+          desc: "bit0 = busy, bit1 = done (job finished since last start), bit2 = bus error latched"
+        }
+      ]
+    }
+    {
+      name: ctrl
+      desc: "Command. Writing start while idle latches the configuration and runs one job."
+      swaccess: wo
+      hwaccess: hro
+      hwext: "true"
+      hwqe: "true"
+      fields:
+      [
+        {
+          bits: 0
+          name: "start"
+          desc: "1 - start a job"
+        }
+      ]
+    }
+    {
+      name: a_addr
+      desc: "Byte address of the activation tile (int16, N_ROWS x K). Must be 4-byte aligned."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: w_addr
+      desc: "Byte address of the weight matrix (int8, M x K). Must be 4-byte aligned."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: c_addr
+      desc: "Byte address of the first output run (int32). Must be 4-byte aligned."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: c_stride
+      desc: "Byte distance between the output runs of consecutive weight rows m."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: k_len
+      desc: "Reduction length K. Multiple of 4, at most CAPS.KMAX."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 15:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: m_len
+      desc: "Number of weight rows M."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 15:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: n_rows
+      desc: "Number of activation rows in this tile, at most CAPS.NROWS."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 7:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: caps
+      desc: "Hardware capabilities: bits [7:0] = NROWS, bits [23:8] = KMAX. Reads 0 when no accelerator is present."
+      swaccess: ro
+      hwaccess: hwo
+      hwext: "true"
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: cycles
+      desc: "Cycles the last (or current) job has been busy."
+      swaccess: ro
+      hwaccess: hwo
+      hwext: "true"
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+  ]
+}
