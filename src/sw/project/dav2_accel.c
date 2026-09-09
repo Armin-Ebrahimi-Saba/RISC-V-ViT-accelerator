@@ -37,10 +37,28 @@
 #define GEMM_N_ROWS   STUDENT_GEMM_N_ROWS(0)
 #define GEMM_CAPS     STUDENT_GEMM_CAPS(0)
 #define GEMM_CYCLES   STUDENT_GEMM_CYCLES(0)
+#define GEMM_DBG      STUDENT_GEMM_DBG(0)
+#define GEMM_DBG2     STUDENT_GEMM_DBG2(0)
+#define GEMM_DBG3     STUDENT_GEMM_DBG3(0)
+#define GEMM_DBG4     STUDENT_GEMM_DBG4(0)
 
 #define STATUS_BUSY 0x1u
 #define STATUS_DONE 0x2u
 #define STATUS_ERR  0x4u
+
+static uint32_t accel_mcycle(void)
+{
+    uint32_t v;
+    __asm__ volatile ("csrr %0, mcycle" : "=r"(v));
+    return v;
+}
+
+/* Deliberately huge. An earlier 200M-cycle bound disabled a perfectly correct
+ * accelerator: simulation against a slow, shallow memory shows the block is
+ * latency-bound rather than stalled (0.116 MAC/cycle vs 12.4 against a fast
+ * model), and real DDR3 here is slower still. This exists only to stop a true
+ * hardware hang wedging the program forever, not to police throughput. */
+#define ACCEL_TIMEOUT_CYCLES 2000000000u
 
 static int      accel_probed;
 static int      accel_ok;
@@ -115,8 +133,58 @@ int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc)
         REG32(GEMM_N_ROWS) = (uint32_t)nt;
         REG32(GEMM_CTRL)   = 1u;
 
-        while (REG32(GEMM_STATUS) & STATUS_BUSY)
-            ;
+        /* Bounded wait. The block has only ever been exercised against BRAM
+         * (dav2_accel_check runs from .bss); the model's tensors live in the
+         * DDR3 arena, so a stall that never appears in simulation or at boot
+         * is possible here. An unbounded poll would wedge the program with no
+         * diagnostic at all. */
+        {
+            uint32_t t0 = accel_mcycle();
+            while (REG32(GEMM_STATUS) & STATUS_BUSY) {
+                if ((accel_mcycle() - t0) > ACCEL_TIMEOUT_CYCLES) {
+                    uint32_t d0 = REG32(GEMM_DBG);
+                    uint32_t c0 = REG32(GEMM_CYCLES);
+                    /* Sample twice: if rd_left or cycles move, the block is
+                     * advancing and this is throughput, not a deadlock. */
+                    for (volatile int w = 0; w < 200000; w++) ;
+                    uint32_t d1 = REG32(GEMM_DBG);
+                    uint32_t c1 = REG32(GEMM_CYCLES);
+                    printf("GEMM accelerator: TIMEOUT status=0x%08lx "
+                           "N=%d K=%d M=%d nt=%d a=%08lx w=%08lx c=%08lx\n",
+                           (unsigned long)REG32(GEMM_STATUS), N, K, M, nt,
+                           (unsigned long)(uintptr_t)(a->v + (size_t)n0 * K),
+                           (unsigned long)(uintptr_t)wt->w,
+                           (unsigned long)(uintptr_t)(acc + n0));
+                    printf("  dbg0=%08lx state=%lu rb_cnt=%lu wr_out=%lu "
+                           "rd_left=%lu cycles=%lu\n",
+                           (unsigned long)d0, (unsigned long)(d0 & 7u),
+                           (unsigned long)((d0 >> 4) & 15u),
+                           (unsigned long)((d0 >> 8) & 15u),
+                           (unsigned long)(d0 >> 16), (unsigned long)c0);
+                    printf("  dbg1=%08lx state=%lu rb_cnt=%lu wr_out=%lu "
+                           "rd_left=%lu cycles=%lu  (delta cycles=%lu)\n",
+                           (unsigned long)d1, (unsigned long)(d1 & 7u),
+                           (unsigned long)((d1 >> 4) & 15u),
+                           (unsigned long)((d1 >> 8) & 15u),
+                           (unsigned long)(d1 >> 16), (unsigned long)c1,
+                           (unsigned long)(c1 - c0));
+                    /* The decisive pair: was the outstanding request ever
+                     * accepted, and did a response ever come back? */
+                    printf("  bus: areq_valid=%lu a_ready=%lu d_valid=%lu "
+                           "err=%lu addr=%08lx accepted=%lu responses=%lu\n",
+                           (unsigned long)((d1 >> 12) & 1u),
+                           (unsigned long)((d1 >> 13) & 1u),
+                           (unsigned long)((d1 >> 14) & 1u),
+                           (unsigned long)((d1 >> 15) & 1u),
+                           (unsigned long)REG32(GEMM_DBG2),
+                           (unsigned long)REG32(GEMM_DBG3),
+                           (unsigned long)REG32(GEMM_DBG4));
+                    printf("GEMM accelerator: disabled, using the CPU kernel\n");
+                    accel_ok = 0;
+                    return 0;
+                }
+            }
+        }
 
         if (REG32(GEMM_STATUS) & STATUS_ERR) {
             /* A bus error means acc is partly garbage and the block cannot be
@@ -126,8 +194,23 @@ int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc)
             return 0;
         }
 
-        accel_cycles += REG32(GEMM_CYCLES);
-        accel_jobs++;
+        {
+            uint32_t jc = REG32(GEMM_CYCLES);
+            accel_cycles += jc;
+            accel_jobs++;
+            /* First few jobs only: enough to measure cycles-per-beat on real
+             * DDR3 without flooding the hostio link. */
+            /* Print the first few tiles of each large job. dbg4 packs the
+             * retry count in its high half, which is the number that says
+             * whether lost-response recovery is rare or constant. */
+            if (M >= 64 && nt >= 1 && accel_jobs <= 120) {
+                uint32_t d4 = REG32(GEMM_DBG4);
+                printf("  tile: %lu cycles, %lu beats, retries=%lu, rsps=%lu\n",
+                       (unsigned long)jc,
+                       (unsigned long)((size_t)M * (K / 4) + (size_t)nt * (K / 2)),
+                       (unsigned long)(d4 >> 16), (unsigned long)(d4 & 0xffffu));
+            }
+        }
     }
 
     return 1;

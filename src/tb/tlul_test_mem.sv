@@ -18,7 +18,11 @@ module tlul_test_mem #(
     parameter logic [31:0] BASE_ADDR  = 32'h8000_0000,
     parameter int unsigned DEPTH      = 8,     // requests accepted in flight
     parameter int unsigned MIN_LAT    = 2,
-    parameter int unsigned MAX_LAT    = 12
+    parameter int unsigned MAX_LAT    = 12,
+    // Drop the response to the Nth read accepted (0 = never). Models the
+    // measured board failure: rvlab_ddr_block_cache pulses d_valid for one
+    // cycle without consulting d_ready, so a response can vanish entirely.
+    parameter int unsigned DROP_NTH_RD = 0
 ) (
     input  logic              clk_i,
     input  logic              rst_ni,
@@ -35,6 +39,7 @@ module tlul_test_mem #(
   logic                     p_read [DEPTH];
   logic [31:0]              p_data [DEPTH];
 
+  int rd_seen;
   int rot;
   int free_slot;
   int rsp_slot;
@@ -74,6 +79,7 @@ module tlul_test_mem #(
     if (!rst_ni) begin
       for (int i = 0; i < DEPTH; i++) p_val[i] <= 1'b0;
       rot <= 0;
+      rd_seen <= 0;
     end else begin
       rot <= (rot + 1) % DEPTH;
 
@@ -85,6 +91,14 @@ module tlul_test_mem #(
         if ((idx < 0) || (idx >= int'(SIZE_WORDS)))
           $fatal(1, "tlul_test_mem: address 0x%08x out of range", tl_i.a_address);
 
+        if (tl_i.a_opcode == tlul_pkg::Get) rd_seen <= rd_seen + 1;
+        // Accept the request, then never answer it.
+        if ((DROP_NTH_RD != 0) && (tl_i.a_opcode == tlul_pkg::Get) &&
+            (rd_seen + 1 == int'(DROP_NTH_RD))) begin
+          $display("tlul_test_mem: dropping response to read #%0d (addr %h)",
+                   rd_seen + 1, tl_i.a_address);
+          p_val [free_slot] <= 1'b0;
+        end else
         p_val [free_slot] <= 1'b1;
         p_cnt [free_slot] <= MIN_LAT + ($urandom % (MAX_LAT - MIN_LAT + 1));
         p_src [free_slot] <= tl_i.a_source;

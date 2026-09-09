@@ -60,6 +60,9 @@ module_tbs = [
     "student_tlul_mux_tb",
     "student_gemm_tb",
     "student_gemm_soc_tb",
+    "student_gemm_ddr_tb",
+    "student_gemm_ddrpath_tb",
+    "student_gemm_droprsp_tb",
 ]
 
 for name in module_tbs:

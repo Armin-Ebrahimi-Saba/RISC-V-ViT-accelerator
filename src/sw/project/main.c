@@ -29,6 +29,10 @@ void dav2_selftest_report(void);
 #define GO_ADDR     0x8F000000u
 #define GO_MAGIC    0xD00DFEEDu
 
+/* Handshake flag, polled by main() and written over JTAG by the host loader.
+ * Must live in BRAM -- see the comment at its use below. */
+volatile uint32_t dav2_go;
+
 static uint32_t cycles_lo(void)
 {
     uint32_t v;
@@ -104,11 +108,17 @@ int main(void)
     }
     printf("DDR3 ready.\n");
 
-    /* Wait for the host to place the weight blob in DDR3. */
-    volatile uint32_t *go = (volatile uint32_t *)GO_ADDR;
-    *go = 0;
+    /* Wait for the host to place the weight blob in DDR3.
+     *
+     * The flag lives in BRAM, not DDR3. A DDR3 handshake word does not work:
+     * once the debugger has pushed the blob through system bus access, the
+     * CPU stops observing debugger writes to DDR3 -- the core spins on a
+     * stale value forever even though a debugger read of the same address
+     * returns the new one. BRAM is not behind that cache, so a write here is
+     * seen immediately. The host finds this variable by symbol name. */
+    dav2_go = 0;
     printf("DAV2_WAITING_FOR_WEIGHTS\n");
-    while (*go != GO_MAGIC)
+    while (dav2_go != GO_MAGIC)
         ;
     printf("weights present (%u bytes expected)\n", (unsigned)DAV2_BLOB_BYTES);
 

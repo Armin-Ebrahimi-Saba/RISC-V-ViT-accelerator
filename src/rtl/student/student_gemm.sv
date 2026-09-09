@@ -44,7 +44,30 @@ module student_gemm #(
   // Largest supported reduction length K (the model needs 1536).
   parameter int unsigned KMAX        = 2048,
   // Read requests in flight (also the write-ack credit). Power of two.
-  parameter int unsigned OUTSTANDING = 8
+  parameter int unsigned OUTSTANDING = 8,
+  // Requests actually allowed in flight at once. The rvlab DDR3 path answers a
+  // request in the same cycle it accepts it -- rvlab_ddr_prefetch derives the
+  // response's ancillary from the request currently presented on its A channel
+  // -- so it cannot hold a transaction whose response comes later. Against that
+  // memory this must be 1; against BRAM the full OUTSTANDING depth works.
+  parameter int unsigned MAX_INFLIGHT = OUTSTANDING,
+  // Cycles an outstanding read may go unanswered before it is re-issued. The
+  // rvlab DDR3 cache pulses d_valid for one cycle without consulting d_ready,
+  // so a response can be lost outright -- measured on hardware as
+  // accepted=444, responses=443. Zero disables recovery. Must comfortably
+  // exceed worst-case memory latency so it never fires on a slow-but-live
+  // transaction.
+  // 2048 cycles = 41 us at 50 MHz. Measured on hardware: real work costs
+  // 8.3 cycles/beat, so this leaves a ~250x margin over typical latency and
+  // still far exceeds a miss-plus-refill. The original 65536 was a guess made
+  // before latency could be measured, and cost 383 x 65536 = 25.1M cycles per
+  // tile -- 98% of the tile time -- purely idling before each re-issue.
+  parameter int unsigned RETRY_CYCLES = 32'd2048,
+  // DEADLOCKS -- do not enable. Blocking writes while reads are outstanding
+  // hangs in ST_DRAIN: the read engine prefetches weight beats that are only
+  // consumed in ST_MAC, so rb_cnt never falls to zero, so no write can issue,
+  // so ST_DRAIN never completes. Kept only to document the dead end.
+  parameter bit          STRICT_SERIAL = 1'b0
 ) (
   input logic clk_i,
   input logic rst_ni,
@@ -124,8 +147,8 @@ module student_gemm #(
   tlul_pkg::tl_h2d_t areq_q;
   logic              areq_valid_q;
   logic              load_next;
+  logic              req_accepted;
 
-  assign load_next = ~areq_valid_q | tl_host_i.a_ready;
 
   always_comb begin
     tl_host_o          = areq_q;
@@ -147,7 +170,6 @@ module student_gemm #(
   logic [31:0]  rd_data;
   logic         rd_pop;
 
-  assign rd_can_issue = (rd_left_q != 32'd0) & (rb_cnt_q != CW'(OUTSTANDING));
   assign rd_valid     = (rb_cnt_q != '0) & rb_val_q[rb_rd_q];
   assign rd_data      = rb_data_q[rb_rd_q];
 
@@ -159,8 +181,50 @@ module student_gemm #(
 
   logic sel_wr, sel_rd, issue_wr, issue_rd;
 
-  assign sel_wr   = wr_req & (wr_out_q != CW'(OUTSTANDING));
-  assign sel_rd   = ~sel_wr & rd_can_issue;
+  // Lost-response recovery. With MAX_INFLIGHT=1 at most one read is in flight,
+  // so a single saved address and slot suffice to re-issue it.
+  logic [31:0]   retry_addr_q;
+  logic [SW-1:0] retry_slot_q;
+  logic [31:0]   retry_cnt_q;
+  logic          retry_pending_q;
+  logic          sel_retry, issue_retry, retry_expired;
+  logic [31:0]   retry_n_q;   // retries performed, for diagnostics
+
+  assign retry_expired = (RETRY_CYCLES != 0) & (retry_cnt_q == RETRY_CYCLES);
+  assign sel_retry     = retry_pending_q;
+  assign issue_retry   = load_next & sel_retry;
+
+  assign rd_can_issue = (rd_left_q != 32'd0) & (rb_cnt_q != CW'(MAX_INFLIGHT))
+                        & (STRICT_SERIAL ? (wr_out_q == '0) : 1'b1);
+
+  // STRICT_SERIAL: never have a read and a write outstanding at the same time.
+  //
+  // rvlab_ddr_block_cache asserts fe_rsp_o.d_valid for exactly one cycle on a
+  // hit and never looks at its front-end d_ready (grep: the only d_ready uses
+  // in that file are back-end). A response therefore evaporates if a FIFO
+  // between the cache and this block is full that cycle -- losing exactly one,
+  // which is what the board shows (accepted=444, responses=443). Keeping a
+  // single transaction in flight means never two responses converging at once.
+  assign sel_wr   = ~sel_retry & wr_req & (wr_out_q != CW'(MAX_INFLIGHT))
+                           & (STRICT_SERIAL ? (rb_cnt_q == '0) : 1'b1);
+  assign sel_rd   = ~sel_retry & ~sel_wr & rd_can_issue;
+  // Only load a new request when one is actually being issued. The previous
+  // formulation (~areq_valid_q | a_ready) reloaded areq_q speculatively
+  // whenever nothing was pending, which changed a_address while a transaction
+  // was still outstanding.
+  //
+  // rvlab_ddr_block_cache cannot tolerate that: its tag lookup is stall-gated
+  //     tag_rdata   <= tag_mem[stall ? access_idx_q : access_idx];
+  // but its dirty bit is not
+  //     dirty_rdata <= dirty_mem[access_idx];        // live bus index
+  // so once the address drifts mid-transaction the cache reloads the dirty
+  // flag from an unrelated set and evicts the same line forever. Holding the
+  // request stable until the next issue is what the CPU does, and costs
+  // nothing at MAX_INFLIGHT=1.
+  assign req_accepted = areq_valid_q & tl_host_i.a_ready;
+  assign load_next    = (~areq_valid_q | tl_host_i.a_ready)
+                        & (sel_wr | sel_rd | sel_retry);
+
   assign issue_wr = load_next & sel_wr;
   assign issue_rd = load_next & sel_rd;
 
@@ -176,21 +240,30 @@ module student_gemm #(
     if (!rst_ni) begin
       areq_q       <= '0;
       areq_valid_q <= 1'b0;
-    end else if (load_next) begin
+    end else begin
+      // Accepted and nothing new to issue: drop a_valid but keep areq_q, so
+      // the address stays put until the next real request.
+      if (req_accepted) areq_valid_q <= 1'b0;
+
+      if (load_next) begin
       areq_q <= '{
         a_opcode:  sel_wr ? tlul_pkg::PutFullData : tlul_pkg::Get,
         a_param:   3'h0,
         a_size:    top_pkg::TL_SZW'(2),   // 2^2 = 4 bytes
-        a_source:  sel_wr ? top_pkg::TL_AIW'({1'b1, wr_src_q})
-                          : top_pkg::TL_AIW'({1'b0, rb_wr_q}),
-        a_address: sel_wr ? wr_addr : rd_addr_q,
+        a_source:  sel_wr    ? top_pkg::TL_AIW'({1'b1, wr_src_q})
+                 : sel_retry ? top_pkg::TL_AIW'({1'b0, retry_slot_q})
+                             : top_pkg::TL_AIW'({1'b0, rb_wr_q}),
+        a_address: sel_wr    ? wr_addr
+                 : sel_retry ? retry_addr_q
+                             : rd_addr_q,
         a_mask:    4'hf,
         a_data:    sel_wr ? wr_data : 32'd0,
         a_user:    '0,
         a_valid:   1'b0,                  // driven separately
         d_ready:   1'b1
       };
-      areq_valid_q <= sel_wr | sel_rd;
+      areq_valid_q <= 1'b1;
+      end
     end
   end
 
@@ -370,6 +443,11 @@ module student_gemm #(
       rd_left_q   <= '0;
       rb_wr_q     <= '0;
       rb_rd_q     <= '0;
+      retry_addr_q    <= '0;
+      retry_slot_q    <= '0;
+      retry_cnt_q     <= '0;
+      retry_pending_q <= 1'b0;
+      retry_n_q       <= '0;
       rb_cnt_q    <= '0;
       wr_out_q    <= '0;
       wr_src_q    <= '0;
@@ -396,6 +474,27 @@ module student_gemm #(
       end
       if (rd_pop) begin
         rb_rd_q <= rb_rd_q + 1'b1;
+      end
+
+      // Lost-response recovery ------------------------------------------
+      // Remember the read in flight, and watch for its answer. Any response
+      // or any issue restarts the clock; only genuine silence trips it.
+      if (issue_rd) begin
+        retry_addr_q <= rd_addr_q;
+        retry_slot_q <= rb_wr_q;
+      end
+
+      if (issue_retry) begin
+        retry_pending_q <= 1'b0;
+        retry_cnt_q     <= '0;
+        retry_n_q       <= retry_n_q + 32'd1;
+      end else if (retry_expired && (rb_cnt_q != '0) && !rb_val_q[rb_rd_q]) begin
+        retry_pending_q <= 1'b1;
+        retry_cnt_q     <= '0;
+      end else if (issue_rd || rsp_rd || (rb_cnt_q == '0)) begin
+        retry_cnt_q <= '0;
+      end else begin
+        retry_cnt_q <= retry_cnt_q + 32'd1;
       end
       unique case ({issue_rd, rd_pop})
         2'b10:   rb_cnt_q <= rb_cnt_q + 1'b1;
@@ -501,7 +600,59 @@ module student_gemm #(
     end
   end
 
+  // Diagnostics: what the FSM is waiting on. Declared here, after the signals
+  // it samples, so the testbench compiler accepts it.
+  // Per-job bus counters. The question a stalled job has to answer is whether
+  // its outstanding read was never accepted, or accepted and never answered;
+  // rb_cnt alone cannot distinguish those.
+  logic [31:0] acc_cnt_q, rsp_cnt_q;
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      acc_cnt_q <= '0;
+      rsp_cnt_q <= '0;
+    end else if (start_strobe) begin
+      acc_cnt_q <= '0;
+      rsp_cnt_q <= '0;
+    end else begin
+      if (areq_valid_q & tl_host_i.a_ready) acc_cnt_q <= acc_cnt_q + 32'd1;
+      if (tl_host_i.d_valid)                rsp_cnt_q <= rsp_cnt_q + 32'd1;
+    end
+  end
+
+  assign hw2reg.dbg.d  = {rd_left_q[15:0], err_q, tl_host_i.d_valid,
+                          tl_host_i.a_ready, areq_valid_q,
+                          4'(wr_out_q), 4'(rb_cnt_q), 1'b0, 3'(state_q)};
+  assign hw2reg.dbg2.d = areq_q.a_address;
+  assign hw2reg.dbg3.d = acc_cnt_q;
+  assign hw2reg.dbg4.d = {retry_n_q[15:0], rsp_cnt_q[15:0]};
+
 `ifndef SYNTHESIS
+  // Simulation-only stall watchdog. If the block is busy but nothing has
+  // moved for a long time, dump what it is waiting on.
+  logic [OUTSTANDING-1:0] rb_val_packed;
+  always_comb for (int i = 0; i < int'(OUTSTANDING); i++) rb_val_packed[i] = rb_val_q[i];
+
+  int stall_cnt;
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      stall_cnt <= 0;
+    end else if (state_q == ST_IDLE || issue_rd || issue_wr || rsp_rd || rsp_wr || adv) begin
+      stall_cnt <= 0;
+    end else begin
+      stall_cnt <= stall_cnt + 1;
+      if (stall_cnt == 3000) begin
+        $display("student_gemm STALL @%0t state=%0d m=%0d t=%0d kcnt=%0d n_rows=%0d",
+                 $time, state_q, m_q, t_q, kcnt_q, n_rows_q);
+        $display("  rd_left=%0d rb_cnt=%0d rb_wr=%0d rb_rd=%0d rb_val=%b wr_out=%0d",
+                 rd_left_q, rb_cnt_q, rb_wr_q, rb_rd_q, rb_val_packed, wr_out_q);
+        $display("  rd_valid=%b wbuf_val=%b areq_valid=%b a_ready=%b d_valid=%b",
+                 rd_valid, wbuf_val_q, areq_valid_q, tl_host_i.a_ready, tl_host_i.d_valid);
+        $display("  sel_wr=%b sel_rd=%b rd_can_issue=%b wr_req=%b pipe_idle=%b",
+                 sel_wr, sel_rd, rd_can_issue, wr_req, pipe_idle);
+      end
+    end
+  end
+
   // Simulation-only. The TL-UL sockets push the whole request struct through a
   // prim_fifo_sync whose DataKnown_A assertion fails on any X, but by then the
   // offending field is no longer identifiable. Catch it at the source.

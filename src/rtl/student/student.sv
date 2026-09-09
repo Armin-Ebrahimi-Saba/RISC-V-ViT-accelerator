@@ -98,7 +98,11 @@ module student (
     .tl_host_i (host_d2h[0])
   );
 
-  student_gemm gemm_i (
+  // MAX_INFLIGHT(1): the DDR3 path cannot hold a transaction whose response
+  // comes after the request is withdrawn. See student_gemm.sv.
+  student_gemm #(
+    .MAX_INFLIGHT(1)
+  ) gemm_i (
     .clk_i,
     .rst_ni,
     .tl_o      (fast_d2h[1]),

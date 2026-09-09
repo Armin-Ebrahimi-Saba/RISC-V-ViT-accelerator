@@ -237,8 +237,10 @@ void dav2_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, dav2_tensor_t *out)
         return;
     }
 
+    dav2_progress("    qgemm: setup done");
     if (!dav2_accel_qgemm(a, wt, acc))
         dav2_qgemm_cpu(a->v, wt->w, acc, N, K, M);
+    dav2_progress("    qgemm: matmul done");
 
     /* Exact output range, including bias, so nothing clips. The min/max scan
      * is O(N*M) against the O(N*M*K) product, so it stays in software even
@@ -261,19 +263,40 @@ void dav2_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, dav2_tensor_t *out)
     }
     float out_scale = (amax > 0.0f) ? amax * (1.0f / (float)DAV2_ACT_QMAX) : 1.0f;
     float inv_out = 1.0f / out_scale;
+    dav2_progress("    qgemm: amax done");
 
     for (int m = 0; m < M; m++) {
         dav2_make_multiplier(a->scale * wt->s[m] * inv_out, &mult[m], &shift[m]);
         biasq[m] = wt->b ? iround(wt->b[m] * inv_out) : 0;
     }
 
-    for (int m = 0; m < M; m++) {
-        const int32_t *ar = acc + (size_t)m * N;
-        int16_t *ocol = out->v + m;
-        const int32_t mu = mult[m], bq = biasq[m];
-        const int sh = shift[m];
-        for (int n = 0; n < N; n++)
-            ocol[(size_t)n * M] = sat_act(apply_multiplier(ar[n], mu, sh) + bq);
+    /* Row-major over the output, not column-major.
+     *
+     * The obvious loop (m outer, writing out->v[n*M + m]) strides the store by
+     * M*2 = 768 bytes, so nearly every store misses and forces a dirty
+     * eviction from the 16 kB direct-mapped DDR3 cache. That matters far more
+     * than cache efficiency here: an eviction can lose the response to the
+     * next read (see report_errors.md), and unlike the accelerator the CPU has
+     * no retry -- a lost load response stalls the core permanently. Measured
+     * on hardware: this loop hung within its first 64 outer iterations.
+     *
+     * Iterating n outer / m inner makes the stores sequential and strides the
+     * *reads* instead. A read miss brings in a clean line, so it costs a fill
+     * but never a write-back. */
+    for (int n = 0; n < N; n++) {
+        int16_t *orow = out->v + (size_t)n * M;
+        for (int m = 0; m < M; m++)
+            orow[m] = sat_act(apply_multiplier(acc[(size_t)m * N + n],
+                                               mult[m], shift[m]) + biasq[m]);
+        /* Does it die on the first interleave or after many? */
+        if (n < 4 || (n & 15) == 15) {
+            static const char *tags[8] = {
+                "    rq n=0", "    rq n=1", "    rq n=2", "    rq n=3",
+                "    rq n=16", "    rq n=32", "    rq n=48", "    rq n=64"
+            };
+            int idx = (n < 4) ? n : (4 + (n >> 4) - 1);
+            if (idx < 8) dav2_progress(tags[idx]);
+        }
     }
 
     out->n = N;

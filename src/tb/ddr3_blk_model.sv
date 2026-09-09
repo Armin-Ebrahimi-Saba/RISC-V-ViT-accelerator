@@ -1,0 +1,107 @@
+// SPDX-License-Identifier: CC0-1.0
+// SPDX-FileCopyrightText: 2026 RVLab Student Project
+//
+// Behavioural stand-in for rvlab_ddr_blkmgr plus the DDR3 controller and PHY.
+//
+// It speaks the rvlab_ddr_pkg block protocol: 256-bit blocks, ancillary data
+// echoed back verbatim, and -- as that package requires -- responses strictly
+// in order. Replacing the real back end lets a testbench exercise the actual
+// rvlab_ddr_cache and rvlab_ddr_prefetch RTL without paying the ~90 minutes of
+// DDR3 calibration a full system simulation needs.
+//
+// Simulation only.
+
+module ddr3_blk_model #(
+    parameter int unsigned SIZE_BLOCKS = 8192,   // 256 kB of 32-byte blocks
+    parameter int unsigned DEPTH       = 16,     // matches blkmgr REQBUF_SIZE
+    parameter int unsigned MIN_LAT     = 6,
+    parameter int unsigned MAX_LAT     = 40
+) (
+    input  logic                      clk_i,
+    input  logic                      rst_ni,
+    input  rvlab_ddr_pkg::ddr3_h2d_t  req_i,
+    output rvlab_ddr_pkg::ddr3_d2h_t  rsp_o
+);
+
+  import rvlab_ddr_pkg::*;
+  import tlul_pkg::*;
+
+  localparam int unsigned IDXW = $clog2(SIZE_BLOCKS);
+
+  logic [255:0] mem [SIZE_BLOCKS];
+
+  // Real DRAM powers up with garbage, not X. Leaving these unknown makes the
+  // cache pull X into whole 32-byte blocks whenever a single word is touched,
+  // which trips the TL-UL DataKnown assertions for reasons that have nothing
+  // to do with the design under test.
+  initial for (int i = 0; i < int'(SIZE_BLOCKS); i++) mem[i] = '0;
+
+  // Strictly in-order queue: head answers first, as the protocol demands.
+  logic                 q_val  [DEPTH];
+  int                   q_cnt  [DEPTH];
+  logic [255:0]         q_data [DEPTH];
+  logic [DDR_ANCW-1:0]  q_anc  [DEPTH];
+  logic                 q_read [DEPTH];
+
+  int wr_ptr, rd_ptr, count;
+
+  wire accept = req_i.a_valid && (count < DEPTH);
+  wire head_ready = (count > 0) && q_val[rd_ptr] && (q_cnt[rd_ptr] <= 0);
+
+  always_comb begin
+    rsp_o          = '0;
+    rsp_o.a_ready  = (count < DEPTH);
+    if (head_ready) begin
+      rsp_o.d_valid  = 1'b1;
+      rsp_o.d_opcode = q_read[rd_ptr] ? AccessAckData : AccessAck;
+      rsp_o.d_data   = q_data[rd_ptr];
+      rsp_o.d_anc    = q_anc[rd_ptr];
+    end
+  end
+
+  function automatic int blk_index(input logic [DDR_AW-1:0] a);
+    return int'(a[IDXW-1:0]);
+  endfunction
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      for (int i = 0; i < DEPTH; i++) q_val[i] <= 1'b0;
+      wr_ptr <= 0;
+      rd_ptr <= 0;
+      count  <= 0;
+    end else begin
+      for (int i = 0; i < DEPTH; i++)
+        if (q_val[i] && (q_cnt[i] > 0)) q_cnt[i] <= q_cnt[i] - 1;
+
+      if (accept) begin
+        int idx = blk_index(req_i.a_address);
+        q_val [wr_ptr] <= 1'b1;
+        q_cnt [wr_ptr] <= MIN_LAT + ($urandom % (MAX_LAT - MIN_LAT + 1));
+        q_anc [wr_ptr] <= req_i.a_anc;
+        q_read[wr_ptr] <= (req_i.a_opcode == Get);
+
+        if (req_i.a_opcode == Get) begin
+          q_data[wr_ptr] <= mem[idx];
+        end else begin
+          q_data[wr_ptr] <= '0;
+          for (int b = 0; b < 32; b++)
+            if (req_i.a_mask[b]) mem[idx][b*8+:8] <= req_i.a_data[b*8+:8];
+        end
+
+        wr_ptr <= (wr_ptr + 1) % DEPTH;
+      end
+
+      if (head_ready && req_i.d_ready) begin
+        q_val[rd_ptr] <= 1'b0;
+        rd_ptr <= (rd_ptr + 1) % DEPTH;
+      end
+
+      case ({accept, head_ready && req_i.d_ready})
+        2'b10:   count <= count + 1;
+        2'b01:   count <= count - 1;
+        default: ;
+      endcase
+    end
+  end
+
+endmodule

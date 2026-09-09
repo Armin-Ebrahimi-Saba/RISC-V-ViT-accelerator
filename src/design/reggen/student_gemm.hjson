@@ -189,5 +189,65 @@
         }
       ]
     }
+    {
+      name: dbg
+      desc: "Internal state, for diagnosing a stalled job on hardware."
+      swaccess: ro
+      hwaccess: hwo
+      hwext: "true"
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: "[2:0] state, [7:4] rb_cnt, [11:8] wr_out, [12] areq_valid, [13] a_ready, [14] d_valid, [15] err, [31:16] rd_left"
+        }
+      ]
+    }
+    {
+      name: dbg2
+      desc: "Address of the request currently presented on the host A channel."
+      swaccess: ro
+      hwaccess: hwo
+      hwext: "true"
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: dbg3
+      desc: "Requests accepted (a_valid & a_ready) since the job started."
+      swaccess: ro
+      hwaccess: hwo
+      hwext: "true"
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: dbg4
+      desc: "Responses received (d_valid) since the job started."
+      swaccess: ro
+      hwaccess: hwo
+      hwext: "true"
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
   ]
 }
