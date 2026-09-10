@@ -98,8 +98,14 @@ module tlul_test_mem #(
           $display("tlul_test_mem: dropping response to read #%0d (addr %h)",
                    rd_seen + 1, tl_i.a_address);
           p_val [free_slot] <= 1'b0;
-        end else
-        p_val [free_slot] <= 1'b1;
+        end else begin
+          p_val [free_slot] <= 1'b1;
+        end
+
+        // These run for every accepted request, dropped or not. Before the
+        // braces above they were siblings of the if/else rather than part of
+        // either branch: correct, but it read as though they belonged to the
+        // else, so a statement added to that branch would have landed here.
         p_cnt [free_slot] <= MIN_LAT + ($urandom % (MAX_LAT - MIN_LAT + 1));
         p_src [free_slot] <= tl_i.a_source;
         p_sz  [free_slot] <= tl_i.a_size;

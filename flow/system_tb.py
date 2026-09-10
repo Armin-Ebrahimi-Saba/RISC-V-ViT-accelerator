@@ -14,8 +14,11 @@ class SystemTb(Block):
         self.design_dir = self.src_dir / "design"
 
     def simulate(self, simulator, cwd, srcs, sw, libs=[], netlist=None, sdf={}, batch=False,
-                 extra_defines={}, extra_plusargs={}):
+                 extra_defines=None, extra_plusargs=None):
         """Generic function that is called by all sim_... tasks."""
+
+        extra_defines = extra_defines or {}
+        extra_plusargs = extra_plusargs or {}
 
         plusargs = {"jtag_prog_mem":sw.deltafile} | extra_plusargs
         top_modules = [self.name, 'glbl']
@@ -164,7 +167,12 @@ class SystemTb(Block):
             plusargs["ddr_blob"] = str(blob)
         self.simulate('xsim', cwd, srcs, sw,
             libs=['unisims_ver', 'secureip'],
-            extra_defines={'RVLAB_DDR_BEHAVIOURAL':'1'},
+            # WITH_EXT_DRAM gates the whole DDR3 subsystem in
+            # rvlab_tlul_ddr.sv, and the behavioural block sits inside it.
+            # Without it the module falls through to a bare tlul_err_resp:
+            # no cache, no prefetcher, no ddr3_blk_model, and software spins
+            # forever waiting for calibration that never completes.
+            extra_defines={'RVLAB_DDR_BEHAVIOURAL':'1', 'WITH_EXT_DRAM':'1'},
             extra_plusargs=plusargs)
 
     @task(requires={

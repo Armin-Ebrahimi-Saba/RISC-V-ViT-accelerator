@@ -170,15 +170,25 @@ int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc)
                            (unsigned long)(c1 - c0));
                     /* The decisive pair: was the outstanding request ever
                      * accepted, and did a response ever come back? */
-                    printf("  bus: areq_valid=%lu a_ready=%lu d_valid=%lu "
-                           "err=%lu addr=%08lx accepted=%lu responses=%lu\n",
-                           (unsigned long)((d1 >> 12) & 1u),
-                           (unsigned long)((d1 >> 13) & 1u),
-                           (unsigned long)((d1 >> 14) & 1u),
-                           (unsigned long)((d1 >> 15) & 1u),
-                           (unsigned long)REG32(GEMM_DBG2),
-                           (unsigned long)REG32(GEMM_DBG3),
-                           (unsigned long)REG32(GEMM_DBG4));
+                    {
+                        /* dbg4 packs {retry_n_q[15:0], rsp_cnt_q[15:0]} --
+                         * printing it raw as "responses" reports a number
+                         * larger than the request count as soon as any retry
+                         * has happened, which is exactly the situation this
+                         * diagnostic exists to describe. */
+                        uint32_t d4 = REG32(GEMM_DBG4);
+                        printf("  bus: areq_valid=%lu a_ready=%lu d_valid=%lu "
+                               "err=%lu addr=%08lx accepted=%lu responses=%lu "
+                               "retries=%lu\n",
+                               (unsigned long)((d1 >> 12) & 1u),
+                               (unsigned long)((d1 >> 13) & 1u),
+                               (unsigned long)((d1 >> 14) & 1u),
+                               (unsigned long)((d1 >> 15) & 1u),
+                               (unsigned long)REG32(GEMM_DBG2),
+                               (unsigned long)REG32(GEMM_DBG3),
+                               (unsigned long)(d4 & 0xffffu),
+                               (unsigned long)(d4 >> 16));
+                    }
                     printf("GEMM accelerator: disabled, using the CPU kernel\n");
                     accel_ok = 0;
                     return 0;

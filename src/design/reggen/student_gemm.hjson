@@ -236,7 +236,7 @@
     }
     {
       name: dbg4
-      desc: "Responses received (d_valid) since the job started."
+      desc: "[15:0] responses received (d_valid) since the job started, [31:16] retries performed after a lost response. Packed as {retry_n_q, rsp_cnt_q} -- see student_gemm.sv."
       swaccess: ro
       hwaccess: hwo
       hwext: "true"

@@ -179,7 +179,11 @@ module rvlab_board (
     .pmod_c
   );
 
+// RVLAB_DDR_BEHAVIOURAL replaces the controller and PHY inside
+// rvlab_tlul_ddr, so the JEDEC chip model has nothing to talk to and its
+// source is not even in the no-DDR3 file list. Skip it in that configuration.
 `ifdef WITH_EXT_DRAM
+`ifndef RVLAB_DDR_BEHAVIOURAL
 
   ddr3 ddr3_model_i (
     .rst_n  (ddr3_reset_n),
@@ -200,6 +204,7 @@ module rvlab_board (
     .odt    (ddr3_odt)
   );
 
+`endif
 `endif
 
 endmodule

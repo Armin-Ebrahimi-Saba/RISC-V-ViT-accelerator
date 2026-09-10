@@ -383,8 +383,18 @@ module student_gemm_ddrpath_tb;
 
     mem_selftest();
 
+    // Actually drive the DUT. Without these the testbench compiled the
+    // accelerator against the real cache and prefetcher and then checked
+    // nothing, reporting "PASSED (0 words checked)".
+    run_gemm(20, 64,  6);    // two tiles, second partial
+    run_gemm(17, 128, 4);    // final tile of a single row
+    run_gemm(16, 384, 12);   // a shape the model issues
 
     $display("=======================================");
+    if (checks == 0) begin
+      $display("student_gemm_ddrpath_tb FAILED (no words checked -- the testbench drove nothing)");
+      errors++;
+    end
     if (errors == 0)
       $display("student_gemm_ddrpath_tb PASSED (%0d words checked)", checks);
     else
