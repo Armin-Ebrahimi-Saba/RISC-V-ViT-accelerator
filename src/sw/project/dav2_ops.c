@@ -237,10 +237,8 @@ void dav2_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, dav2_tensor_t *out)
         return;
     }
 
-    dav2_progress("    qgemm: setup done");
     if (!dav2_accel_qgemm(a, wt, acc))
         dav2_qgemm_cpu(a->v, wt->w, acc, N, K, M);
-    dav2_progress("    qgemm: matmul done");
 
     /* Exact output range, including bias, so nothing clips. The min/max scan
      * is O(N*M) against the O(N*M*K) product, so it stays in software even
@@ -263,7 +261,6 @@ void dav2_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, dav2_tensor_t *out)
     }
     float out_scale = (amax > 0.0f) ? amax * (1.0f / (float)DAV2_ACT_QMAX) : 1.0f;
     float inv_out = 1.0f / out_scale;
-    dav2_progress("    qgemm: amax done");
 
     for (int m = 0; m < M; m++) {
         dav2_make_multiplier(a->scale * wt->s[m] * inv_out, &mult[m], &shift[m]);
@@ -288,15 +285,6 @@ void dav2_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, dav2_tensor_t *out)
         for (int m = 0; m < M; m++)
             orow[m] = sat_act(apply_multiplier(acc[(size_t)m * N + n],
                                                mult[m], shift[m]) + biasq[m]);
-        /* Does it die on the first interleave or after many? */
-        if (n < 4 || (n & 15) == 15) {
-            static const char *tags[8] = {
-                "    rq n=0", "    rq n=1", "    rq n=2", "    rq n=3",
-                "    rq n=16", "    rq n=32", "    rq n=48", "    rq n=64"
-            };
-            int idx = (n < 4) ? n : (4 + (n >> 4) - 1);
-            if (idx < 8) dav2_progress(tags[idx]);
-        }
     }
 
     out->n = N;

@@ -33,7 +33,8 @@ sys.path.insert(0, str(REPO))
 
 from flow.tools import openocd  # noqa: E402
 from flow.tools.openocd import Hostio  # noqa: E402
-from flow.tools.riscv_debug_helper import reset_halt_rvlab_cpu  # noqa: E402
+from flow.tools.riscv_debug_helper import (  # noqa: E402
+    reset_halt_rvlab_cpu, DMControl, DMStatus)
 
 BLOB_ADDR = 0x80000000
 GO_ADDR = 0x8F000000
@@ -44,21 +45,40 @@ def read_hostio(ocd):
     """Drain the program's stdout ring buffer and return it as text.
 
     OpenOcd.hostio_read() prints straight to our stdout, which is no use when
-    we need to match markers, so this mirrors it and returns the characters
-    instead. Same ring-buffer protocol, same indices.
+    we need to match markers, so this returns the characters instead.
+
+    Both indices are read from the device on every poll rather than kept in a
+    host-side mirror. A mirror desynchronises whenever the device restarts
+    without the host knowing (a debugger reset, say), and the ring cannot then
+    recover: the device computes occupancy as (widx - ridx) & (SIZE-1), so a
+    read index even one byte ahead of the write index reads as SIZE-1 --
+    permanently "full". The device then spins in obuf_putc (hostio.c:23)
+    forever and the program looks hung at whatever line it last printed.
+    Measured on hardware as widx=18, ridx=19, enqueued=1023, ring empty.
     """
-    out = []
     widx = ocd.readword(Hostio.OBUF_WIDX)
+    ridx = ocd.readword(Hostio.OBUF_RIDX)
+    navail = (widx - ridx) & (Hostio.OBUF_SIZE - 1)
+    if navail == 0:
+        ocd.obuf_ridx = ridx          # keep the lab helper's mirror honest
+        return ""
+
+    out = []
+    pos = ridx
     wordaddr_last = -1
     word = 0
-    while widx != ocd.obuf_ridx:
-        wordaddr = Hostio.OBUF + (ocd.obuf_ridx & ~3)
+    for _ in range(navail):
+        wordaddr = Hostio.OBUF + (pos & ~3)
         if wordaddr != wordaddr_last:
             word = ocd.readword(wordaddr)
             wordaddr_last = wordaddr
-        out.append(chr((word >> ((ocd.obuf_ridx & 3) * 8)) & 0xff))
-        ocd.obuf_ridx = (ocd.obuf_ridx + 1) & (Hostio.OBUF_SIZE - 1)
-    ocd.writeword(Hostio.OBUF_RIDX, ocd.obuf_ridx)
+        out.append(chr((word >> ((pos & 3) * 8)) & 0xff))
+        pos = (pos + 1) & (Hostio.OBUF_SIZE - 1)
+
+    # pos == widx here, so the ring is always left exactly empty and a skew
+    # can never accumulate.
+    ocd.writeword(Hostio.OBUF_RIDX, pos)
+    ocd.obuf_ridx = pos
     return "".join(out)
 
 
@@ -94,6 +114,38 @@ def start_program(ocd, elf_filename):
     ocd.hostio_clear()
     ocd.cmd("resume")
     print("program started", flush=True)
+
+
+def dm_halt(ocd, timeout=5.0):
+    """Halt the core by driving the debug module directly.
+
+    OpenOCD's own `halt` is a no-op on this target: it returns an empty
+    string and `targets` keeps reporting running, so every subsequent `reg`
+    read fails. The reset-halt path in flow/tools does work, and it works by
+    writing DMControl over dmi, so do the same thing with haltreq instead of
+    ndmreset -- that stops the core where it is rather than restarting it.
+    Afterwards force OpenOCD to re-poll so its cached target state agrees and
+    `reg` is accepted.
+    """
+    ctrl = DMControl(ocd)
+    status = DMStatus(ocd)
+    ctrl.dmactive = 1
+    ctrl.haltreq = 1
+    ctrl.write()
+
+    deadline = time.time() + timeout
+    st = status.read()
+    while not st.allhalted and time.time() < deadline:
+        st = status.read()
+    halted = bool(st.allhalted)
+
+    ctrl.haltreq = 0
+    ctrl.dmactive = 1
+    ctrl.write()
+
+    ocd.cmd("lpriscv1.tap.0 arp_poll")
+    ocd.cmd("poll")
+    return halted, st
 
 
 def wait_for_marker(ocd, marker, timeout=120.0, buf=""):
@@ -240,8 +292,57 @@ def main():
         print(f"handshake flag at 0x{go:08x} (BRAM)", flush=True)
         ocd.writeword(go, GO_MAGIC)
         print("handshake written; inference running", flush=True)
-        text = wait_for_marker(ocd, "DAV2_RESULT_END", timeout=args.timeout,
-                               buf=text)
+        try:
+            text = wait_for_marker(ocd, "DAV2_RESULT_END", timeout=args.timeout,
+                                   buf=text)
+        except TimeoutError:
+            # The core is stalled. Halt it and read where -- far better than
+            # inferring the location from which printf was last seen.
+            print("\n--- inference did not finish; probing the core ---",
+                  flush=True)
+            # Sysbus reads work while the core runs, so sample the live state
+            # first: this needs no halt and therefore cannot perturb anything.
+            GEMM = 0x20010000
+            names = ("status", "dbg", "dbg2", "dbg3", "dbg4", "cycles")
+            offs  = (0x00, 0x2c, 0x30, 0x34, 0x38, 0x28)
+            for k in range(4):
+                vals = [ocd.readword(GEMM + o) for o in offs]
+                w = ocd.readword(Hostio.OBUF_WIDX)
+                r = ocd.readword(Hostio.OBUF_RIDX)
+                print("  sample%d widx=%d ridx=%d enq=%d | %s" % (
+                    k, w, r, (w - r) & (Hostio.OBUF_SIZE - 1),
+                    " ".join("%s=%08x" % (n, v)
+                             for n, v in zip(names, vals))), flush=True)
+                time.sleep(1.0)
+
+            # Only then try to stop it. A core wedged on a bus access that
+            # never completes cannot retire and so cannot accept a halt;
+            # "targets" staying at running is itself the diagnosis.
+            halted, st = dm_halt(ocd)
+            print("  dm halt: allhalted=%d anyrunning=%d anyunavail=%d "
+                  "anyhavereset=%d" % (st.allhalted, st.anyrunning,
+                                       st.anyunavail, st.anyhavereset),
+                  flush=True)
+            print("  targets:", ocd.cmd("targets").strip()[-30:], flush=True)
+            if not halted:
+                print("  core did not halt via the debug module either",
+                      flush=True)
+            for r in ("pc", "ra", "sp", "a0", "a1", "a2", "a3", "a4", "a5"):
+                print("  %-4s %s" % (r, ocd.cmd("reg " + r).strip()), flush=True)
+            for csr in ("dpc", "dcsr", "mcause", "mepc", "mtval", "mstatus", "mcycle"):
+                try:
+                    print("  %-8s %s" % (csr, ocd.cmd("reg " + csr).strip()),
+                          flush=True)
+                except Exception as exc:      # not all CSRs are exposed
+                    print("  %-8s <%s>" % (csr, exc), flush=True)
+            for i in range(6):
+                try:
+                    ocd.cmd("step")
+                    print("  step%d %s" % (i, ocd.cmd("reg pc").strip()),
+                          flush=True)
+                except Exception as exc:
+                    print("  step%d <%s>" % (i, exc), flush=True)
+            raise
         parse_result(text, args.out)
 
 

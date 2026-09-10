@@ -1,6 +1,6 @@
 # Hardware
 
-- Our hardware is Xilinx Artix-7 XC7A200T
+Our hardware is Xilinx Artix-7 XC7A200T.
 
 
 # Run 
@@ -11,4 +11,5 @@ After running bitstream, pnr and syn check the following files for warnings and 
 - build/rvlab_fpga_top/syn/rvlab_fpga_top.*.txt
 - build/rvlab_fpga_top/pnr/rvlab_fpga_top.*.txt
 
-DDR3 simulation is very slow, do not do it
+DDR3 simulation is very slow, do not do it.
+Use debugger for solving software issues.

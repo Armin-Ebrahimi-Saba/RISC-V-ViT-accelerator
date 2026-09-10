@@ -315,17 +315,14 @@ void dav2_infer(const dav2_cfg_t *cfg, float *depth_out)
     image.c = 3;
     image.scale = *img_scale;
 
-    dav2_progress("  pe: weights loaded");
     dav2_qw_t pe_w;
     dav2_qw(&pe_w, "patch_embed", DAV2_PATCH * DAV2_PATCH * 3);
-    dav2_progress("  pe: dav2_qw done");
 
     dav2_tensor_t x = dav2_tensor_new(n_tokens, ED);
     {
         dav2_tensor_t patches = dav2_conv2d(&image, cfg->size, cfg->size,
                                             &pe_w, DAV2_PATCH, DAV2_PATCH, 0,
                                             0, 0);
-        dav2_progress("  pe: conv2d done");
         /* prepend the class token and add the (pre-interpolated) position
          * embedding; both are float in the blob, so this is done in float and
          * requantised once. */
@@ -340,10 +337,8 @@ void dav2_infer(const dav2_cfg_t *cfg, float *depth_out)
                 tmp[(size_t)(p + 1) * ED + c] =
                     (float)patches.v[(size_t)p * ED + c] * patches.scale
                     + pos[(size_t)(p + 1) * ED + c];
-        dav2_progress("  pe: cls+pos float done");
         dav2_quantize_f32(tmp, n_tokens, ED, &x);
         dav2_arena_release(mark);
-        dav2_progress("  pe: quantize done");
     }
 
 #ifdef DAV2_TRACE

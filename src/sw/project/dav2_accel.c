@@ -203,7 +203,11 @@ int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc)
             /* Print the first few tiles of each large job. dbg4 packs the
              * retry count in its high half, which is the number that says
              * whether lost-response recovery is rare or constant. */
-            if (M >= 64 && nt >= 1 && accel_jobs <= 120) {
+            /* Off by default. The hostio console ring is 1 kB and the
+             * host drains it over JTAG at tens of bytes per second; a device
+             * that outruns that spins in obuf_putc (hostio.c:23) and looks
+             * exactly like a hung program. Keep target output minimal. */
+            if (0) {
                 uint32_t d4 = REG32(GEMM_DBG4);
                 printf("  tile: %lu cycles, %lu beats, retries=%lu, rsps=%lu\n",
                        (unsigned long)jc,

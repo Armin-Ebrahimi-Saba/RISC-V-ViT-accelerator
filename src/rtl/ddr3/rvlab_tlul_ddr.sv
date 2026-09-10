@@ -127,14 +127,36 @@ module rvlab_tlul_ddr (
   tlul_pkg::tl_h2d_t cache_req, err_resp_req;
   tlul_pkg::tl_d2h_t cache_rsp, err_resp_rsp;
 
+  // rvlab_ddr_cache ignores its front-end d_ready and pulses d_valid for a
+  // single cycle, so a host that is unready on that cycle loses the response
+  // permanently -- see src/tb/rvlab_ddr_dready_tb.sv, and student_gemm.sv for
+  // the retry timer the accelerator needs without this. The skid buffer takes
+  // every response the cycle it is offered and holds it for the real host, so
+  // the cache is never asked to honour a d_ready it does not implement.
+  tlul_pkg::tl_h2d_t llc_req_tl;
+  tlul_pkg::tl_d2h_t llc_rsp_tl;
+
+  student_tl_rsp_hold #(
+    .DEPTH(2)
+  ) ddr_rsp_hold_i (
+    .clk_i,
+    .rst_ni,
+
+    .tl_h_i(cache_req),
+    .tl_h_o(cache_rsp),
+
+    .tl_d_o(llc_req_tl),
+    .tl_d_i(llc_rsp_tl)
+  );
+
   rvlab_ddr_cache #(
     .IDX_BITS(9)
   ) ddr_llc_i (
     .clk_i,
     .rst_ni,
 
-    .tl_i(cache_req),
-    .tl_o(cache_rsp),
+    .tl_i(llc_req_tl),
+    .tl_o(llc_rsp_tl),
 
     .block_req_o(llc_req),
     .block_rsp_i(llc_rsp)
