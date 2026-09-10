@@ -35,6 +35,7 @@ int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc);
 
 /* Software reference for the same product and the same acc layout. Exposed so
  * dav2_accel_check() can compare the two. */
+int dav2_accel_bigcheck(int N, int K, int M);
 void dav2_qgemm_cpu(const int16_t *av, const int8_t *w, int32_t *acc,
                     int n, int k, int m);
 

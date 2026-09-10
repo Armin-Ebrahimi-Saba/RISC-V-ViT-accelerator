@@ -34,7 +34,39 @@ module ddr3_blk_model #(
   // cache pull X into whole 32-byte blocks whenever a single word is touched,
   // which trips the TL-UL DataKnown assertions for reasons that have nothing
   // to do with the design under test.
-  initial for (int i = 0; i < int'(SIZE_BLOCKS); i++) mem[i] = '0;
+  // Backdoor image load.
+  //
+  // The blob reaches DDR3 over JTAG on hardware, which is not simulatable
+  // (24.87 MB at the JTAG bit rate would dwarf the run). Reading the same file
+  // straight into the backing array puts the design in the state it is in on
+  // the board at the moment inference starts, which is the state under
+  // investigation. Byte 0 of the file is byte 0 of block 0, matching the
+  // little-endian word order the cache expects.
+  string blob_file;
+  int    blob_fd, blob_n, blob_blk;
+  logic [7:0] blob_buf [32];
+
+  initial begin
+    for (int i = 0; i < int'(SIZE_BLOCKS); i++) mem[i] = '0;
+
+    if ($value$plusargs("ddr_blob=%s", blob_file)) begin
+      blob_fd = $fopen(blob_file, "rb");
+      if (blob_fd == 0) $fatal(1, "ddr3_blk_model: cannot open %s", blob_file);
+      blob_blk = 0;
+      forever begin
+        blob_n = $fread(blob_buf, blob_fd);
+        if (blob_n <= 0) break;
+        if (blob_blk >= int'(SIZE_BLOCKS))
+          $fatal(1, "ddr3_blk_model: image larger than SIZE_BLOCKS");
+        for (int b = 0; b < 32; b++)
+          mem[blob_blk][8*b +: 8] = (b < blob_n) ? blob_buf[b] : 8'h00;
+        blob_blk++;
+      end
+      $fclose(blob_fd);
+      $display("ddr3_blk_model: loaded %0d blocks (%0d bytes) from %s",
+               blob_blk, blob_blk * 32, blob_file);
+    end
+  end
 
   // Strictly in-order queue: head answers first, as the protocol demands.
   logic                 q_val  [DEPTH];

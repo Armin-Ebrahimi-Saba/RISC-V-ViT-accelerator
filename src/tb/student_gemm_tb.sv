@@ -20,8 +20,8 @@ module student_gemm_tb;
 
   localparam logic [31:0] MEM_BASE = 32'h8000_0000;
   localparam logic [31:0] A_BASE   = 32'h8000_0000;
-  localparam logic [31:0] W_BASE   = 32'h8001_0000;
-  localparam logic [31:0] C_BASE   = 32'h8002_0000;
+  localparam logic [31:0] W_BASE   = 32'h8002_0000;
+  localparam logic [31:0] C_BASE   = 32'h8006_0000;
 
   // Register offsets, from student_gemm.hjson.
   localparam logic [31:0] R_STATUS   = 32'h00;
@@ -66,7 +66,7 @@ module student_gemm_tb;
   );
 
   tlul_test_mem #(
-      .SIZE_WORDS(65536),
+      .SIZE_WORDS(262144),
       .BASE_ADDR (MEM_BASE),
       .DEPTH     (OUTSTANDING)
   ) memory (
@@ -267,6 +267,13 @@ module student_gemm_tb;
     run_gemm(17, 128, 4);    // partial tile of a single row
     run_gemm(16, 384, 12);   // a shape the model actually uses
     run_gemm(16, 384, 64);   // enough weight rows that the MAC array dominates
+
+    // Patch embedding, the exact shape the model issues. On hardware this is
+    // the only GEMM that disagrees with the CPU kernel, and it does so
+    // deterministically: one accumulator word of 31104 is never written
+    // (m=233, n=31). K=588 is unique to this shape, and N=81 leaves a final
+    // tile of a single row.
+    run_gemm(81, 588, 384);
 
     if (x_errors) begin
       $display("X on the host A channel in %0d cycles", x_errors);

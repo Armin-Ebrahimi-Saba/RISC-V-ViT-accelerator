@@ -23,6 +23,31 @@
       ]
     }  
     {
+      name: "wdog_addr"
+      desc: '''Address of the oldest TL-UL request on the DDR3 port that has
+              not been answered. Latched by student_tl_watch and readable over
+              JTAG system-bus access, which keeps working when the CPU is
+              wedged on a load and therefore cannot be halted at all.'''
+      swaccess: "ro"
+      hwaccess: "hwo"
+      hwext: "true"
+      fields: [
+        {bits: "31:0", name: "val", desc: "Address of the stalled request"}
+      ]
+    }
+    {
+      name: "wdog_stat"
+      desc: '''Status of the stalled-request watchdog. stall_cycles saturates,
+              so a non-zero value that stops advancing means the request was
+              answered, while one pinned at the maximum means it never was.'''
+      swaccess: "ro"
+      hwaccess: "hwo"
+      hwext: "true"
+      fields: [
+        {bits: "31:0", name: "val", desc: "{stall_cycles[15:0], src[7:0], outstanding[4:0], opcode[2:0]}"}
+      ]
+    }
+    {
       name: "ctrl"
       desc: "Control"
       swaccess: "rw"

@@ -75,6 +75,27 @@ module rvlab_tlul_ddr (
   assign hw2reg.status.calib_complete.d = ctrl_calib_complete;
   assign hw2reg.status.calib_status.d = ctrl_calib_status;
 
+  /* Stalled-transaction watchdog.
+   *
+   * A CPU wedged on a DDR3 load cannot be halted, so the debugger cannot
+   * report where it is. JTAG system-bus reads still work, so record in
+   * hardware what the core can no longer be asked: which request went
+   * unanswered, from which master, and for how long. Pure observer -- it
+   * drives nothing on the bus. */
+  logic [31:0] wdog_addr, wdog_stat;
+
+  student_tl_watch watch_i (
+    .clk_i,
+    .rst_ni,
+    .tl_h2d_i   (tl_i),
+    .tl_d2h_i   (tl_o),
+    .wdog_addr_o(wdog_addr),
+    .wdog_stat_o(wdog_stat)
+  );
+
+  assign hw2reg.wdog_addr.d = wdog_addr;
+  assign hw2reg.wdog_stat.d = wdog_stat;
+
   assign ctrl_ddr_self_refresh = reg2hw.ctrl.self_refresh.q;
   assign ctrl_ddr_rst_n = reg2hw.ctrl.rst_n.q;
 
@@ -136,6 +157,14 @@ module rvlab_tlul_ddr (
   tlul_pkg::tl_h2d_t llc_req_tl;
   tlul_pkg::tl_d2h_t llc_rsp_tl;
 
+  /* The skid buffer was added for the cache's d_ready defect, before the
+   * a_ready mux above was found and fixed. Its credit throttle deasserts
+   * a_ready, which is precisely the signal that mishandling made requests
+   * vanish, so whether it still helps or now hurts is an open question --
+   * hence the switch. */
+  localparam bit USE_RSP_HOLD = 1'b0;
+
+  if (USE_RSP_HOLD) begin : gen_rsp_hold
   student_tl_rsp_hold #(
     .DEPTH(2)
   ) ddr_rsp_hold_i (
@@ -148,6 +177,10 @@ module rvlab_tlul_ddr (
     .tl_d_o(llc_req_tl),
     .tl_d_i(llc_rsp_tl)
   );
+  end else begin : gen_no_rsp_hold
+    assign llc_req_tl = cache_req;
+    assign cache_rsp  = llc_rsp_tl;
+  end
 
   rvlab_ddr_cache #(
     .IDX_BITS(9)
@@ -204,20 +237,119 @@ module rvlab_tlul_ddr (
       cache_req.a_valid = '0;
       tl_o.d_error = '1;
     end
+
+    /* a_ready must come from whichever module is actually going to accept the
+     * request, not from whichever one happens to be answering this cycle.
+     *
+     * Taking it from err_resp_rsp above is wrong once calibration completes:
+     * tlul_err_resp holds a_ready high whenever it is idle, but its a_valid is
+     * forced to zero here, so it never takes anything. A request issued while
+     * the cache is not ready was therefore handshaked away by the bus and
+     * accepted by nobody, and no response for it can ever exist. Measured on
+     * hardware as 30 transactions outstanding on this port and saturated,
+     * with the CPU wedged on a bus access it can never retire. */
+    tl_o.a_ready = ctrl_calib_complete ? cache_rsp.a_ready : err_resp_rsp.a_ready;
   end
 
   /* Prefetcher */
 
-  rvlab_ddr_prefetch prefetcher_i (
-    .clk_i,
-    .rst_ni,
+  /* Prefetcher, bypassable.
+   *
+   * rvlab_ddr_prefetch returns the wrong line when two regions alias in the
+   * direct-mapped cache: src/tb/rvlab_ddr_alias_tb.sv walks the blob at
+   * 0x80000000 against the arena at 0x82000000, which collide in every set,
+   * and 65 of 256 reads come back holding the alias partner's data, a
+   * different set's data, or zeros. Bypassing the prefetcher makes the same
+   * test pass 256/256, so the cache is not at fault.
+   *
+   * On hardware this is why tensors that demonstrably exist in the blob --
+   * verified byte for byte in DDR3 over JTAG -- are reported "not found":
+   * the directory scan reads a line belonging to the accelerator's arena.
+   *
+   * Bypassing costs read bandwidth. Correctness first; the prefetcher needs
+   * repairing before it is switched back on. */
+  localparam bit USE_PREFETCH = 1'b0;
 
-    .fe_req_i(llc_req),
-    .fe_rsp_o(llc_rsp),
+  if (USE_PREFETCH) begin : gen_prefetch
+    rvlab_ddr_prefetch prefetcher_i (
+      .clk_i,
+      .rst_ni,
 
-    .be_req_o(prefetch_req),
-    .be_rsp_i(prefetch_rsp)
+      .fe_req_i(llc_req),
+      .fe_rsp_o(llc_rsp),
+
+      .be_req_o(prefetch_req),
+      .be_rsp_i(prefetch_rsp)
+    );
+  end else begin : gen_no_prefetch
+    assign prefetch_req = llc_req;
+    assign llc_rsp      = prefetch_rsp;
+  end
+
+`ifdef RVLAB_DDR_BEHAVIOURAL
+  /* Behavioural back end (simulation only).
+   *
+   * Everything below the prefetcher -- CDC FIFO, block manager, DDR3
+   * controller and PHY -- is replaced by ddr3_blk_model, which speaks the same
+   * rvlab_ddr_pkg block protocol. The cache and prefetcher, the parts under
+   * investigation, are the real RTL and are untouched.
+   *
+   * This exists because a full DDR3 simulation is not merely slow but the
+   * wrong shape of slow: ddr3_controller.v waits out 200 us of power-on reset
+   * and 500 us of CKE-low before the first command, then calibrates, all in a
+   * 3 ns clock domain through SERDES primitives against a 2937-line JEDEC
+   * timing model. Shrinking the part does not help -- the cost is per-edge and
+   * per-microsecond, not per-byte. Removing the stack entirely does, and
+   * leaves only the 50 MHz domain.
+   *
+   * SIZE_BLOCKS must cover the arena at 0x82000000 as well as the blob at
+   * 0x80000000: blk_index truncates to IDXW bits, so a smaller memory aliases
+   * activations onto weights and corrupts the very thing being debugged.
+   */
+  // Say which back end is in the path. Getting this wrong is otherwise
+  // invisible until the run has burned an hour going nowhere.
+  initial $display("rvlab_tlul_ddr: BEHAVIOURAL DDR3 back end (ddr3_blk_model)");
+
+  ddr3_blk_model #(
+    .SIZE_BLOCKS(2**21),        // 64 MB: blob at +0, arena at +32 MB
+    .DEPTH      (16),           // matches BLKMGR_REQBUF_SIZE
+    .MIN_LAT    (6),
+    .MAX_LAT    (40)
+  ) ddr_behavioural_i (
+    .clk_i (clk_i),
+    .rst_ni(rst_ni),
+    .req_i (prefetch_req),
+    .rsp_o (prefetch_rsp)
   );
+
+  logic ddr3_self_refresh;
+  logic ddr3_calib_complete;
+  logic [ 4:0] ddr3_calib_status;
+
+  assign ddr3_calib_complete = 1'b1;   // nothing to calibrate
+  assign ddr3_calib_status   = 5'd0;
+
+  // The pins go nowhere in this configuration.
+  assign ddr3_ck_p    = '0;
+  assign ddr3_ck_n    = '0;
+  assign ddr3_reset_n = '0;
+  assign ddr3_cke     = '0;
+  assign ddr3_ras_n   = '0;
+  assign ddr3_cas_n   = '0;
+  assign ddr3_we_n    = '0;
+  assign ddr3_addr    = '0;
+  assign ddr3_ba      = '0;
+  assign ddr3_dm      = '0;
+  assign ddr3_odt     = '0;
+
+  // Unused in this configuration, but still read by the blkmgr wiring above.
+  logic unused_ddr_beh;
+  assign unused_ddr_beh = ^{blockmgr_req, blockmgr_rsp, ddr3if_stall,
+                            ddr3if_ack, ddr3if_rdata, ddr3if_rsp_aux,
+                            ddr3_self_refresh};
+
+`else
+  initial $display("rvlab_tlul_ddr: REAL DDR3 controller and PHY in the path");
 
   /* CDC FIFO */
 
@@ -345,6 +477,8 @@ module rvlab_tlul_ddr (
     // UART
     .uart_tx()
   );
+
+`endif
 
   assign ctrl_ddr_present = '1;
 

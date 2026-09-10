@@ -118,12 +118,60 @@ int main(void)
      * seen immediately. The host finds this variable by symbol name. */
     dav2_go = 0;
     printf("DAV2_WAITING_FOR_WEIGHTS\n");
+    /* Wait for the host to say the weights are complete.
+     *
+     * Do not be tempted to start on "the blob header looks valid" instead:
+     * the magic word lives at the very start of the blob, so it is written by
+     * the first chunk of the transfer, and inference then runs against a blob
+     * that is still being written underneath it. Measured effect: DDR3
+     * read-back fails outright a few seconds later. The flag is the only
+     * signal that means the whole transfer finished. */
     while (dav2_go != GO_MAGIC)
         ;
     printf("weights present (%u bytes expected)\n", (unsigned)DAV2_BLOB_BYTES);
 
     dav2_blob_init((const void *)BLOB_ADDR);
     dav2_arena_init((void *)ARENA_ADDR, ARENA_SIZE);
+
+    /* Start-up self-checks. Off by default: the checksum reads 24.87 MB and
+     * the GEMM comparison runs every model shape twice, which is a second or
+     * two each and pointless on a run whose purpose is inference. Set to 1
+     * when the numbers look wrong -- between them they localise a bad result
+     * to the weights, the accelerator, or neither. */
+#define DAV2_STARTUP_CHECKS 0
+
+#if DAV2_STARTUP_CHECKS
+    {
+        /* Checksum the whole blob as the CPU sees it, through the same path
+         * the engine uses. A JTAG sample says what DDR3 holds at rest; this
+         * says what the CPU actually reads. */
+        const volatile uint32_t *bw = (const volatile uint32_t *)BLOB_ADDR;
+        uint32_t h = 2166136261u;
+        for (uint32_t i = 0; i < DAV2_BLOB_BYTES / 4u; i++) {
+            h ^= bw[i];
+            h *= 16777619u;
+        }
+        printf("blob checksum (device) %08lx over %lu bytes\n",
+               (unsigned long)h, (unsigned long)DAV2_BLOB_BYTES);
+    }
+
+    {
+        /* Accelerator against the CPU kernel at the shapes the model issues,
+         * with every buffer in DDR3. 81x588x384 -- patch embedding -- loses
+         * one accumulator word of 31104, deterministically; the same shape
+         * passes in student_gemm_tb against ideal memory, so the fault is on
+         * the DDR3 path rather than in the GEMM. See HANDOFF.md. */
+        static const int shapes[][3] = {
+            { DAV2_N_TOKENS,   384,  384 },   /* proj            */
+            { DAV2_N_TOKENS,   384, 1152 },   /* qkv             */
+            { DAV2_N_TOKENS,   384, 1536 },   /* fc1             */
+            { DAV2_N_TOKENS,  1536,  384 },   /* fc2             */
+            { DAV2_N_PATCHES,  588,  384 },   /* patch embedding */
+        };
+        for (unsigned i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++)
+            dav2_accel_bigcheck(shapes[i][0], shapes[i][1], shapes[i][2]);
+    }
+#endif
 
     const int out_size = DAV2_PATCH_GRID * DAV2_PATCH;
     float *depth = (float *)dav2_arena_alloc((size_t)out_size * out_size * sizeof(float));

@@ -64,6 +64,7 @@ module_tbs = [
     "student_gemm_ddrpath_tb",
     "student_gemm_droprsp_tb",
     "rvlab_ddr_dready_tb",
+    "rvlab_ddr_alias_tb",
 ]
 
 for name in module_tbs:

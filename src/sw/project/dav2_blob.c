@@ -42,13 +42,32 @@ int dav2_blob_check(void)
 
 const void *dav2_find(const char *name, uint32_t *nbytes)
 {
-    for (uint32_t i = 0; i < blob_hdr->n_tensors; i++) {
-        if (strcmp(blob_dir[i].name, name) == 0) {
-            if (nbytes) *nbytes = blob_dir[i].nbytes;
-            return blob_base + blob_dir[i].offset;
+    /* Retry a miss once.
+     *
+     * Every tensor named here does exist: the same blob read on the host
+     * resolves all of them, and a JTAG sample of 300 random words matches the
+     * file byte for byte. So a miss means the directory scan read something
+     * other than what DDR3 holds. Retrying distinguishes that from a genuine
+     * absence -- a lookup that fails and then succeeds is proof of transient
+     * corruption on the read path, not of a missing tensor. */
+    for (int attempt = 0; attempt < 2; attempt++) {
+        for (uint32_t i = 0; i < blob_hdr->n_tensors; i++) {
+            if (strcmp(blob_dir[i].name, name) == 0) {
+                if (nbytes) *nbytes = blob_dir[i].nbytes;
+                if (attempt)
+                    printf("dav2: '%s' found on retry (transient bad read)\n",
+                           name);
+                return blob_base + blob_dir[i].offset;
+            }
         }
     }
-    printf("dav2: tensor '%s' not found in blob\n", name);
+    /* Report the header as the scan just saw it. n_tensors is re-read from
+     * DDR3 on every call and used as the loop bound, so a single wrong word
+     * here silently truncates the search and makes tensors near the end of
+     * the directory look absent. */
+    printf("dav2: tensor '%s' not found in blob (magic=%08lx n_tensors=%lu)\n",
+           name, (unsigned long)blob_hdr->magic,
+           (unsigned long)blob_hdr->n_tensors);
     return 0;
 }
 

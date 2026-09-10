@@ -196,8 +196,14 @@ never finishes -- and probes inside it show it dies **within its first outer
 iteration**, roughly 384 strided reads and 384 sequential 2-byte writes in.
 
 The CPU is not slow here, it is **stalled**. It has no retry: one lost load
-response stalls the core forever. This is the same platform defect the
-accelerator works around.
+response stalls the core forever.
+
+> **Superseded — see section 12.** The observation (stalled, not slow) was
+> right. The attribution was wrong: the trigger was not the cache's lost
+> responses but a request-acceptance defect one level up, in the DDR3 request
+> mux. Everything below about *which loop* stalls is therefore describing
+> where the CPU happened to be standing when the port jammed, not a property
+> of requantisation.
 
 **This corrects several earlier statements in this log and in conversation.**
 "Patch embedding takes ~12 minutes of CPU element-wise work" and the earlier
@@ -222,20 +228,137 @@ one. The loss rate the accelerator measured -- 383 in 57,126, about 1 in 150 --
 is consistent with the CPU dying within its first few hundred interleaved
 accesses, but consistency is not proof.
 
-## 11. Where this leaves the project
+## 11. The real root cause — a request nobody accepted
 
-**Working, on hardware:** bitstream and timing; the quantised kernels
-(`3ac57cd2`, matching host and simulation); the accelerator, reachable and
-correct, cross-checked against software at boot; DDR3 calibration and memtest;
-the 24.87 MB weight load; and the accelerator running real DDR3 work at
-**9.0 cycles/beat**, surviving lost responses via retry.
+`rvlab_tlul_ddr.sv` built its TL-UL response by starting from the error
+responder and overriding it when the cache answered:
 
-**Blocking a full frame:** the CPU stalls in requantisation, the first
-element-wise stage after the first GEMM. No FPGA depth map exists. The only
-complete inference remains the host x86 build, correlation 0.99984 against
-PyTorch.
+    tl_o = err_resp_rsp;                 // a_ready comes from HERE
+    if (cache_rsp.d_valid) tl_o = cache_rsp;
 
-**The honest summary:** the accelerator problem is solved. What replaced it is
-a platform-level memory defect that the accelerator can now survive and the CPU
-cannot, and working around it from the student files alone has not yet been
-achieved.
+`tlul_err_resp.sv:38` holds `a_ready` high whenever it is idle. Once
+calibration completes, `err_resp_req.a_valid` is forced to `0` so the error
+responder never *takes* a request — but its `a_ready` was still what the bus
+saw. Any request issued while the cache was not ready was therefore
+handshaked away by the fabric (`a_valid && a_ready`) and **accepted by
+nobody**. No response for it can ever exist.
+
+The fix is to source `a_ready` from whichever module will actually accept:
+
+    tl_o.a_ready = ctrl_calib_complete ? cache_rsp.a_ready : err_resp_rsp.a_ready;
+
+**Effect.** Before: the run never reached `block 1/12` in any attempt, across
+the whole bring-up. After: patch embedding, then blocks 1 through 7 and
+counting, at ~250 M cycles per block.
+
+**The skid buffer made this worse, not better.** `student_tl_rsp_hold`
+(section 6) throttles the A channel with a credit counter, so it deasserts the
+cache-side `a_ready` routinely — and with the mux ignoring that signal, every
+request issued in those windows was swallowed. An intermittent defect became a
+systematic one. A correct fix to one layer can amplify a defect in another;
+re-measure after every such change rather than assuming monotone improvement.
+
+> **Rule:** when a response never arrives, do not assume the response was
+> lost. Check first that the request was ever *accepted*. A mux that selects a
+> response source must select the matching `a_ready`, or the two halves of the
+> handshake describe different modules.
+
+## 12. How it was finally found — a register, not a debugger
+
+Every software instrument failed, for one structural reason: **cv32e40p
+cannot enter debug mode while an outstanding bus access cannot retire.**
+Driving `DMControl.haltreq` over DMI directly (bypassing OpenOCD's `halt`)
+returned `allhalted=0, anyrunning=1, anyunavail=0` — the debug module was
+talking to the hart fine; the hart simply could not stop. There was no `pc`
+to read, and there never would be. Days of PC-hunting were chasing a reading
+that does not exist in this failure mode.
+
+What still works on a wedged system is **JTAG system-bus access**. So the
+answer was to record in hardware what the core can no longer be asked.
+`src/rtl/student/student_tl_watch.sv` snoops the DDR3 TL-UL port and latches
+the oldest unanswered request; `ddr_ctrl` exposes it at `+0x4` (address) and
+`+0x8` (`{stall_cycles, source, outstanding, opcode}`), with a saturating
+stall counter so a pinned maximum is unambiguous. One line named the culprit:
+
+    ddr watchdog: addr=82045670 PutFullData source=71 outstanding=30
+                  stalled=65535 cycles (SATURATED -- never answered)
+
+Decoding `source=71`: low 2 bits = 3 → `student_host` on `sm1_11`; next bit =
+1 → `student_gemm` inside `student.sv`; top bit set → its write engine. A
+*write*, from the accelerator, to the activation arena — while the accelerator
+itself reported `state=IDLE` with zero outstanding writes. `outstanding=30`
+saturating was the tell: requests were leaving and nothing was coming back.
+
+> **Rule:** when the debugger structurally cannot answer, add a register that
+> can. A dozen flops on a bus port, readable over sysbus, beat every software
+> probe on this project — and unlike printf instrumentation, an observer that
+> drives nothing cannot perturb the bug it is watching.
+
+## 13. Two self-inflicted failures worth remembering
+
+**A probe that killed the thing it measured.** A "read-only" script used
+`with OpenOcd() as ocd:` — whose `__exit__` sends `shutdown`. It terminated
+the OpenOCD the live run depended on, leaving the runner blocked on a dead
+socket. Connect and close the socket by hand when attaching to a session you
+must not disturb.
+
+**A start condition that fired too early.** To let a simulation start without
+a host, `main.c` accepted "blob header valid" as an alternative to the
+`dav2_go` handshake. The magic word is at the *start* of the blob, so it
+lands with the first chunk: the CPU began inference against a blob still being
+written underneath it, and DDR3 read-back failed outright seconds later.
+Reverted. Only the flag means the transfer finished.
+
+## 14. Where this leaves the project
+
+**Fixed and verified on hardware:** the request-acceptance defect (section
+11). The model now runs patch embedding and transformer blocks 1–7+, which no
+build before this ever did.
+
+**New, open, and different:** blob lookups intermittently return garbage
+during those blocks —
+
+    dav2: tensor 'blk1.qkv.w' not found in blob
+    dav2: 'blk6.fc1' has k=2143289344, expected 384
+
+The run no longer *hangs*; it now reads **wrong data**. That is a distinct
+failure and needs a distinct hypothesis. The natural suspect is the response
+path rather than the request path: `rvlab_ddr_block_cache` still pulses
+`d_valid` for one cycle and ignores front-end `d_ready` (section 6, proven in
+`src/tb/rvlab_ddr_dready_tb.sv`), and `rvlab_ddr_cache` selects `d_data` by
+the *current* `d_anc[2:0]` word-select combinationally, so a delayed or
+mismatched response can return the wrong word. Check response-to-request
+correspondence (`d_source`, word select) before anything else. The watchdog
+register is the tool to extend here.
+
+**Not established.** Whether the accelerator's own retry logic is still
+needed now that requests are no longer swallowed, and whether the skid buffer
+should stay. Both were designed against a defect that is now fixed at its
+source; both should be re-evaluated, and the skid buffer in particular is the
+component that amplified section 11's defect.
+
+**Still true:** no FPGA depth map exists. The only complete inference remains
+the host x86 build (`src/sw/project/host/dav2_host`), which runs the whole
+model in ~4 s at correlation 0.99984 against PyTorch, and is the reference for
+any hardware result.
+
+**Uncommitted at handoff** (last commit `4a833df`):
+
+| Path | What |
+|---|---|
+| `src/rtl/ddr3/rvlab_tlul_ddr.sv` | the `a_ready` fix; watchdog instantiation; `RVLAB_DDR_BEHAVIOURAL` guard |
+| `src/rtl/student/student_tl_watch.sv` | new — the stalled-transaction watchdog |
+| `src/design/reggen/ddr_ctrl.hjson` | new `wdog_addr` / `wdog_stat` registers |
+| `src/sw/project/tools/dav2_run_fpga.py` | `dm_halt` via DMI; live sysbus sampling; watchdog readout |
+| `src/tb/ddr3_blk_model.sv` | backdoor `+ddr_blob` image load |
+| `flow/system_tb.py` | `sim_ddrmodel_xsim` task (behavioural DDR3 back end) |
+| `flow/tools/xsim.py` | one `--testplusarg` per plusarg — they were being concatenated |
+| `src/sw/project/main.c` | premature start condition reverted (section 13) |
+
+**Watch out:** inserting registers into `ddr_ctrl.hjson` shifted `ctrl` from
+`+0x4` to `+0xc`. Rebuild `libsys` **and** `sw_project` after any reggen
+change, or `ddr_init.c` writes the DDR3 reset bit into a read-only register
+and the controller never leaves reset.
+
+Also note `TASK.md` currently shows as deleted in the working tree; that looks
+unintentional and was not done as part of this work.

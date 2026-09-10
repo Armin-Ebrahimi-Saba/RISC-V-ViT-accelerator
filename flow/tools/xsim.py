@@ -6,8 +6,18 @@ from pathlib import Path
 from notcl import TclTool
 import os
 
-def plusargs_to_str(plusargs: dict[str,str]) -> str:
-    return "".join([f"{key}={value}" for key, value in plusargs.items()])
+def plusargs_to_args(plusargs: dict[str,str]) -> list[str]:
+    """One --testplusarg per entry.
+
+    Joining them into a single argument silently concatenates the values, so
+    the first plusarg absorbs the name of the second and both are lost. That
+    is invisible until a testbench opens the resulting path and gets a null
+    file descriptor.
+    """
+    args = []
+    for key, value in plusargs.items():
+        args += ["--testplusarg", f"{key}={value}"]
+    return args
 
 class Xsim(TclTool):
     def __init__(self, top_module:str, plusargs: dict[str,str], enable_gui:bool, **kwargs):
@@ -22,8 +32,7 @@ class Xsim(TclTool):
             self.top_module]
         if self.enable_gui:
             l += ["--gui"]
-        if len(self.plusargs) > 0:
-            l += ["--testplusarg", plusargs_to_str(self.plusargs)]
+        l += plusargs_to_args(self.plusargs)
         return l
 
 def simulate(

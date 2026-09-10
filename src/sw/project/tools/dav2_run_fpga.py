@@ -23,6 +23,7 @@ and the program then loops on inference rather than reloading per frame.
 """
 import argparse
 import subprocess
+import random
 import struct
 import sys
 import time
@@ -251,6 +252,32 @@ def verify_blob(ocd, blob_path):
     print(f"blob header verified in DDR3 ({n_tensors} tensors)", flush=True)
 
 
+def verify_blob_sampled(ocd, blob_path, nsamp=300, seed=1):
+    """Compare random words of DDR3 against the file, with the CPU halted.
+
+    Separates the two explanations for intermittent 'tensor not found':
+    DDR3 holding the wrong bytes, or DDR3 holding the right bytes that the
+    CPU's read path mangles. The debugger reads through the same cache the
+    CPU does, so a clean result does not exonerate the cache -- but a dirty
+    one convicts the write path.
+    """
+    data = Path(blob_path).read_bytes()
+    nwords = len(data) // 4
+    rng = random.Random(seed)
+    bad = 0
+    for i in range(nsamp):
+        w = rng.randrange(nwords)
+        want = struct.unpack_from("<I", data, w * 4)[0]
+        got = ocd.readword(BLOB_ADDR + w * 4)
+        if got != want:
+            bad += 1
+            if bad <= 8:
+                print("  MISMATCH at +0x%08x: got %08x want %08x"
+                      % (w * 4, got, want), flush=True)
+    print("blob sample check: %d/%d words mismatched" % (bad, nsamp), flush=True)
+    return bad
+
+
 def parse_result(text, out_path):
     """Extract the hex-encoded float depth map printed by the program."""
     try:
@@ -265,11 +292,26 @@ def parse_result(text, out_path):
     raw = bytes.fromhex(hexdata)
     if len(raw) != count * 4:
         print(f"warning: expected {count*4} bytes, got {len(raw)}")
-    import numpy as np
     side = int(round(count ** 0.5))
-    depth = np.frombuffer(raw, dtype="<f4").reshape(side, side)
-    np.save(out_path, depth)
-    print(f"saved {out_path} ({side}x{side}, range {depth.min():.4f}..{depth.max():.4f})")
+    vals = struct.unpack("<%df" % count, raw[:count * 4])
+
+    # Write the .npy by hand rather than importing numpy.
+    #
+    # numpy is not in requirements.txt and is not installed in the flow venv,
+    # and a frame costs nearly two minutes on the board -- losing one to an
+    # ImportError after the run has already succeeded is not acceptable. The
+    # v1.0 format is a short ASCII header plus raw little-endian data, so
+    # there is nothing here worth a dependency.
+    hdr = ("{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }"
+           % (side, side))
+    hdr += " " * (64 - ((10 + len(hdr) + 1) % 64)) + "\n"
+    with open(out_path, "wb") as f:
+        f.write(b"\x93NUMPY\x01\x00")
+        f.write(struct.pack("<H", len(hdr)))
+        f.write(hdr.encode("ascii"))
+        f.write(raw[:count * 4])
+    print(f"saved {out_path} ({side}x{side}, "
+          f"range {min(vals):.4f}..{max(vals):.4f})")
 
 
 def main():
@@ -278,6 +320,8 @@ def main():
     ap.add_argument("--blob", default="build/dav2/dav2_weights.bin")
     ap.add_argument("--out", default="build/dav2/fpga_depth.npy")
     ap.add_argument("--cfg", default="src/design/openocd/fpga.cfg")
+    ap.add_argument("--verify-sampled", action="store_true",
+                    help="compare random blob words in DDR3 against the file")
     ap.add_argument("--timeout", type=float, default=3600.0,
                     help="seconds to wait for inference to finish")
     args = ap.parse_args()
@@ -287,6 +331,8 @@ def main():
         text = wait_for_marker(ocd, "DAV2_WAITING_FOR_WEIGHTS")
         load_blob(ocd, str(Path(args.blob).resolve()))
         verify_blob(ocd, args.blob)
+        if args.verify_sampled:
+            verify_blob_sampled(ocd, args.blob)
         ensure_running(ocd)
         go = go_address(Path(args.elf).resolve())
         print(f"handshake flag at 0x{go:08x} (BRAM)", flush=True)
@@ -318,6 +364,25 @@ def main():
             # Only then try to stop it. A core wedged on a bus access that
             # never completes cannot retire and so cannot accept a halt;
             # "targets" staying at running is itself the diagnosis.
+            # The stalled-transaction watchdog in the DDR3 register block.
+            # This is the one source that still answers when the core cannot
+            # be halted: it records which request went unanswered, from which
+            # master, and for how long.
+            DDR_CTRL = 0x1F001000
+            wa = ocd.readword(DDR_CTRL + 0x4)
+            ws = ocd.readword(DDR_CTRL + 0x8)
+            opcode = ws & 0x7
+            outst  = (ws >> 3) & 0x1F
+            src    = (ws >> 8) & 0xFF
+            stall  = (ws >> 16) & 0xFFFF
+            opname = {0: "PutFullData", 1: "PutPartialData", 4: "Get"}.get(
+                opcode, "op%d" % opcode)
+            print("  ddr watchdog: addr=%08x %s source=%d outstanding=%d "
+                  "stalled=%d cycles%s" % (
+                      wa, opname, src, outst, stall,
+                      " (SATURATED -- never answered)"
+                      if stall == 0xFFFF else ""), flush=True)
+
             halted, st = dm_halt(ocd)
             print("  dm halt: allhalted=%d anyrunning=%d anyunavail=%d "
                   "anyhavereset=%d" % (st.allhalted, st.anyrunning,

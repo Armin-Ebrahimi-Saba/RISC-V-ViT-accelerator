@@ -242,6 +242,63 @@ static uint32_t chk_rand(uint32_t *s)
     return x;
 }
 
+/* Same comparison as dav2_accel_check, but at model dimensions and with every
+ * buffer in DDR3 rather than BRAM.
+ *
+ * The small check passes on hardware while the full inference produces a depth
+ * map uncorrelated with the host build (r = 0.19), so the failure is one the
+ * small case cannot reach: real N/K/M, real tile counts, and operands that
+ * live in the aliasing DDR3 arena instead of on-chip memory. Returns the
+ * number of mismatching accumulator words. */
+int dav2_accel_bigcheck(int N, int K, int M)
+{
+    if (!dav2_accel_init())
+        return -1;
+
+    const size_t mark = dav2_arena_mark();
+    int16_t *a  = (int16_t *)dav2_arena_alloc((size_t)N * K * sizeof(int16_t));
+    int8_t  *w  = (int8_t  *)dav2_arena_alloc((size_t)M * K * sizeof(int8_t));
+    int32_t *hw = (int32_t *)dav2_arena_alloc((size_t)N * M * sizeof(int32_t));
+    int32_t *sw = (int32_t *)dav2_arena_alloc((size_t)N * M * sizeof(int32_t));
+    if (!a || !w || !hw || !sw) {
+        printf("GEMM bigcheck: arena too small\n");
+        return -1;
+    }
+
+    uint32_t seed = 0x2468aceu;
+    for (int i = 0; i < N * K; i++)
+        a[i] = (int16_t)((int32_t)(chk_rand(&seed) % 16383u) - 8191);
+    for (int i = 0; i < M * K; i++)
+        w[i] = (int8_t)((int32_t)(chk_rand(&seed) % 255u) - 127);
+    for (int i = 0; i < N * M; i++) { hw[i] = 0; sw[i] = 0; }
+
+    dav2_tensor_t at = { a, 1.0f, N, K };
+    dav2_qw_t     wt = { w, 0, 0, M, K };
+
+    dav2_qgemm_cpu(a, w, sw, N, K, M);
+    if (!dav2_accel_qgemm(&at, &wt, hw)) {
+        printf("GEMM bigcheck: accelerator declined\n");
+        dav2_arena_release(mark);
+        return -1;
+    }
+
+    int bad = 0, first = -1;
+    for (int i = 0; i < N * M; i++) {
+        if (hw[i] != sw[i]) {
+            if (first < 0) first = i;
+            bad++;
+        }
+    }
+    printf("GEMM bigcheck %dx%dx%d: %d/%d words differ", N, K, M, bad, N * M);
+    if (bad)
+        printf(", first at %d (hw %ld sw %ld)", first,
+               (long)hw[first], (long)sw[first]);
+    printf("\n");
+
+    dav2_arena_release(mark);
+    return bad;
+}
+
 int dav2_accel_check(void)
 {
     if (!dav2_accel_init())

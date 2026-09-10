@@ -13,13 +13,15 @@ class SystemTb(Block):
         self.src_dir = self.flow.base_dir / "src"
         self.design_dir = self.src_dir / "design"
 
-    def simulate(self, simulator, cwd, srcs, sw, libs=[], netlist=None, sdf={}, batch=False):
+    def simulate(self, simulator, cwd, srcs, sw, libs=[], netlist=None, sdf={}, batch=False,
+                 extra_defines={}, extra_plusargs={}):
         """Generic function that is called by all sim_... tasks."""
 
-        plusargs = {"jtag_prog_mem":sw.deltafile}
+        plusargs = {"jtag_prog_mem":sw.deltafile} | extra_plusargs
         top_modules = [self.name, 'glbl']
 
         verilog_srcs = srcs.design_srcs + srcs.tb_srcs
+        defines = srcs.defines | extra_defines
         if netlist:
             verilog_srcs.append(netlist)
 
@@ -48,7 +50,7 @@ class SystemTb(Block):
             top_modules,
             cwd=cwd,
             include_dirs=srcs.include_dirs,
-            defines=srcs.defines,
+            defines=defines,
             plusargs=plusargs,
             libs=libs,
             batch_mode=batch,
@@ -141,6 +143,29 @@ class SystemTb(Block):
         self.simulate('xsim', cwd, srcs, sw,
             libs=['unisims_ver', 'secureip'],
             batch=True)
+
+    @task(requires={
+        'srcs':'srcs.srcs_noddr',
+        'sw':'sw.delta',
+        })
+    def sim_ddrmodel_xsim(self, cwd, srcs, sw):
+        """RTL simulation with a behavioural DDR3 back end (fast)
+
+        The DDR3 controller, PHY and chip model are replaced by
+        ddr3_blk_model, leaving the real cache and prefetcher in place. That
+        removes the 700 us of JEDEC power-up and calibration and the 3 ns
+        clock domain, which is what makes a full DDR3 simulation impractical
+        rather than merely slow. Pass +ddr_blob to place a weight blob in the
+        backing memory, standing in for the JTAG transfer.
+        """
+        blob = self.flow.base_dir / "build/dav2/dav2_weights.bin"
+        plusargs = {}
+        if blob.exists():
+            plusargs["ddr_blob"] = str(blob)
+        self.simulate('xsim', cwd, srcs, sw,
+            libs=['unisims_ver', 'secureip'],
+            extra_defines={'RVLAB_DDR_BEHAVIOURAL':'1'},
+            extra_plusargs=plusargs)
 
     @task(requires={
         'srcs':'srcs.srcs',
