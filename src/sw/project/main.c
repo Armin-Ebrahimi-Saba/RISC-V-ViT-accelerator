@@ -142,6 +142,83 @@ int main(void)
 
 #if DAV2_STARTUP_CHECKS
     {
+        /* Does DDR3 hold what is written to it, at all?
+         *
+         * Random words at random arena addresses, in two passes: write them
+         * all, then read them all back. The set is 64k words spread over the
+         * full 64 MB arena, so by the time anything is re-read the 16 kB
+         * cache has been turned over hundreds of times and every read is a
+         * genuine refill of a line that was written back. Whether the
+         * accelerator's lost word is a memory fault or a specific eviction
+         * bug depends on whether this passes. */
+        enum { NWORDS = 65536 };
+        volatile uint32_t *arena = (volatile uint32_t *)ARENA_ADDR;
+        const uint32_t arena_words = ARENA_SIZE / 4u;
+        uint32_t seed, bad = 0, first_bad = 0, got_bad = 0, want_bad = 0;
+
+        seed = 0x9e3779b9u;
+        for (uint32_t i = 0; i < NWORDS; i++) {
+            seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+            uint32_t idx = seed % arena_words;
+            seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+            arena[idx] = seed;
+        }
+        seed = 0x9e3779b9u;
+        for (uint32_t i = 0; i < NWORDS; i++) {
+            seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+            uint32_t idx = seed % arena_words;
+            seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+            uint32_t got = arena[idx];
+            if (got != seed) {
+                if (!bad) { first_bad = idx; got_bad = got; want_bad = seed; }
+                /* Print the first few in full: the address pattern of the
+                 * failures says whether this is a bad bank, row, column bit
+                 * or byte lane, and whether the wrong value is another
+                 * address's data. Re-reading says whether it is stable. */
+                if (bad < 6)
+                    printf("  bad %08lx got %08lx want %08lx reread %08lx\n",
+                           (unsigned long)(ARENA_ADDR + idx * 4u),
+                           (unsigned long)got, (unsigned long)seed,
+                           (unsigned long)arena[idx]);
+                bad++;
+            }
+        }
+        printf("DDR3 random r/w: %lu/%u words wrong", (unsigned long)bad, NWORDS);
+        if (bad)
+            printf(", first at %08lx got %08lx want %08lx",
+                   (unsigned long)(ARENA_ADDR + first_bad * 4u),
+                   (unsigned long)got_bad, (unsigned long)want_bad);
+        printf("\n");
+
+        /* Random order, but confined to 8 kB -- half the cache, so nothing is
+         * ever evicted. If this passes while the full-arena random test
+         * fails, the fault is in eviction and write-back, not in random
+         * access as such. */
+        {
+            uint32_t s2 = 0x7f4a7c15u, cbad = 0;
+            for (uint32_t i = 0; i < NWORDS; i++) {
+                s2 ^= s2 << 13; s2 ^= s2 >> 17; s2 ^= s2 << 5;
+                arena[s2 % 2048u] = s2;
+                if (arena[s2 % 2048u] != s2) cbad++;
+            }
+            printf("DDR3 random r/w within cache: %lu/%u wrong\n",
+                   (unsigned long)cbad, NWORDS);
+        }
+
+        /* Same test, sequential rather than random. A DRAM cell or lane
+         * fault fails regardless of order; an eviction or reordering fault
+         * in the cache path needs the random pattern to provoke it. */
+        {
+            uint32_t sbad = 0;
+            for (uint32_t i = 0; i < NWORDS; i++)
+                arena[i * 64u] = i * 2654435761u;      /* one word per line */
+            for (uint32_t i = 0; i < NWORDS; i++)
+                if (arena[i * 64u] != i * 2654435761u) sbad++;
+            printf("DDR3 sequential r/w: %lu/%u words wrong\n",
+                   (unsigned long)sbad, NWORDS);
+        }
+    }
+    {
         /* Checksum the whole blob as the CPU sees it, through the same path
          * the engine uses. A JTAG sample says what DDR3 holds at rest; this
          * says what the CPU actually reads. */
