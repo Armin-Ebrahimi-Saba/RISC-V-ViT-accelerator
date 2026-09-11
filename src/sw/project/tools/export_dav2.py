@@ -17,6 +17,19 @@ Blob layout:
 
 Usage:
     python export_dav2.py --size 126 --image demo01.jpg --out build/dav2
+
+Requirements: torch, numpy, PIL, and a checkout of the Depth-Anything-V2
+reference repository with its checkpoint (set DAV2_REF_DIR / DAV2_CKPT, see
+dav2_common.py). None of these are in the project's .venv, which only holds
+the FPGA flow. Run this in a separate Python environment.
+
+The exported blob is checked into build/dav2/dav2_weights.bin. To run a
+different picture WITHOUT this exporter's dependencies, use
+dav2_patch_image.py, which rewrites just the two image tensors in a copy of
+an existing blob -- the weights do not depend on the picture.
+
+The blob also carries dav2_blob_config.h, generated alongside it, which tells
+the C engine the input size, patch grid and token count at compile time.
 """
 import argparse
 import math

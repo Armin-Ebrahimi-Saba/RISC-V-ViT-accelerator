@@ -6,6 +6,17 @@
  * On the host (and in any build without the block) every entry point reports
  * "not available" and the engine falls back to the software kernel, so the
  * numerical result is identical either way.
+ *
+ * How a GEMM runs on the block: the accelerator holds NROWS (16) activation
+ * rows at a time, so dav2_accel_qgemm() cuts an N-row problem into ceil(N/16)
+ * "jobs", programs each one's addresses into the registers, sets CTRL.start,
+ * and polls STATUS until busy drops. All M output columns are produced per
+ * job. The int32 results land directly in the caller's accumulator buffer in
+ * DDR3; requantisation happens afterwards in dav2_ops.c.
+ *
+ * The debug registers (DBG..DBG4) are read only when something goes wrong
+ * -- a timeout -- or by the self-checks at the bottom of this file. Their
+ * packing is defined in src/design/reggen/student_gemm.hjson.
  */
 
 #include "dav2_accel.h"
@@ -275,13 +286,19 @@ static uint32_t chk_rand(uint32_t *s)
 }
 
 /* Same comparison as dav2_accel_check, but at model dimensions and with every
- * buffer in DDR3 rather than BRAM.
+ * buffer in DDR3 rather than BRAM. Returns the number of mismatching
+ * accumulator words, or -1 if it could not run.
  *
- * The small check passes on hardware while the full inference produces a depth
- * map uncorrelated with the host build (r = 0.19), so the failure is one the
- * small case cannot reach: real N/K/M, real tile counts, and operands that
- * live in the aliasing DDR3 arena instead of on-chip memory. Returns the
- * number of mismatching accumulator words. */
+ * Why it exists: the small check passed on hardware while the full inference
+ * was wrong (r = 0.19 against the host), so the fault was one the small case
+ * could not reach. This found it: 81x588x384 -- the patch-embedding shape --
+ * lost exactly one word, deterministically, while every other shape passed.
+ * That word, and the "reread after eviction" probe below, showed the write
+ * was acknowledged but never reached DDR3, which led to the cache write-back
+ * bug in rvlab_ddr_block_cache.sv. Since that fix every shape is bit-exact.
+ *
+ * Run it by setting DAV2_STARTUP_CHECKS in main.c; it costs about a second
+ * per shape on the board, so it is off by default. */
 int dav2_accel_bigcheck(int N, int K, int M)
 {
     if (!dav2_accel_init())

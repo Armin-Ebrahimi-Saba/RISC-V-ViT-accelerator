@@ -18,6 +18,30 @@
 // then read them back interleaved so every access evicts the other region's
 // line and forces a dirty write-back. Any address that returns its alias
 // partner's data -- or stale data -- is the defect.
+//
+// Two defects were found with this bench, and it covers both:
+//
+//  1. rvlab_ddr_prefetch returns another region's line under aliasing.
+//     The interleaved section above fails 65/256 with the prefetcher in the
+//     path and passes 256/256 with BYPASS_PREFETCH=1. (Fix: bypassed in
+//     rvlab_tlul_ddr.sv.)
+//
+//  2. rvlab_ddr_block_cache wrote back a dirty line with data one cycle
+//     stale when the line had been written on the immediately preceding
+//     access. The "random pipelined" section at the end found it -- but only
+//     after the driver was changed to present the next request the moment
+//     the previous is accepted, the way a CPU does. tlul_test_host waits for
+//     each response first and can never open that window, so the same test
+//     PASSED on unfixed RTL until the driver was pipelined. (Fix: write-back
+//     now uses the forwarded data_rdata, in rvlab_ddr_block_cache.sv.)
+//
+// Terms: a cache "set" is the slot an address maps to; "tag" is the part of
+// the address that identifies which of the aliasing addresses currently
+// occupies it; a line is "dirty" when it holds writes not yet in DRAM;
+// "eviction" is throwing a line out to make room, which for a dirty line
+// means writing it back first.
+//
+// Run:  flow rvlab_ddr_alias_tb.sim_rtl_xsim
 
 module rvlab_ddr_alias_tb;
 

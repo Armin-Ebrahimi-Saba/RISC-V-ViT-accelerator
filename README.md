@@ -8,27 +8,37 @@ GEMM accelerator for the matrix multiplications.
 No operating system, no inference framework, no floating-point unit. The
 network is a hand-written freestanding C engine; the matmuls are hardware.
 
+![Input photo, PyTorch depth, FPGA depth](img/result.png)
+
+*Left: input. Middle: PyTorch reference. Right: the FPGA's output. Bright is
+near.*
+
 Results
 -------
 
 | | |
 |---|---|
-| Accuracy vs. PyTorch reference | correlation **0.99984** |
-| GEMM throughput | **12.4 MAC/cycle** of a 16 MAC/cycle peak (78%) |
-| Speed-up on the matmul | **~75x** over the CPU kernel |
-| Timing | met, WNS **+0.268 ns** at 50 MHz |
-| Resources | LUT 12.7%, BRAM 23.0%, DSP 3.1% of an XC7A200T |
+| FPGA output vs. the same C engine on a PC | **bit-exact**, 15876/15876 pixels, on every image tried |
+| FPGA output vs. PyTorch reference | correlation **0.99984** |
+| Frame time on the board | **93.6 s** (0.0107 FPS) at 50 MHz |
+| Accelerator vs. CPU on the matmul | **~36×** |
+| Timing | met, WNS **+0.287 ns** at 50 MHz, 0 failing endpoints |
+| Resources | LUT 12.4 %, BRAM 23.0 %, DSP 3.1 % of an XC7A200T |
 
-One frame at 126x126 is 2.412 G MAC and 5.273 M requantised elements. The
-accelerator takes the multiply-accumulate work from ~290 s to ~4 s, which makes
-the element-wise CPU work (requantisation, LayerNorm, GELU) and the 25 MB of
-weights crossing DDR3 the new limits.
+One frame at 126×126 is 2.4 G multiply-accumulates. The accelerator takes those
+off the critical path; what remains is the CPU's element-wise work
+(LayerNorm, softmax, GELU, requantisation) in software floating point, and the
+25 MB of weights crossing DDR3 once per frame.
+
+Two more of the images it has produced, input left and depth right:
+
+![sphere](img/sphere.png)
+![corridor](img/corridor.png)
 
 How it works
 ------------
 
 ![Accelerator architecture](img/accelerator.svg)
-
 
 **Software** (`src/sw/project/`) — ~2000 lines of C, freestanding. Weights are
 int8 with a per-output-channel scale, activations int16 at 14 bits, and each
@@ -41,54 +51,73 @@ the DPT head — funnels through one function, `dav2_qgemm()`. That single choke
 point is why the accelerator needed exactly one attachment point.
 
 **Hardware** (`src/rtl/student/student_gemm.sv`) — a 16-wide
-int8xint16 -> int32 MAC array with its own TL-UL host port. The dataflow is
-inverted weight-stationary: a tile of 16 activation rows loads into 16 private
-BRAMs, then the weight matrix streams past as one contiguous byte stream, each
-weight broadcasting to all 16 multipliers. All three streams are sequential,
-because the DDR3 last-level cache is direct-mapped. An 8-slot reorder buffer
-keyed on `a_source` tolerates out-of-order responses, and the accumulator
-layout is `[m][n]` so writeback stays contiguous.
+int8×int16 → int32 MAC array with its own TL-UL host port. A tile of 16
+activation rows loads into on-chip BRAM once, then the weight matrix streams
+past as one contiguous byte stream, each weight broadcasting to all 16
+multipliers. Weights — the dominant memory traffic — cross the bus exactly
+once. A retry timer re-issues any read the platform's cache fails to answer.
 
 The software kernel never leaves: `dav2_accel_qgemm()` declines any shape the
 hardware cannot take, and a boot-time cross-check disables the block on
 mismatch rather than producing wrong answers.
 
+What it took
+------------
+
+The accelerator was right early. What stood between it and a correct depth
+map were three defects in the platform's DDR3 path — a request-accept
+handshake taken from the wrong module, a cache that wrote back stale data
+when a line was evicted the cycle after it was written, and a prefetcher that
+returned the wrong address's data under collisions. Finding them needed a
+hardware watchdog register (because a CPU wedged on a bus access cannot be
+halted by a debugger) and a testbench driver rewritten to issue requests
+back-to-back like a real CPU. The full account, including the wrong turns, is
+in `docs/DEBUGGING.md`.
+
+Documentation
+-------------
+
+    docs/ARCHITECTURE.md   the SoC, the memory map, the accelerator, the DDR3 path — with diagrams
+    docs/DATAFLOW.md       timing diagrams: the bus handshake, one inference, the write-back bug
+    docs/DEBUGGING.md      every defect: symptom, wrong theories, instrument, fix, verification
+    docs/LESSONS.md        portable rules for the next project
+    docs/HANDOFF.md        current state, what is bypassed, what is not done
+    CLAUDE.md              build, simulate, and run commands
+
 Layout
 ------
 
-    src/rtl/student/student_gemm.sv   the accelerator
-    src/rtl/student/student.sv        bus integration (TL-UL sockets)
-    src/design/reggen/                register map, and the software contract
-    src/sw/project/                   the inference engine and its driver
-    src/sw/project/host/              native build, for verification
-    src/sw/project/tools/             weight export, NumPy reference, board runner
-    src/tb/                           unit and socket-level testbenches
-    report.md                         engineering record and design rationale
-    report_how_it_runs.md             plain-language walkthrough
+    src/rtl/student/student_gemm.sv        the accelerator
+    src/rtl/student/student_tl_watch.sv    stalled-transaction watchdog register
+    src/rtl/student/student.sv             bus integration
+    src/rtl/ddr3/rvlab_tlul_ddr.sv         DDR3 path top (request mux fix, prefetch bypass)
+    src/rtl/ddr3/rvlab_ddr_block_cache.sv  the cache (write-back fix)
+    src/design/reggen/                     register maps
+    src/sw/project/                        the inference engine
+    src/sw/project/host/                   native build — the oracle
+    src/sw/project/tools/                  weight export, board runner, image patcher
+    src/tb/                                testbenches
 
-Building
---------
+Building and running
+--------------------
 
-    flow sw_project build                      # RISC-V program
-    flow student_gemm_tb sim_rtl_xsim          # accelerator unit tests
-    flow systb_project sim_rtl_xsim_batch      # full system simulation
-    flow rvlab_fpga_top syn pnr bitstream      # bitstream
+    source .venv/bin/activate
+    flow sw_project.build                       # RISC-V program
+    flow student_gemm_tb.sim_rtl_xsim           # accelerator unit test
+    flow rvlab_ddr_alias_tb.sim_rtl_xsim        # the cache and prefetcher tests
+    flow rvlab_fpga_top.bitstream               # syn + pnr + bitstream
+    flow rvlab_fpga_top.program                 # load onto the board
+    python -u src/sw/project/tools/dav2_run_fpga.py --timeout 900
 
-The same engine sources also build natively, which is the fast way to check a
-change against the PyTorch reference:
+The same engine sources build natively, which is the fast way to check any
+change and the reference every board result must match bit for bit:
 
-    make -C src/sw/project/host run
+    make -C src/sw/project/host
+    ./src/sw/project/host/dav2_host build/dav2/dav2_weights.bin out.bin
 
-Status
-------
-
-Verified: the engine against PyTorch on a host; the kernels bit-exactly on the
-CV32E40P in RTL simulation; the accelerator against a memory model that answers
-out of order (1672 words, exact); hardware and software agreeing on the core at
-boot; and a bitstream that closes timing.
-
-Not yet done: no board run, and no DDR3-inclusive system simulation. Every
-number above comes from simulation or static analysis.
+To run a different image, `src/sw/project/tools/dav2_patch_image.py` rewrites
+the image tensors in a copy of the blob — synthetic scenes built in, or any
+binary P6 PPM — with no torch required.
 
 Built on
 --------
@@ -100,4 +129,5 @@ The platform's own documentation is at
 instructions are in `docs/tutorials/setup/index.rst`.
 
 Third-party sources under `src/rtl/` (CV32E40P, the TL-UL fabric, OpenTitan
-primitives) are unmodified.
+primitives, the UberDDR3 controller) are unmodified. Two RVLab platform files
+in `src/rtl/ddr3/` carry fixes, each documented at the change.

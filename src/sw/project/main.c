@@ -1,16 +1,37 @@
 /* SPDX-License-Identifier: CC0-1.0
  * SPDX-FileCopyrightText: 2026 RVLab Student Project
  *
- * Depth-Anything V2 Small on the rvlab SoC.
+ * Depth-Anything V2 Small on the rvlab SoC -- the program the CPU runs.
+ *
+ * What happens, in order:
+ *   1. Print a banner and run dav2_selftest (a checksum that must match the
+ *      host build bit for bit) and the accelerator's small self-check.
+ *   2. Bring up DDR3 and wait for the host to load the weights over JTAG.
+ *   3. Run one inference (dav2_infer in dav2_engine.c) into a float depth map.
+ *   4. Print the depth map as hex so the host can capture it.
  *
  * DDR3 map (see docs/design_ref/memory_map.rst -- DDR3 starts at 0x80000000):
  *
  *   0x80000000  weight blob produced by tools/export_dav2.py (~25 MB)
  *   0x82000000  activation arena for the engine (peak ~16 MB at 126x126)
- *   0x8F000000  handshake word written by the host loader once the blob is in
  *
- * The CPU cannot pull 25 MB in by itself, so the flow loads the blob over JTAG
- * (see flow/tools/dav2_loader.py) while this program waits at the handshake.
+ * The handshake that says "weights are in" is the BRAM variable dav2_go
+ * below, NOT a DDR3 address -- see its comment. The CPU cannot pull 25 MB in
+ * by itself, so the host script (src/sw/project/tools/dav2_run_fpga.py) loads
+ * the blob over JTAG while this program spins at the handshake, then writes
+ * the flag.
+ *
+ * How this file fits with the others:
+ *   dav2_engine.c   the network: patch embedding, 12 transformer blocks, DPT head
+ *   dav2_ops.c      the quantised kernels those layers are built from
+ *   dav2_accel.c    driver for the hardware GEMM; the kernels call it first
+ *   dav2_blob.c     finds tensors by name in the weight blob
+ *   dav2_mathf.c    sqrt/exp/erf, because there is no libm in a -nostdlib build
+ *   dav2_selftest.c the bit-exactness checksum
+ *
+ * "Blob" throughout means the single file of weights plus input image that
+ * export_dav2.py produces; "arena" is a bump allocator (allocate by moving a
+ * pointer forward, free by moving it back) over a DDR3 region.
  */
 
 #include <stdio.h>
@@ -26,8 +47,7 @@ void dav2_selftest_report(void);
 #define BLOB_ADDR   0x80000000u
 #define ARENA_ADDR  0x82000000u
 #define ARENA_SIZE  (64u * 1024u * 1024u)
-#define GO_ADDR     0x8F000000u
-#define GO_MAGIC    0xD00DFEEDu
+#define GO_MAGIC    0xD00DFEEDu   /* value the host writes into dav2_go */
 
 /* Handshake flag, polled by main() and written over JTAG by the host loader.
  * Must live in BRAM -- see the comment at its use below. */
@@ -255,7 +275,7 @@ int main(void)
          * with every buffer in DDR3. 81x588x384 -- patch embedding -- loses
          * one accumulator word of 31104, deterministically; the same shape
          * passes in student_gemm_tb against ideal memory, so the fault is on
-         * the DDR3 path rather than in the GEMM. See HANDOFF.md. */
+         * the DDR3 path rather than in the GEMM. See docs/DEBUGGING.md. */
         static const int shapes[][3] = {
             { DAV2_N_TOKENS,   384,  384 },   /* proj            */
             { DAV2_N_TOKENS,   384, 1152 },   /* qkv             */

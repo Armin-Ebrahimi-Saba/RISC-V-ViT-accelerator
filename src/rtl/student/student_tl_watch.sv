@@ -18,6 +18,24 @@
 // It is a pure observer. It drives nothing on the bus and cannot perturb the
 // traffic it watches, which matters when the bug being chased is a lost
 // handshake.
+//
+// Instantiated in rvlab_tlul_ddr.sv on the DDR3 TL-UL port; the two outputs
+// are the ddr_ctrl registers wdog_addr (+0x4) and wdog_stat (+0x8), see
+// src/design/reggen/ddr_ctrl.hjson.  Read them over JTAG with
+//   ocd.readword(0x1F001004) / (0x1F001008)
+// -- dav2_run_fpga.py does this automatically when a run times out.
+//
+// wdog_stat packs {stall_cycles[15:0], src[7:0], outstanding[4:0],
+// opcode[2:0]}. The source id says which master issued the request: on this
+// SoC the low two bits index the crossbar's DDR3 hosts (0 CPU instruction,
+// 1 CPU data, 2 debug module, 3 student host) and, for the student host, the
+// next bit selects DMA (0) or GEMM (1).  This is what located the CPU hang:
+// one line read "PutFullData from the GEMM write engine, 30 outstanding,
+// stalled counter saturated".
+//
+// "Outstanding" means issued but not yet answered.  "Saturating" means the
+// counter stops at its maximum instead of wrapping to zero, so a pinned
+// maximum is unambiguous evidence of a hang.
 
 module student_tl_watch #(
     // Requests may be outstanding this many at once before the counter

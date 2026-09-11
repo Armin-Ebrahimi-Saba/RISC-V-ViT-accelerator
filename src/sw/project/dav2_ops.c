@@ -2,6 +2,26 @@
  * SPDX-FileCopyrightText: 2026 RVLab Student Project
  *
  * Quantised kernels. See dav2.h for the numeric contract.
+ *
+ * Everything the network is built from lives here: the arena allocator, the
+ * fixed-point helpers, GEMM, LayerNorm, GELU, residual add and the bilinear
+ * resampler. dav2_engine.c composes these into layers; it never touches a
+ * number itself.
+ *
+ * Terms:
+ *   quantised   stored as a small integer plus one float scale: real = q*scale
+ *   requantise  turn an int32 accumulator (the sum of many int8*int16
+ *               products) back into a 14-bit int16 activation, using a
+ *               precomputed (multiplier, shift) pair instead of a float divide
+ *   GEMM        general matrix multiply, C = A * W^T; every linear layer,
+ *               attention projection and MLP is one
+ *   arena       bump allocator over a DDR3 region: alloc moves a pointer up,
+ *               release moves it back to a saved mark
+ *
+ * Every GEMM goes through dav2_qgemm(), which asks the accelerator first and
+ * falls back to dav2_qgemm_cpu() if it declines. Both produce the same int32
+ * accumulators, so the requantisation after them is common code and the
+ * result is bit-identical whichever ran.
  */
 
 #include "dav2.h"
@@ -270,16 +290,19 @@ void dav2_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, dav2_tensor_t *out)
     /* Row-major over the output, not column-major.
      *
      * The obvious loop (m outer, writing out->v[n*M + m]) strides the store by
-     * M*2 = 768 bytes, so nearly every store misses and forces a dirty
-     * eviction from the 16 kB direct-mapped DDR3 cache. That matters far more
-     * than cache efficiency here: an eviction can lose the response to the
-     * next read (see report_errors.md), and unlike the accelerator the CPU has
-     * no retry -- a lost load response stalls the core permanently. Measured
-     * on hardware: this loop hung within its first 64 outer iterations.
+     * M*2 = 768 bytes, so nearly every store misses the 16 kB direct-mapped
+     * DDR3 cache and forces a dirty-line write-back (a "dirty" line is one
+     * holding data not yet copied to DRAM; "direct-mapped" means each address
+     * can live in exactly one cache slot, so two addresses 16 kB apart fight
+     * for it). Iterating n outer / m inner makes the stores sequential and
+     * strides the *reads* instead; a read miss brings in a clean line, so it
+     * costs a fill but never a write-back. Bit-identical result, better
+     * locality.
      *
-     * Iterating n outer / m inner makes the stores sequential and strides the
-     * *reads* instead. A read miss brings in a clean line, so it costs a fill
-     * but never a write-back. */
+     * (An earlier version of this comment claimed the m-outer loop hung the
+     * CPU. It did hang here, but the cause was a bus defect since fixed --
+     * the DDR3 request mux took a_ready from the wrong module -- not the loop
+     * order. Kept row-major for locality alone.) */
     for (int n = 0; n < N; n++) {
         int16_t *orow = out->v + (size_t)n * M;
         for (int m = 0; m < M; m++)

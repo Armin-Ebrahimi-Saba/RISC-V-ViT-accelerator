@@ -4,12 +4,20 @@
 // student_gemm against the REAL rvlab DDR3 front end.
 //
 //   student_gemm ---+
-//                   |-- tlul_socket_m1 -- rvlab_ddr_cache -- rvlab_ddr_prefetch -- ddr3_blk_model
-//   testbench host -+        (real)            (real)              (real)           (behavioural)
+//                   |-- tlul_socket_m1 -- rvlab_ddr_cache --[prefetch]-- ddr3_blk_model
+//   testbench host -+        (real)            (real)       (bypassed)     (behavioural)
 //
 // Only the block manager, DDR3 controller and PHY are replaced, so this
-// exercises the cache and prefetch logic the board actually runs without
-// paying the ~90 minutes of DDR3 calibration a system simulation needs.
+// exercises the cache logic the board actually runs without paying the
+// ~90 minutes of DDR3 calibration a system simulation needs. The prefetcher
+// is bypassed (BYPASS_PREFETCH=1) to match rvlab_tlul_ddr.sv, where it is
+// switched off for returning aliased lines; set it to 0 to test that path.
+//
+// Run:  flow student_gemm_ddrpath_tb.sim_rtl_xsim
+//
+// Note: this bench was found (by code review) to have compiled the DUT and
+// then driven nothing, reporting "PASSED (0 words checked)". It now runs
+// three shapes and treats zero words checked as a failure.
 //
 // The testbench reaches memory through its own port on the same socket rather
 // than poking the backend array. rvlab_ddr_cache is write-back: data written

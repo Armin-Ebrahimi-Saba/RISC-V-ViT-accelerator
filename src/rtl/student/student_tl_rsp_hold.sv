@@ -25,6 +25,20 @@
 // DEPTH is the number of responses that may be outstanding at once.  Two is
 // enough to keep a single-outstanding host from ever stalling on the A
 // channel while a response is still being accepted.
+//
+// Status: instantiated in rvlab_tlul_ddr.sv behind USE_RSP_HOLD, currently 0.
+// It was written before the real cause of the CPU hang was found (the DDR3
+// request mux took a_ready from the wrong module) and it turned out to make
+// that defect worse, because its credit throttle deasserts a_ready -- the
+// very signal the broken mux was ignoring.  With the mux fixed the buffer is
+// correct but has not been shown to be necessary, so it is switched off
+// rather than removed.  Verified either way by src/tb/rvlab_ddr_dready_tb.sv,
+// which fails with USE_SKID=0 and passes with USE_SKID=1.
+//
+// Terms: a "skid buffer" is a small FIFO placed on a valid/ready interface so
+// the upstream side can be told "always ready" while the downstream side is
+// allowed to stall; a "credit" is a count of how many more items the buffer
+// has room for.
 
 module student_tl_rsp_hold #(
     parameter int unsigned DEPTH = 2

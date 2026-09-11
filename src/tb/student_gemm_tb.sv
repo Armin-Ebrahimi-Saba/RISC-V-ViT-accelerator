@@ -7,10 +7,19 @@
 // tiling loop, same register order -- against a TL-UL memory that answers out
 // of order, and compares every output word against a behavioural model.
 //
-// Run standalone:
+// Run:  flow student_gemm_tb.sim_rtl_xsim        (seconds)
+//
+// Or standalone:
 //   xvlog -sv <pkgs> <tlul sources> src/rtl/student/student_gemm.sv \
 //              src/tb/tlul_test_mem.sv src/tb/student_gemm_tb.sv
 //   xelab work.student_gemm_tb -s gemm && xsim gemm -runall
+//
+// This is the fast, ideal-memory test. Its siblings cover what it cannot:
+//   student_gemm_droprsp_tb   a read response deliberately dropped
+//   student_gemm_ddrpath_tb   the real DDR3 cache in the path
+// A shape that passes here but fails on the board (as 81x588x384 once did)
+// is therefore a memory-path fault, not an accelerator fault -- that
+// distinction is exactly what this bench is for.
 
 module student_gemm_tb;
 

@@ -1,16 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 // SPDX-FileCopyrightText: 2026 RVLab Student Project
 //
-// Unit testbench for the int8 GEMM accelerator.
+// Regression test for the accelerator's lost-response recovery.
 //
-// It drives the register interface exactly the way dav2_accel.c does -- same
-// tiling loop, same register order -- against a TL-UL memory that answers out
-// of order, and compares every output word against a behavioural model.
+// The rvlab DDR3 cache can lose a read response outright (it pulses d_valid
+// for one cycle without honouring d_ready). student_gemm survives that with a
+// retry timer: a read unanswered for RETRY_CYCLES is re-issued. This bench
+// proves the timer works by using tlul_test_mem's DROP_NTH_RD parameter to
+// accept the 200th read and never answer it.
 //
-// Run standalone:
-//   xvlog -sv <pkgs> <tlul sources> src/rtl/student/student_gemm.sv \
-//              src/tb/tlul_test_mem.sv src/tb/student_gemm_tb.sv
-//   xelab work.student_gemm_tb -s gemm && xsim gemm -runall
+// Expected: the job still completes and every output word is correct.
+// Without the retry (RETRY_CYCLES=0) the job hangs with STATUS=0x1 forever --
+// that failing case was run deliberately before the retry was trusted, since
+// a test that cannot fail proves nothing.
+//
+// Otherwise identical to student_gemm_tb: same register sequence as
+// dav2_accel.c, same behavioural model for the expected values.
+//
+// Run:  flow student_gemm_droprsp_tb.sim_rtl_xsim
 
 module student_gemm_droprsp_tb;
 

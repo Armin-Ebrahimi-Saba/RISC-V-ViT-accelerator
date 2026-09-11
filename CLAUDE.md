@@ -9,8 +9,6 @@ Model weights should be stored on the DRAM (DDR3)
 
 Our hardware is Xilinx Artix-7 XC7A200T.
 
-
-
 # Run
 
 All flow commands need `source .venv/bin/activate` first. `flow` with no
@@ -66,3 +64,7 @@ You may define new registers that hold the debugging info needed.
 # Git
 
 Do not mention yourself as contributor.
+
+# Output
+
+Depth images produced by the FPGA and pytorch side-by-side.

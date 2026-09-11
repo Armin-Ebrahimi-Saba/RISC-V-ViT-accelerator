@@ -37,6 +37,24 @@
 //
 // Everything the software contract needs is documented in
 // src/design/reggen/student_gemm.hjson.
+//
+// Where this fits
+// ---------------
+//
+//   src/rtl/student/student.sv          instantiates this block, gives it a
+//                                       register window and a host port
+//   src/design/reggen/student_gemm.hjson the register map (generated into
+//                                       student_gemm_reg_top / _reg_pkg)
+//   src/sw/project/dav2_accel.c         the driver: tiles a GEMM into jobs
+//                                       of NROWS rows and polls STATUS
+//   src/tb/student_gemm_tb.sv           module test against ideal memory
+//   src/tb/student_gemm_ddrpath_tb.sv   same, through the real DDR3 cache
+//   src/tb/student_gemm_droprsp_tb.sv   proves the lost-response retry works
+//
+// Terms used below: a "beat" is one 32-bit transfer on the TL-UL bus; a
+// "tile" is the NROWS activation rows a job processes; "MAC" is one
+// multiply-accumulate; "requantisation" (done in software, not here) scales
+// the int32 accumulators back to int16 activations.
 
 module student_gemm #(
   // Activation rows held in the tile == multipliers == MACs per cycle.
@@ -45,11 +63,15 @@ module student_gemm #(
   parameter int unsigned KMAX        = 2048,
   // Read requests in flight (also the write-ack credit). Power of two.
   parameter int unsigned OUTSTANDING = 8,
-  // Requests actually allowed in flight at once. The rvlab DDR3 path answers a
-  // request in the same cycle it accepts it -- rvlab_ddr_prefetch derives the
-  // response's ancillary from the request currently presented on its A channel
-  // -- so it cannot hold a transaction whose response comes later. Against that
-  // memory this must be 1; against BRAM the full OUTSTANDING depth works.
+  // Requests actually allowed in flight at once. student.sv sets this to 1
+  // for the DDR3-facing instance. The reason is the rvlab cache's response
+  // handshake: it pulses d_valid for a single cycle without consulting
+  // d_ready, so a response that arrives while this block is busy with
+  // another is lost. With one request in flight the response can always be
+  // taken the cycle it appears. (An earlier version of this comment blamed
+  // rvlab_ddr_prefetch; that block is now bypassed for an unrelated aliasing
+  // defect, and the cache constraint above still applies.) Against ideal
+  // BRAM the full OUTSTANDING depth works.
   parameter int unsigned MAX_INFLIGHT = OUTSTANDING,
   // Cycles an outstanding read may go unanswered before it is re-issued. The
   // rvlab DDR3 cache pulses d_valid for one cycle without consulting d_ready,
@@ -606,12 +628,18 @@ module student_gemm #(
   // its outstanding read was never accepted, or accepted and never answered;
   // rb_cnt alone cannot distinguish those.
   //
-  // wr_issue_cnt_q / wr_ack_cnt_q count writes specifically. On hardware one
-  // accumulator word per job is never written, always a tile's final row,
-  // while the job still completes -- so every issued write was acknowledged
-  // and the lost one was most likely never issued. Comparing issued writes
-  // against n_rows * m_len per job says so directly, without a simulation
-  // that has so far failed to reproduce the loss.
+  // wr_issue_cnt_q / wr_ack_cnt_q count writes specifically, exposed on dbg2
+  // as {issued, acked} for the job just finished. Software compares them
+  // against n_rows * m_len, the number of writes a job owes.
+  //
+  // History: these were added to test the theory that an accumulator word
+  // lost on hardware (always a tile's final row) was never issued by this
+  // block. They showed issued == acked == owed on every job, which
+  // exonerated the accelerator: the write reached the bus and was acked, and
+  // the data was lost downstream. The real fault was rvlab_ddr_block_cache
+  // writing back a line with data one cycle stale (fixed there). The counters
+  // stay because "did the block issue every write it owed" is a question
+  // worth being able to answer in one register read.
   logic [31:0] acc_cnt_q, rsp_cnt_q;
   logic [15:0] wr_issue_cnt_q, wr_ack_cnt_q;
   always_ff @(posedge clk_i or negedge rst_ni) begin

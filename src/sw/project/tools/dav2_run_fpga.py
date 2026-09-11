@@ -1,25 +1,43 @@
 # SPDX-License-Identifier: CC0-1.0
 # SPDX-FileCopyrightText: 2026 RVLab Student Project
 """
-Run Depth-Anything V2 on the Nexys Video board.
+Run Depth-Anything V2 on the Nexys Video board: one frame, end to end.
 
 Sequence:
   1. start OpenOCD against the FPGA, reset-halt the CPU and load the program
   2. wait for the program to initialise DDR3 and print DAV2_WAITING_FOR_WEIGHTS
-  3. push the ~25 MB weight blob into DDR3 at 0x80000000 over JTAG
-  4. write the handshake word so the program starts inference
+  3. push the ~25 MB weight blob into DDR3 at 0x80000000 over JTAG (~1 min)
+  4. write the handshake word so the program starts inference (~95 s)
   5. stream stdout, capture the hex-encoded depth map and save it as .npy
 
-Usage (from the repository root, with the rvlab environment set up):
+Usage (from the repository root, after `source .venv/bin/activate`):
 
-    python src/sw/project/tools/dav2_run_fpga.py \
-        --elf build/sw_project/build/sw.elf \
-        --blob build/dav2/dav2_weights.bin \
-        --out build/dav2/fpga_depth.npy
+    python -u src/sw/project/tools/dav2_run_fpga.py --timeout 300
 
-Note on speed: the blob crosses JTAG one OpenOCD `load_image` at a time. This
-is the slow part of the run (minutes), which is why the weights are loaded once
-and the program then loops on inference rather than reloading per frame.
+Options: --blob for a different weight/image file (see dav2_patch_image.py),
+--out for the result path, --verify-sampled to spot-check DDR3 against the
+file after loading.
+
+Terms: "OpenOCD" is the program that talks to the board's JTAG debug port;
+"hostio" is the 1 kB console ring buffer in BRAM that the program prints
+into and this script drains; "sysbus"/"system-bus access" is the debug
+module reading memory directly, without the CPU's help -- which is why it
+still works when the CPU is wedged.
+
+If the run times out, the script does NOT simply give up. It samples the
+accelerator's debug registers and the console indices over sysbus (no halt,
+no disturbance), reads the DDR3 stalled-transaction watchdog (student_tl_watch,
+the register that located the CPU hang), and only then tries to halt the core
+by writing the debug module's haltreq bit directly. OpenOCD's own `halt` is
+a no-op on this target. A core wedged on a bus access that never completes
+cannot halt at all, and the script says so rather than printing empty
+registers.
+
+Two traps this script avoids, both learned the hard way:
+  - openocd.start() resets the core. Never attach a second OpenOCD to inspect
+    a running board -- every reading would be of a freshly restarted program.
+  - `with OpenOcd() as ocd:` sends `shutdown` on exit, which kills the
+    OpenOCD a live run depends on. Peek with a raw socket instead.
 """
 import argparse
 import subprocess

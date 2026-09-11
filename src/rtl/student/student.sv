@@ -1,5 +1,24 @@
 // SPDX-License-Identifier: SHL-2.1
 // SPDX-FileCopyrightText: 2024 RVLab Contributors
+//
+// Top of the student-owned logic. Everything the project adds to the SoC
+// hangs off this module; the platform (CPU, crossbar, DDR3, debug module)
+// instantiates it once and gives it three bus connections:
+//
+//   tl_device_peri_*   a slow register window for peripherals (the LEDs)
+//   tl_device_fast_*   a 256 MB window at 0x2000_0000 for register blocks
+//                      that need low latency (the DMA and GEMM controls)
+//   tl_host_*          one master port into the crossbar, so student logic
+//                      can read and write memory on its own
+//
+// TL-UL ("TileLink Uncached Lightweight") is the on-chip bus: a request
+// channel A (address, opcode, data) and a response channel D, each with a
+// valid/ready handshake. A "device" answers requests; a "host" issues them.
+// This module is a device on two ports and a host on one.
+//
+// Two masters share the single host port -- the DMA engine and the GEMM
+// accelerator -- merged by a standard tlul_socket_m1. The fast device window
+// is split between their register blocks by address with a tlul_socket_1n.
 
 module student (
   input logic clk_i,
@@ -98,8 +117,10 @@ module student (
     .tl_host_i (host_d2h[0])
   );
 
-  // MAX_INFLIGHT(1): the DDR3 path cannot hold a transaction whose response
-  // comes after the request is withdrawn. See student_gemm.sv.
+  // MAX_INFLIGHT(1): the rvlab DDR3 cache pulses its response for a single
+  // cycle regardless of d_ready, so a master with more than one request in
+  // flight can miss one. One at a time is the safe setting against that
+  // memory. See the parameter comment in student_gemm.sv.
   student_gemm #(
     .MAX_INFLIGHT(1)
   ) gemm_i (
