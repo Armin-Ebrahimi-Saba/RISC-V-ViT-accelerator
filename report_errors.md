@@ -89,6 +89,15 @@ than reasoning further about the symptom.
   against a fast one, same RTL.
 * **"An `nt=1` partial-tile edge case."** `N=1`, `N=17` (the 16→1 transition)
   and `N=16` all pass at `MAX_INFLIGHT=1` against single-outstanding memory.
+* **"The lost write is in `student_gemm.sv`'s drain logic."** Per-job write
+  counters showed `issued == acked == owed` on the failing job. The accelerator
+  issued every write; the cache lost one on write-back (section 15).
+* **"DDR3 loses 111 words under random access."** The test's checker compared
+  against a superseded write; 111 was the number of repeated addresses. Memory
+  passes 0/65536 with the checker fixed (section 16).
+* **"Stall-gating the cache's data/dirty lookups fixes the lost write."** It
+  passed a test that also passed on unfixed RTL. The real mechanism was the
+  write-back data source (section 15).
 
 ## 6. The board hang — root cause and fix
 
@@ -174,7 +183,7 @@ defaulted off and the test exercised the old path entirely. A parameter that
 was never enabled was declared safe and put on hardware, where it disabled the
 accelerator at boot. Reverted, with the dead end recorded at the declaration.
 
-## 9. Still open
+## 9. Still open (superseded — see section 17 for the current state)
 
 The accelerator works on hardware. **The bottleneck is now the scalar CPU
 code**: the accelerator finishes patch embedding's GEMM in ~0.5 s, while the
@@ -309,56 +318,164 @@ lands with the first chunk: the CPU began inference against a blob still being
 written underneath it, and DDR3 read-back failed outright seconds later.
 Reverted. Only the flag means the transfer finished.
 
-## 14. Where this leaves the project
+## 14. The prefetcher returns the wrong line under aliasing
 
-**Fixed and verified on hardware:** the request-acceptance defect (section
-11). The model now runs patch embedding and transformer blocks 1–7+, which no
-build before this ever did.
-
-**New, open, and different:** blob lookups intermittently return garbage
-during those blocks —
+Once section 11's hang was gone, the run reached the transformer blocks and
+began reporting tensors as absent that are demonstrably present:
 
     dav2: tensor 'blk1.qkv.w' not found in blob
-    dav2: 'blk6.fc1' has k=2143289344, expected 384
+    dav2: 'blk6.fc1' has k=2143289344, expected 384      (0x7FC00000, a NaN pattern)
 
-The run no longer *hangs*; it now reads **wrong data**. That is a distinct
-failure and needs a distinct hypothesis. The natural suspect is the response
-path rather than the request path: `rvlab_ddr_block_cache` still pulses
-`d_valid` for one cycle and ignores front-end `d_ready` (section 6, proven in
-`src/tb/rvlab_ddr_dready_tb.sv`), and `rvlab_ddr_cache` selects `d_data` by
-the *current* `d_anc[2:0]` word-select combinationally, so a delayed or
-mismatched response can return the wrong word. Check response-to-request
-correspondence (`d_source`, word select) before anything else. The watchdog
-register is the tool to extend here.
+Each miss failed **twice in a row** when `dav2_find` was made to retry, so it
+was not a transient bad read. A device-side FNV checksum over all 24,871,428
+blob bytes, read through the CPU's own path, matched the file exactly. So the
+weights were correct in DDR3 and the CPU's *cached* reads of them were wrong.
 
-**Not established.** Whether the accelerator's own retry logic is still
-needed now that requests are no longer swallowed, and whether the skid buffer
-should stay. Both were designed against a defect that is now fixed at its
-source; both should be re-evaluated, and the skid buffer in particular is the
-component that amplified section 11's defect.
+**Cause.** `rvlab_ddr_prefetch` returns the alias partner's line, another
+set's line, or zeros when two regions collide in the direct-mapped cache. The
+blob at `0x80000000` and the arena at `0x82000000` differ only in tag, so
+every set aliases, and the 21 kB blob directory is scanned linearly on every
+lookup while the accelerator writes the arena.
 
-**Still true:** no FPGA depth map exists. The only complete inference remains
-the host x86 build (`src/sw/project/host/dav2_host`), which runs the whole
-model in ~4 s at correlation 0.99984 against PyTorch, and is the reference for
-any hardware result.
+**Proof.** `src/tb/rvlab_ddr_alias_tb.sv` walks that pattern against the real
+`rvlab_ddr_cache` + `rvlab_ddr_prefetch` with `ddr3_blk_model` behind them.
+With the prefetcher in the path, 65 of 256 reads return wrong data
+(`got 820100a5 want 800100a5 <-- ARENA'S DATA`). With it bypassed, 256/256
+pass — so the cache is not at fault.
 
-**Uncommitted at handoff** (last commit `4a833df`):
+**Fix.** `USE_PREFETCH = 1'b0` in `rvlab_tlul_ddr.sv`. This is a bypass, not
+a repair; it costs read bandwidth. On hardware the miss count went from 61
+per run to 0. The prefetcher's invalidation logic *looks* correct on
+inspection (PUT matches invalidate, pending entries go `Stale`), which is why
+it is bypassed rather than patched — the fault was not localised inside it.
 
-| Path | What |
-|---|---|
-| `src/rtl/ddr3/rvlab_tlul_ddr.sv` | the `a_ready` fix; watchdog instantiation; `RVLAB_DDR_BEHAVIOURAL` guard |
-| `src/rtl/student/student_tl_watch.sv` | new — the stalled-transaction watchdog |
-| `src/design/reggen/ddr_ctrl.hjson` | new `wdog_addr` / `wdog_stat` registers |
-| `src/sw/project/tools/dav2_run_fpga.py` | `dm_halt` via DMI; live sysbus sampling; watchdog readout |
-| `src/tb/ddr3_blk_model.sv` | backdoor `+ddr_blob` image load |
-| `flow/system_tb.py` | `sim_ddrmodel_xsim` task (behavioural DDR3 back end) |
-| `flow/tools/xsim.py` | one `--testplusarg` per plusarg — they were being concatenated |
-| `src/sw/project/main.c` | premature start condition reverted (section 13) |
+## 15. One lost accumulator word — a cache write-back bug
 
-**Watch out:** inserting registers into `ddr_ctrl.hjson` shifted `ctrl` from
-`+0x4` to `+0xc`. Rebuild `libsys` **and** `sw_project` after any reggen
-change, or `ddr_init.c` writes the DDR3 reset bit into a read-only register
-and the controller never leaves reset.
+With lookups fixed, inference completed but the depth map was wrong:
+r = 0.19 against the host build, which itself matches PyTorch at r = 0.9998.
+The engine is correct; the target diverges.
 
-Also note `TASK.md` currently shows as deleted in the working tree; that looks
-unintentional and was not done as part of this work.
+**Narrowing it.** `dav2_accel_bigcheck` compares the accelerator against the
+CPU kernel at model shapes, all buffers in DDR3. Four of five shapes were
+bit-exact; patch embedding, 81×588×384, lost **exactly one word** of 31,104,
+deterministically (`hw 0`, `sw -4690841`, same index six runs running).
+A shape sweep showed N is the trigger, not K: 49, 65, 79, 81, 97 fail;
+17, 33, 80, 82, 83 pass. The same shape passes in `student_gemm_tb` against
+ideal memory, so the accelerator's logic was clean and the fault needed the
+real cache's back-pressure.
+
+Three more measurements, each ruling something out:
+
+- Evicting the line and re-reading still gave 0 → **lost, not read stale**.
+- Every lost word was a tile's final row (`n ≡ 15 mod 16`, or the single row
+  of a partial last tile) → the write issued immediately before the next
+  tile's first access evicts it.
+- Per-job counters packed into `dbg2` (`{writes issued, writes acked}`)
+  showed `issued == acked == nt × M` on the failing job → the accelerator put
+  the write on the bus and the bus acknowledged it. **This exonerated
+  `student_gemm.sv`** and moved the fault downstream.
+
+**Cause.** `rvlab_ddr_block_cache.sv` issued dirty-line write-backs with
+`a_data: data_rdata_raw` — the raw RAM output, which is one cycle stale when
+the line being evicted was written on the immediately preceding access. The
+write-first-forwarded `data_rdata` (via `data_wen_q`) exists for exactly that
+window and was already used for the front-end response, but never for the
+back-end write-back. Two back-to-back misses to the same set — write a line,
+then evict it — sent the pre-write contents to DDR3. The cache acks the
+write, then writes back the wrong bytes; that is why `issued == acked` with
+the data gone.
+
+**Fix.** One line: `a_data: data_rdata`. (Also gated the data/dirty lookups
+on `stall` to match the tag lookup — correct, but *not* the mechanism; see
+below.)
+
+**Proof, and why the first attempt proved nothing.** The aliasing testbench
+passed on unfixed RTL because `tlul_test_host` waits for each response before
+presenting the next request, so a stalled miss never has a second request
+behind it — the exact condition the defect needs. Driving the bus
+**pipelined** (next request presented the moment the previous is accepted, as
+a CPU does) made it fail on unfixed RTL at a single word, `80004340`, whose
+write was immediately followed by a write to the same set. The stall-gating
+"fix" passed that test — and so did unfixed RTL, i.e. the test had no power
+until the driver was pipelined. The negative control is what separated a
+real fix from a plausible one.
+
+**Result.** Every GEMM shape bit-exact. Full inference output identical to
+the host in all 15,876 pixels — r = 1.000000 against host, r = 0.999836
+against PyTorch. 93.6 s per frame, 0.0107 FPS.
+
+This fix is in platform RTL (`rvlab_ddr_block_cache.sv`, RVLab code, not a
+vendored third-party library) and is worth upstreaming.
+
+## 16. A finding that was wrong: "DDR3 loses 111 words"
+
+Recorded in commit `8dcdee1` and retracted in `1c8aa6f`. A random
+write-then-read test over the 64 MB arena reported 111 of 65,536 words wrong,
+stable across runs, with the wrong value always being *another valid word*.
+Two controls — random access confined to 8 kB (no evictions) and sequential
+access across the arena — both passed, which was read as "only out-of-order
+eviction loses data".
+
+**It was the checker.** The random sequence picks some addresses more than
+once, and the naive check compared each op against its own value rather than
+the *last* value written there. The number of repeated addresses in the
+sequence is exactly 111. The "wrong" values were correct: they were the later
+write. The controls "isolated" nothing — sequential never repeats an address
+and the in-cache test compared immediately after each write.
+
+With a repeat-address bitmap, DDR3 passes **0/65536** on random, in-cache and
+sequential patterns. The memory was never at fault.
+
+> Rule: a memory test that does not account for duplicate addresses is
+> measuring its own generator. Build the last-writer check in before
+> trusting a single number from it — the simulation testbench had this check
+> from the start and the hardware test did not.
+
+## 17. Where this leaves the project
+
+**Done and verified on hardware.** The full Depth-Anything V2 inference runs
+on the FPGA and is bit-exact with the host reference. Three real defects were
+found and fixed along the way, none of them in the accelerator or the model:
+
+| Defect | Where | Fix | Section |
+|---|---|---|---|
+| `a_ready` taken from the idle error responder; requests accepted by nobody | `rvlab_tlul_ddr.sv` | source `a_ready` from the module that will accept | 11 |
+| prefetcher returns aliased lines | `rvlab_ddr_prefetch.sv` | bypassed (`USE_PREFETCH=0`) | 14 |
+| write-back uses stale RAM output for a line written the previous cycle | `rvlab_ddr_block_cache.sv` | `a_data: data_rdata` | 15 |
+
+Plus the cache's `d_ready` defect (section 6), still worked around by
+`student_tl_rsp_hold` rather than fixed at source.
+
+**Instruments that made the difference**, in order of leverage:
+
+1. `student_tl_watch` — hardware watchdog register, readable over JTAG
+   sysbus on a wedged core. Found section 11 in one line.
+2. `dav2_accel_bigcheck` — accelerator vs CPU kernel at model shapes in DDR3.
+   Localised section 15 to one word, then exonerated the accelerator.
+3. `rvlab_ddr_alias_tb` driven **pipelined** — reproduced section 15 in
+   simulation. Serialised driving could not.
+4. The negative control, every time. Two "fixes" in this project passed
+   tests that also passed unfixed.
+
+**Not done.**
+
+- `rvlab_ddr_prefetch` is bypassed, not repaired. Read bandwidth is lower
+  than it could be.
+- `student_gemm`'s retry re-issues reads only; a dropped write ack would
+  still wedge the block (ultrareview finding, pre-existing). Now that
+  requests are no longer swallowed it may never trigger, but it is a real
+  hang path.
+- `main.c` prints `inference finished in N kcycles` from two 32-bit `mcycle`
+  reads across an interval that wraps; it under-reports by whole multiples
+  of 85.9 s. Sum the stage timestamps with wrap correction instead.
+- `sim_ddrmodel_xsim` works (blob loads, behavioural back end reports) but
+  still needs a start condition that does not depend on a host writing
+  `dav2_go`. The blob-header shortcut is **not** acceptable (section 13).
+- `student_gemm_ddrpath_tb` fails wholesale in its current environment and
+  does not model the board; do not trust it until that is fixed.
+- Frame time is 93.6 s. The accelerator is ~36× faster than the CPU kernel
+  for GEMM, so the remaining time is CPU-side float bookkeeping and the
+  JTAG-bound console; profiling has not been done.
+
+**All work is committed** through `1c8aa6f` on `student-gemm-accelerator`,
+pushed to the `armin` remote.
