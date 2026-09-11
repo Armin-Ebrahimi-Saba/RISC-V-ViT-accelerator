@@ -128,6 +128,84 @@ module rvlab_ddr_alias_tb;
         end
       end
 
+    // Random write-then-read across many sets, the CPU pattern that loses
+    // words on hardware. The test host issues requests back to back, so the
+    // next request is on the bus while the previous one is stalled on a miss
+    // -- which is what exposed the cache reading data_mem and dirty_mem at
+    // the live index instead of the stalled one.
+    $display("--- random access across 4096 sets with dirty evictions ---");
+    // tlul_test_host serialises transactions -- it waits for each response
+    // before presenting the next request -- so a stalled miss never has a
+    // second request behind it, and that is the exact condition the defect
+    // needs. Drive the bus directly instead, the way a CPU does: as soon as
+    // one request is accepted, present the next, and collect responses as
+    // they come. The bus interface belongs to the test host, so this borrows
+    // its tl_o for the duration.
+    begin
+      int rerr = 0;
+      int seed = 32'h1234_5678;
+      logic [31:0] addrs [1024];
+      logic [31:0] vals  [1024];
+      int  issued, got;
+      logic [31:0] rsp_data [1024];
+
+      for (int i = 0; i < 1024; i++) begin
+        seed     = seed * 1103515245 + 12345;
+        addrs[i] = BLOB_BASE + ((seed >> 4) & 32'h0001_FFFC);
+        seed     = seed * 1103515245 + 12345;
+        vals[i]  = seed;
+      end
+
+      // Pipelined writes.
+      issued = 0; got = 0;
+      bus.tl_o.d_ready <= 1'b1;
+      while (got < 1024) begin
+        @(posedge clk);
+        if (issued < 1024) begin
+          bus.tl_o.a_valid   <= 1'b1;
+          bus.tl_o.a_opcode  <= tlul_pkg::PutFullData;
+          bus.tl_o.a_size    <= 2;
+          bus.tl_o.a_mask    <= 4'hF;
+          bus.tl_o.a_address <= addrs[issued];
+          bus.tl_o.a_data    <= vals[issued];
+        end else bus.tl_o.a_valid <= 1'b0;
+        #1;
+        if (bus.tl_o.a_valid && d2h.a_ready) issued++;
+        if (d2h.d_valid) got++;
+      end
+      bus.tl_o.a_valid <= 1'b0;
+      repeat (4) @(posedge clk);
+
+      // Pipelined reads, responses in order (single outstanding source).
+      issued = 0; got = 0;
+      while (got < 1024) begin
+        @(posedge clk);
+        if (issued < 1024) begin
+          bus.tl_o.a_valid   <= 1'b1;
+          bus.tl_o.a_opcode  <= tlul_pkg::Get;
+          bus.tl_o.a_address <= addrs[issued];
+        end else bus.tl_o.a_valid <= 1'b0;
+        #1;
+        if (bus.tl_o.a_valid && d2h.a_ready) issued++;
+        if (d2h.d_valid) begin rsp_data[got] = d2h.d_data; got++; end
+      end
+      bus.tl_o.a_valid <= 1'b0;
+
+      for (int i = 0; i < 1024; i++) begin
+        logic [31:0] want = vals[i];
+        for (int j = i + 1; j < 1024; j++)
+          if (addrs[j] == addrs[i]) want = vals[j];
+        if (rsp_data[i] !== want) begin
+          rerr++;
+          if (rerr <= 6)
+            $display("  MISMATCH random %08x: got %08x want %08x (xor %08x)",
+                     addrs[i], rsp_data[i], want, rsp_data[i] ^ want);
+        end
+      end
+      $display("    random pipelined: %0d of 1024 wrong", rerr);
+      errors += rerr;
+    end
+
     $display("");
     if (errors == 0)
       $display("RESULT: PASS -- %0d aliasing accesses all returned their own data.",

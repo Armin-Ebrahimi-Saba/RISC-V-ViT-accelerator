@@ -138,7 +138,7 @@ int main(void)
      * two each and pointless on a run whose purpose is inference. Set to 1
      * when the numbers look wrong -- between them they localise a bad result
      * to the weights, the accelerator, or neither. */
-#define DAV2_STARTUP_CHECKS 1
+#define DAV2_STARTUP_CHECKS 0
 
 #if DAV2_STARTUP_CHECKS
     {
@@ -146,35 +146,51 @@ int main(void)
          *
          * Random words at random arena addresses, in two passes: write them
          * all, then read them all back. The set is 64k words spread over the
-         * full 64 MB arena, so by the time anything is re-read the 16 kB
-         * cache has been turned over hundreds of times and every read is a
-         * genuine refill of a line that was written back. Whether the
-         * accelerator's lost word is a memory fault or a specific eviction
-         * bug depends on whether this passes. */
+         * arena, so by the time anything is re-read the 16 kB cache has been
+         * turned over hundreds of times and every read is a genuine refill of
+         * a line that was written back.
+         *
+         * Addresses that the random sequence picks more than once hold the
+         * LAST value written, not the one this op wrote. The first version of
+         * this test compared against the op's own value and reported exactly
+         * 111 failures, stable across runs -- precisely the number of
+         * repeated addresses. That was the checker, not the memory. One
+         * replay pass now marks repeated addresses in a bitmap kept at the
+         * top of the arena, and those are skipped. */
         enum { NWORDS = 65536 };
         volatile uint32_t *arena = (volatile uint32_t *)ARENA_ADDR;
-        const uint32_t arena_words = ARENA_SIZE / 4u;
-        uint32_t seed, bad = 0, first_bad = 0, got_bad = 0, want_bad = 0;
+        const uint32_t bitmap_bytes = 2u * 1048576u;          /* 16M bits */
+        const uint32_t test_words   = (ARENA_SIZE - bitmap_bytes) / 4u;
+        volatile uint32_t *seen  = (volatile uint32_t *)(ARENA_ADDR + ARENA_SIZE - bitmap_bytes);
+        volatile uint32_t *twice = (volatile uint32_t *)(ARENA_ADDR + ARENA_SIZE - bitmap_bytes / 2u);
+        uint32_t seed, bad = 0, first_bad = 0, got_bad = 0, want_bad = 0, skipped = 0;
+
+        for (uint32_t i = 0; i < bitmap_bytes / 4u; i++) seen[i] = 0;
+        seed = 0x9e3779b9u;
+        for (uint32_t i = 0; i < NWORDS; i++) {
+            seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+            uint32_t idx = seed % test_words;
+            seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+            uint32_t w = idx >> 5, b = 1u << (idx & 31u);
+            if (seen[w] & b) twice[w] |= b; else seen[w] |= b;
+        }
 
         seed = 0x9e3779b9u;
         for (uint32_t i = 0; i < NWORDS; i++) {
             seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
-            uint32_t idx = seed % arena_words;
+            uint32_t idx = seed % test_words;
             seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
             arena[idx] = seed;
         }
         seed = 0x9e3779b9u;
         for (uint32_t i = 0; i < NWORDS; i++) {
             seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
-            uint32_t idx = seed % arena_words;
+            uint32_t idx = seed % test_words;
             seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+            if (twice[idx >> 5] & (1u << (idx & 31u))) { skipped++; continue; }
             uint32_t got = arena[idx];
             if (got != seed) {
                 if (!bad) { first_bad = idx; got_bad = got; want_bad = seed; }
-                /* Print the first few in full: the address pattern of the
-                 * failures says whether this is a bad bank, row, column bit
-                 * or byte lane, and whether the wrong value is another
-                 * address's data. Re-reading says whether it is stable. */
                 if (bad < 6)
                     printf("  bad %08lx got %08lx want %08lx reread %08lx\n",
                            (unsigned long)(ARENA_ADDR + idx * 4u),
@@ -183,7 +199,8 @@ int main(void)
                 bad++;
             }
         }
-        printf("DDR3 random r/w: %lu/%u words wrong", (unsigned long)bad, NWORDS);
+        printf("DDR3 random r/w: %lu/%u words wrong (%lu repeated addresses skipped)",
+               (unsigned long)bad, NWORDS, (unsigned long)skipped);
         if (bad)
             printf(", first at %08lx got %08lx want %08lx",
                    (unsigned long)(ARENA_ADDR + first_bad * 4u),

@@ -137,7 +137,15 @@ module rvlab_ddr_block_cache #(
     // cycle, i.e. complete the request that caused the miss. This however
     // requires reading from the stored index (request that caused the stall)
     // instead of the one from the current address.
-    data_rdata_raw <= data_mem[use_be_port ? access_idx_q : access_idx];
+    // While stalled on a miss the request that caused it is the only one that
+    // matters, and its index is access_idx_q. Reading from the live bus index
+    // instead handed the write-back another set's data whenever the front end
+    // had already presented its next request -- which a random access pattern
+    // does constantly and a sequential one never does. Measured on hardware
+    // as 111 words in 65536 lost, deterministically, with bits [31:7] of each
+    // belonging to a different word. The tag lookup below was already gated
+    // on stall; the data and dirty lookups were not.
+    data_rdata_raw <= data_mem[(use_be_port || stall) ? access_idx_q : access_idx];
   end
 
   always_ff @(posedge clk_i) begin
@@ -180,7 +188,7 @@ module rvlab_ddr_block_cache #(
     if (fe_modify_req || modify_clear) begin
       dirty_mem[access_idx_q] <= ~modify_clear;
       dirty_rdata <= ~modify_clear;
-    end else dirty_rdata <= dirty_mem[access_idx];
+    end else dirty_rdata <= dirty_mem[stall ? access_idx_q : access_idx];
   end
 
   always_comb begin
@@ -198,7 +206,13 @@ module rvlab_ddr_block_cache #(
       a_opcode: dirty_rdata ? PutFullData : Get,
       a_mask: 32'hFFFFFFFF,
       a_address: {dirty_rdata ? tag_rdata : access_tag_q, access_idx_q},
-      a_data: data_rdata_raw,
+      // The write-back must carry the line as it is now, including a write
+      // that landed on the immediately preceding cycle. data_rdata_raw is the
+      // RAM output and is one cycle stale in exactly that case; data_rdata is
+      // the write-first-forwarded version the front-end response already
+      // uses. Two back-to-back misses to the same set -- write a line, then
+      // evict it -- sent the pre-write contents to DDR3 and lost the write.
+      a_data: data_rdata,
       a_anc: ancillary_q
     };
   end

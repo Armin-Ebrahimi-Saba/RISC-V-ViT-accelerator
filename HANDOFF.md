@@ -142,68 +142,45 @@ lost. Invisible until a testbench opens the resulting path and gets fd 0.
 
 ---
 
-## 5b. Open bug: one lost accumulator word at N=81
+## 5b. RESOLVED: the lost write was a cache write-back bug
 
-The bus hang is fixed and the model now runs to completion, but the depth map
-does **not** match the host build: Pearson r = 0.19 against both the host and
-the PyTorch reference, while host-vs-reference is r = 0.9998. So the C engine
-is right and the target diverges.
+The model now runs end to end on the FPGA and is **bit-exact with the host
+build**: all 15876 pixels identical, r = 1.000000 against the host and
+r = 0.999836 against the PyTorch reference. Frame time 93.6 s (0.0107 FPS).
 
-What has been ruled out, each by measurement:
+### The defect
 
-- **Weights.** The device-side FNV checksum over all 24,871,428 bytes read
-  through the CPU's own path is `fdd83e93`, identical to the file.
-- **Kernels.** `dav2_selftest` prints `3ac57cd2` on both host and target.
-- **The accelerator's logic.** `student_gemm_tb` runs the exact failing shape,
-  81x588x384, against ideal memory and passes 32776 words.
-- **The skid buffer.** Bypassing `student_tl_rsp_hold` changes nothing --
-  byte-identical failure with and without it.
+`rvlab_ddr_block_cache.sv` issued dirty-line write-backs with
+`a_data: data_rdata_raw` -- the raw RAM output, which is one cycle stale when
+the line being evicted was written on the immediately preceding access. The
+forwarded `data_rdata` (write-first, via `data_wen_q`) exists for exactly that
+window and was already used for the front-end response, but never for the
+back-end write-back. Two back-to-back misses to the same set -- write a line,
+then evict it -- sent the pre-write contents to DDR3.
 
-What remains: on hardware, `dav2_accel_bigcheck` finds accumulator words the
-accelerator never wrote (`hw == 0` against a pre-zeroed buffer), so a
-PutFullData is lost on the DDR3 path. It is perfectly deterministic -- same
-index, same values, six consecutive runs.
+That is why every lost word was a tile's final row: it is the write issued
+immediately before the next tile's first access evicts it. And it is why the
+accelerator's counters showed `issued == acked` with the data gone -- the
+cache acks the write, then writes back the wrong bytes.
 
-Two facts established since, both on hardware:
+Fix: `a_data: data_rdata`. One line, plus gating the data/dirty lookups on
+`stall` to match the tag lookup (correct, but not the mechanism).
 
-- **The write is lost, not read stale.** After walking well past the 16 kB
-  cache to evict the line and reading again, the word is still zero. It never
-  reached DDR3.
-- **Every lost write is a tile's final write.** Decoding the failures as
-  (m, n): (233,31), (297,79), (17,47) are all n = 15 mod 16, the last row of a
-  16-row tile; (272,80) is the single row of a partial final tile.
+### How it was found, and a mistake on the way
 
-Since ST_FINISH only completes when wr_out_q == 0 and the job does complete,
-every write that was *issued* was acknowledged -- so the lost write was most
-likely never issued, i.e. t_q advanced past a row without issue_wr. That is in
-student_gemm.sv, not platform RTL. Inspection has not found it: the A-channel
-request is held stable until accepted, and wr_req/sel_wr look correctly gated.
+Found by making `rvlab_ddr_alias_tb` drive the bus **pipelined**, presenting
+the next request the moment the previous is accepted, as a CPU does.
+`tlul_test_host` serialises transactions and can never hit the window, which
+is why the aliasing test passed on unfixed RTL until then. The negative
+control was essential: the first "fix" (stall-gating the lookups) passed on a
+test that also passed unfixed, i.e. proved nothing.
 
-**student_gemm_ddrpath_tb does not currently reproduce it.** With the
-prefetcher bypassed to match the board, it now drives the DUT (it checked
-nothing at all until the ultrareview caught that), but the accelerator fails
-wholesale there -- whole rows unwritten from m=0, and "job did not finish" --
-rather than losing one word in 31104. Fix that environment before trusting it:
-suspect ddr3_blk_model's DEPTH(1) against MAX_INFLIGHT(1), and the interaction
-between the poison-write step and the write-back cache. It also emits
-DataKnown_A X-propagation assertions, and tlul_test_host now takes a VERBOSE
-parameter because its per-transaction printing produced a 1.4 GB log.
-
-Characterisation so far, all with M=384, K=588 unless noted:
-
-| N | result | | N | result |
-|---|---|---|---|---|
-| 17 | clean | | 79 | 1 word lost |
-| 33 | clean | | 80 | clean |
-| 49 | 2 words lost | | 81 | 1 word lost |
-| 65 | 2 words lost | | 82 | clean |
-| 97 | 2 words lost | | 83 | clean |
-
-K does not matter (81x384, 81x588 and 81x592 all fail). Size alone does not
-matter: 82x384x1536 writes 125,952 words and loses none. Shrinking the failing
-case did not work -- 81x588x64 still fails, but 81x588x16 and everything
-smaller is clean -- so there is not yet a case small enough to simulate
-against the real cache with waveforms. Finding one is the way in.
+The mistake: the "DDR3 random r/w loses 111 words" result recorded in commit
+8dcdee1 was **the checker, not the memory**. The random sequence hits some
+addresses twice and the naive check compared against the earlier write.
+111 was exactly the number of repeated addresses. With repeats skipped, DDR3
+passes 0/65536 on random, in-cache and sequential patterns. Do not trust a
+memory test that does not account for duplicate addresses.
 
 ## 6. Next steps
 
@@ -219,7 +196,7 @@ against the real cache with waveforms. Finding one is the way in.
    `./src/sw/project/host/dav2_host build/dav2/dav2_weights.bin out.bin`.
    If the host is clean and the target is not, suspect the DDR3 read path --
    the cache's `d_ready` defect is worked around, not fixed.
-2. **FPS measured: 0.0102, i.e. 98.4 s per frame** (4.920 G cycles at 50 MHz,
+2. **FPS measured: 0.0107, i.e. 93.6 s per frame** (4.681 G cycles at 50 MHz,
    summed over the stage timestamps with wrap correction). Note the program's
    own "inference finished in N kcycles" line is wrong -- it differences two
    32-bit `mcycle` reads across an interval that wraps several times, and
