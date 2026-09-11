@@ -224,6 +224,28 @@ int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc)
                        (unsigned long)((size_t)M * (K / 4) + (size_t)nt * (K / 2)),
                        (unsigned long)(d4 >> 16), (unsigned long)(d4 & 0xffffu));
             }
+
+            /* Did this job issue every write it owed? dbg2 packs
+             * {writes issued, writes acknowledged} for the job just
+             * finished. Expected is nt * M: one word per output row per
+             * tile row. Any shortfall is a write that was never put on the
+             * bus, which is the lost-word signature; only such jobs print,
+             * so this costs nothing on a healthy run. */
+            {
+                uint32_t d2 = REG32(GEMM_DBG2);
+                uint32_t issued = d2 >> 16, acked = d2 & 0xffffu;
+                uint32_t owed = (uint32_t)nt * (uint32_t)M;
+                /* Print the last tile of every job unconditionally so a
+                 * counter that is wired wrong cannot pass by staying zero. */
+                if (issued != owed || acked != issued || n0 + nt >= N)
+                    printf("  %s job %lu: nt=%d M=%d owed=%lu "
+                           "issued=%lu acked=%lu\n",
+                           (issued != owed || acked != issued)
+                               ? "WRITE SHORTFALL" : "writes ok, last tile",
+                           (unsigned long)accel_jobs, nt, M,
+                           (unsigned long)owed, (unsigned long)issued,
+                           (unsigned long)acked);
+            }
         }
     }
 

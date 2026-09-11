@@ -605,24 +605,39 @@ module student_gemm #(
   // Per-job bus counters. The question a stalled job has to answer is whether
   // its outstanding read was never accepted, or accepted and never answered;
   // rb_cnt alone cannot distinguish those.
+  //
+  // wr_issue_cnt_q / wr_ack_cnt_q count writes specifically. On hardware one
+  // accumulator word per job is never written, always a tile's final row,
+  // while the job still completes -- so every issued write was acknowledged
+  // and the lost one was most likely never issued. Comparing issued writes
+  // against n_rows * m_len per job says so directly, without a simulation
+  // that has so far failed to reproduce the loss.
   logic [31:0] acc_cnt_q, rsp_cnt_q;
+  logic [15:0] wr_issue_cnt_q, wr_ack_cnt_q;
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      acc_cnt_q <= '0;
-      rsp_cnt_q <= '0;
+      acc_cnt_q      <= '0;
+      rsp_cnt_q      <= '0;
+      wr_issue_cnt_q <= '0;
+      wr_ack_cnt_q   <= '0;
     end else if (start_strobe) begin
-      acc_cnt_q <= '0;
-      rsp_cnt_q <= '0;
+      acc_cnt_q      <= '0;
+      rsp_cnt_q      <= '0;
+      wr_issue_cnt_q <= '0;
+      wr_ack_cnt_q   <= '0;
     end else begin
       if (areq_valid_q & tl_host_i.a_ready) acc_cnt_q <= acc_cnt_q + 32'd1;
       if (tl_host_i.d_valid)                rsp_cnt_q <= rsp_cnt_q + 32'd1;
+      if (issue_wr)                         wr_issue_cnt_q <= wr_issue_cnt_q + 16'd1;
+      if (rsp_wr)                           wr_ack_cnt_q   <= wr_ack_cnt_q + 16'd1;
     end
   end
 
   assign hw2reg.dbg.d  = {rd_left_q[15:0], err_q, tl_host_i.d_valid,
                           tl_host_i.a_ready, areq_valid_q,
                           4'(wr_out_q), 4'(rb_cnt_q), 1'b0, 3'(state_q)};
-  assign hw2reg.dbg2.d = areq_q.a_address;
+  // dbg2 used to expose areq_q.a_address; the write counters are worth more.
+  assign hw2reg.dbg2.d = {wr_issue_cnt_q, wr_ack_cnt_q};
   assign hw2reg.dbg3.d = acc_cnt_q;
   assign hw2reg.dbg4.d = {retry_n_q[15:0], rsp_cnt_q[15:0]};
 

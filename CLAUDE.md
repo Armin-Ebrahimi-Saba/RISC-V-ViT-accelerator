@@ -51,6 +51,9 @@ After running bitstream, pnr and syn check the following files for warnings and 
 
 DDR3 simulation is very slow, do not do it.
 
+pkill -f "[x]simk" matches the simulation kernel but not the xsim --gui parent that owns the window. Killing -f "[x]sim" (no trailing k) gets both.
+
+
 # Debug
 
 Killing the runner to attach causes openocd.start to reset the core, so every PC reading is a freshly restarted program, not a stalled one
