@@ -164,6 +164,31 @@ accelerator never wrote (`hw == 0` against a pre-zeroed buffer), so a
 PutFullData is lost on the DDR3 path. It is perfectly deterministic -- same
 index, same values, six consecutive runs.
 
+Two facts established since, both on hardware:
+
+- **The write is lost, not read stale.** After walking well past the 16 kB
+  cache to evict the line and reading again, the word is still zero. It never
+  reached DDR3.
+- **Every lost write is a tile's final write.** Decoding the failures as
+  (m, n): (233,31), (297,79), (17,47) are all n = 15 mod 16, the last row of a
+  16-row tile; (272,80) is the single row of a partial final tile.
+
+Since ST_FINISH only completes when wr_out_q == 0 and the job does complete,
+every write that was *issued* was acknowledged -- so the lost write was most
+likely never issued, i.e. t_q advanced past a row without issue_wr. That is in
+student_gemm.sv, not platform RTL. Inspection has not found it: the A-channel
+request is held stable until accepted, and wr_req/sel_wr look correctly gated.
+
+**student_gemm_ddrpath_tb does not currently reproduce it.** With the
+prefetcher bypassed to match the board, it now drives the DUT (it checked
+nothing at all until the ultrareview caught that), but the accelerator fails
+wholesale there -- whole rows unwritten from m=0, and "job did not finish" --
+rather than losing one word in 31104. Fix that environment before trusting it:
+suspect ddr3_blk_model's DEPTH(1) against MAX_INFLIGHT(1), and the interaction
+between the poison-write step and the write-back cache. It also emits
+DataKnown_A X-propagation assertions, and tlul_test_host now takes a VERBOSE
+parameter because its per-transaction printing produced a 1.4 GB log.
+
 Characterisation so far, all with M=384, K=588 unless noted:
 
 | N | result | | N | result |

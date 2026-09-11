@@ -305,6 +305,27 @@ int dav2_accel_bigcheck(int N, int K, int M)
                (long)hw[first], (long)sw[first]);
     printf("\n");
 
+    if (bad) {
+        /* Was the word never written, or written and read stale?
+         *
+         * Those need opposite fixes and nothing so far separates them: the
+         * value read is 0 either way, because the buffer is pre-zeroed. Evict
+         * the line by walking well past the 16 kB direct-mapped cache, then
+         * read it again. If the second read finds the accelerator's data, the
+         * write landed and the first read was stale. If it is still 0, the
+         * write never reached DDR3. */
+        volatile int32_t sink = 0;
+        for (int i = 0; i < 16384; i++)
+            sink += ((volatile int32_t *)a)[i % (N * K / 2)];
+        (void)sink;
+
+        printf("  reread after eviction: hw %ld (sw %ld) -> %s\n",
+               (long)((volatile int32_t *)hw)[first], (long)sw[first],
+               (((volatile int32_t *)hw)[first] == sw[first])
+                   ? "STALE READ, the write did land"
+                   : "still wrong, the write was lost");
+    }
+
     dav2_arena_release(mark);
     return bad;
 }

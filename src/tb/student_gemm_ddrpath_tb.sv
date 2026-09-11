@@ -98,7 +98,11 @@ module student_gemm_ddrpath_tb;
   // Set BYPASS_PREFETCH to take rvlab_ddr_prefetch out of the path and wire the
   // cache straight to the backend. A plain write hangs waiting for a response
   // on the first dirty eviction; this says whether the prefetcher is involved.
-  localparam bit BYPASS_PREFETCH = 1'b0;
+  // Matches rvlab_tlul_ddr.sv, where USE_PREFETCH is 0: the prefetcher
+  // returns aliased lines (see rvlab_ddr_alias_tb) and is bypassed on the
+  // board, so simulating with it in the path tests a configuration that
+  // no longer ships.
+  localparam bit BYPASS_PREFETCH = 1'b1;
 
   if (BYPASS_PREFETCH) begin : gen_bypass
     assign pf_req  = llc_req;
@@ -115,7 +119,7 @@ module student_gemm_ddrpath_tb;
   end
 
   ddr3_blk_model #(
-      .SIZE_BLOCKS(8192),
+      .SIZE_BLOCKS(32768),
       .DEPTH      (1),
       .MIN_LAT    (6),
       .MAX_LAT    (40)
@@ -126,7 +130,7 @@ module student_gemm_ddrpath_tb;
       .rsp_o (pf_rsp)
   );
 
-  tlul_test_host bus (
+  tlul_test_host #(.VERBOSE(1'b0)) bus (
       .clk_i (clk),
       .rst_no(rst_n),
       .tl_i  (reg_d2h),
@@ -389,6 +393,13 @@ module student_gemm_ddrpath_tb;
     run_gemm(20, 64,  6);    // two tiles, second partial
     run_gemm(17, 128, 4);    // final tile of a single row
     run_gemm(16, 384, 12);   // a shape the model issues
+
+    // Patch embedding. On hardware this shape loses exactly one accumulator
+    // word of 31104, deterministically, and the lost word is always a tile's
+    // final row (n = 15 mod 16, or the single row of a partial last tile).
+    // It passes against ideal memory in student_gemm_tb, so reproducing it
+    // needs the real cache's back-pressure. Slow: expect roughly an hour.
+    run_gemm(81, 588, 384);
 
     $display("=======================================");
     if (checks == 0) begin

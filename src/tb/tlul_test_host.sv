@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: SHL-2.1
 // SPDX-FileCopyrightText: 2024 RVLab Contributors
 
-module tlul_test_host (
+module tlul_test_host #(
+    // Every transaction prints a line. A testbench that polls a status
+    // register in a wait loop produces millions of them -- 200 MB of log in
+    // four minutes -- which is slower than the simulation it is describing.
+    parameter bit VERBOSE = 1'b1
+) (
     input  logic              clk_i,
     output logic              rst_no,
     input  tlul_pkg::tl_d2h_t tl_i,
@@ -72,7 +77,7 @@ module tlul_test_host (
       $display("Warning: put response d_opcode was %p.", tl_i.d_opcode);
     end
     @(posedge clk_i);
-    $display("Debug: put word addr=0x%08x, wdata=0x%08x", addr, wdata);
+    if (VERBOSE) $display("Debug: put word addr=0x%08x, wdata=0x%08x", addr, wdata);
   endtask
 
   task get_word(input logic [31:0] addr, output logic [31:0] rdata);
@@ -86,7 +91,7 @@ module tlul_test_host (
       $display("Warning: put response d_opcode was %p.", tl_i.d_opcode);
     end
     @(posedge clk_i);
-    $display("Debug: get word addr=0x%08x, rdata=0x%08x", addr, rdata);
+    if (VERBOSE) $display("Debug: get word addr=0x%08x, rdata=0x%08x", addr, rdata);
   endtask
 
 endmodule
