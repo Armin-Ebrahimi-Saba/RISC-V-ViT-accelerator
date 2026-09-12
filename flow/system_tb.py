@@ -162,7 +162,7 @@ class SystemTb(Block):
         backing memory, standing in for the JTAG transfer.
         """
         blob = self.flow.base_dir / "build/dav2/dav2_weights.bin"
-        plusargs = {}
+        plusargs = {"dav2_autostart": "1"}
         if blob.exists():
             plusargs["ddr_blob"] = str(blob)
         self.simulate('xsim', cwd, srcs, sw,

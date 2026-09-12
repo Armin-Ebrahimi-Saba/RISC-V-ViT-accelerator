@@ -230,9 +230,14 @@ module student_gemm_ddrpath_tb;
 
   int errors, checks;
 
-  localparam int MAXN = 20;
+  // Sized for the largest shape run below. Shapes beyond these read X from
+  // out-of-range array elements, which then go to memory as the weights and
+  // come back as DataKnown_A assertion failures and rows of zeros -- a
+  // testbench fault that looks exactly like a DUT fault. The bounds are
+  // asserted in run_gemm so this cannot happen silently again.
+  localparam int MAXN = 96;
   localparam int MAXK = 640;
-  localparam int MAXM = 8;
+  localparam int MAXM = 384;
 
   logic signed [15:0] a_ref [MAXN*MAXK];
   logic signed [ 7:0] w_ref [MAXM*MAXK];
@@ -325,6 +330,12 @@ module student_gemm_ddrpath_tb;
     logic [31:0] cyc;
 
     $display("--- GEMM N=%0d K=%0d M=%0d", ndim, kdim, mdim);
+    if (ndim > MAXN || kdim > MAXK || mdim > MAXM) begin
+      $display("FAIL: shape exceeds the reference arrays (MAXN=%0d MAXK=%0d MAXM=%0d)",
+               MAXN, MAXK, MAXM);
+      errors++;
+      return;
+    end
 
     for (int n = 0; n < ndim; n++)
       for (int k = 0; k < kdim; k++)

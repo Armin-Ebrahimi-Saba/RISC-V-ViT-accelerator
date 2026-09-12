@@ -48,21 +48,35 @@ void dav2_selftest_report(void);
 #define ARENA_ADDR  0x82000000u
 #define ARENA_SIZE  (64u * 1024u * 1024u)
 #define GO_MAGIC    0xD00DFEEDu   /* value the host writes into dav2_go */
+#define DAV2_AUTOSTART_ADDR 0x81F00000u   /* simulation-only start token */
 
 /* Handshake flag, polled by main() and written over JTAG by the host loader.
  * Must live in BRAM -- see the comment at its use below. */
 volatile uint32_t dav2_go;
 
-static uint32_t cycles_lo(void)
+/* 64-bit cycle count.
+ *
+ * mcycle alone is 32 bits and wraps every 85.9 s at 50 MHz -- less than one
+ * frame. Differencing two 32-bit reads across a frame therefore reported a
+ * time short by whole multiples of 85.9 s; the first "inference finished"
+ * figure printed by this program was 12.5 s for a 98 s frame. Read the high
+ * half too, with the standard re-read loop so a carry between the two reads
+ * cannot produce a value that is wrong by 2^32. */
+static uint64_t cycles64(void)
 {
-    uint32_t v;
-    __asm__ volatile ("csrr %0, mcycle" : "=r"(v));
-    return v;
+    uint32_t hi, lo, hi2;
+    do {
+        __asm__ volatile ("csrr %0, mcycleh" : "=r"(hi));
+        __asm__ volatile ("csrr %0, mcycle"  : "=r"(lo));
+        __asm__ volatile ("csrr %0, mcycleh" : "=r"(hi2));
+    } while (hi != hi2);
+    return ((uint64_t)hi << 32) | lo;
 }
 
 void dav2_progress(const char *stage)
 {
-    printf("  [%s] t=%u kcycles\n", stage, (unsigned)(cycles_lo() / 1000u));
+    /* kcycles fit in 32 bits for over 24 hours at 50 MHz. */
+    printf("  [%s] t=%u kcycles\n", stage, (unsigned)(cycles64() / 1000u));
 }
 
 /* Print the depth map as coarse ASCII art so the result is visible over the
@@ -146,8 +160,16 @@ int main(void)
      * that is still being written underneath it. Measured effect: DDR3
      * read-back fails outright a few seconds later. The flag is the only
      * signal that means the whole transfer finished. */
-    while (dav2_go != GO_MAGIC)
-        ;
+    while (dav2_go != GO_MAGIC) {
+        /* Simulation start token: see ddr3_blk_model.sv. Two words in the
+         * gap between blob and arena that nothing on the board writes. Both
+         * must match, so a random DDR3 power-up pattern cannot trigger it. */
+        const volatile uint32_t *tok = (const volatile uint32_t *)DAV2_AUTOSTART_ADDR;
+        if (tok[0] == GO_MAGIC && tok[1] == ~GO_MAGIC) {
+            printf("autostart token found (simulation)\n");
+            break;
+        }
+    }
     printf("weights present (%u bytes expected)\n", (unsigned)DAV2_BLOB_BYTES);
 
     dav2_blob_init((const void *)BLOB_ADDR);
@@ -297,9 +319,9 @@ int main(void)
 
     dav2_cfg_t cfg = { DAV2_INPUT_SIZE, DAV2_PATCH_GRID, DAV2_N_TOKENS };
 
-    uint32_t t0 = cycles_lo();
+    uint64_t t0 = cycles64();
     dav2_infer(&cfg, depth);
-    uint32_t t1 = cycles_lo();
+    uint64_t t1 = cycles64();
 
     if (dav2_arena_failed) {
         printf("FATAL: activation arena exhausted -- increase ARENA_SIZE or "
@@ -307,7 +329,16 @@ int main(void)
         return 1;
     }
 
-    printf("\ninference finished in %u kcycles\n", (unsigned)((t1 - t0) / 1000u));
+    {
+        /* Also in seconds and frames per second, so the number that matters
+         * does not have to be derived by hand. 50 MHz system clock. */
+        uint64_t dc = t1 - t0;
+        unsigned ms = (unsigned)(dc / 50000u);            /* cycles -> ms */
+        printf("\ninference finished in %u kcycles = %u.%03u s  (%u.%04u FPS)\n",
+               (unsigned)(dc / 1000u), ms / 1000u, ms % 1000u,
+               (unsigned)(1000u / (ms ? ms : 1)),
+               (unsigned)((10000000ull / (ms ? ms : 1)) % 10000u));
+    }
     printf("arena peak %u KB\n", (unsigned)(dav2_arena_peak() / 1024u));
 
     print_ascii_depth(depth, out_size, 63);

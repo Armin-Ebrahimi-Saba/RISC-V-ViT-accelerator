@@ -67,22 +67,15 @@ work.
 
 ## 3. What is not done
 
-- **The `mcycle` wrap in the reported frame time.** `main.c` prints
-  "inference finished in N kcycles" by differencing two 32-bit reads across
-  an interval that wraps every 85.9 s, so the number is wrong by multiples
-  of that. The correct figure comes from summing the per-stage timestamps
-  with wrap correction, which `dav2_run_fpga.py` does not yet do for you.
-- **`sim_ddrmodel_xsim` has no start condition.** The fast whole-SoC
-  simulation now elaborates and loads the blob, but the program waits for a
-  host to write `dav2_go` and no host exists in simulation. Do not use the
-  "blob header looks valid" shortcut — it broke hardware (see
-  `DEBUGGING.md`). A `+dav2_autostart` plusarg read by the testbench and
-  poked into the flag is the right shape.
-- **`student_gemm_ddrpath_tb` fails wholesale.** With the prefetcher
-  bypassed to match the board it drives the DUT but reports whole rows
-  unwritten and jobs not finishing — a different failure from anything seen
-  on hardware, so its environment is wrong. Suspect `ddr3_blk_model`'s
-  `DEPTH(1)` against `MAX_INFLIGHT(1)`.
+- **`sim_ddrmodel_xsim` start token: two halves verified, not yet seen to
+  meet.** The program now also accepts a two-word token (magic and its
+  complement) at `0x81F00000` — in the gap between blob and arena, which
+  nothing on the board writes — and `ddr3_blk_model` places it when given
+  `+dav2_autostart`, which the flow task passes. Both halves are confirmed
+  (the token is reported placed; the program compiles and compares that
+  address), but the one full run was closed before the program reached the
+  handshake. Run it once to completion and watch for
+  `autostart token found (simulation)`.
 - **Photographs as input.** `dav2_patch_image.py` takes any binary P6 PPM
   and rewrites the image tensors in a blob without torch. This machine has
   no PIL or ImageMagick, so no photo other than the baked-in demo has been

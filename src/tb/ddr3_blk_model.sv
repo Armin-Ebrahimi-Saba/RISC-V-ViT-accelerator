@@ -66,6 +66,25 @@ module ddr3_blk_model #(
       $display("ddr3_blk_model: loaded %0d blocks (%0d bytes) from %s",
                blob_blk, blob_blk * 32, blob_file);
     end
+
+    // Simulation start condition. On the board the program waits for the
+    // host to write dav2_go after the JTAG weight transfer; a simulation has
+    // no host. The program therefore also accepts a two-word token at
+    // DAV2_AUTOSTART_ADDR in DDR3 -- the magic and its bitwise complement --
+    // which nothing on the board ever writes (the odds of DDR3 powering up
+    // with a matching 64-bit pattern are 2^-64). The token sits in the 8 MB
+    // gap between the end of the blob and the start of the arena, so neither
+    // the weights nor the activations can overwrite it.
+    //
+    // Do not be tempted to key off the blob header instead: it is written by
+    // the FIRST chunk of the host transfer, and starting on it ran inference
+    // against a blob still being written.
+    if ($test$plusargs("dav2_autostart")) begin
+      int b = (32'h81F0_0000 - 32'h8000_0000) / 32;
+      mem[b][31:0]  = 32'hD00D_FEED;
+      mem[b][63:32] = ~32'hD00D_FEED;
+      $display("ddr3_blk_model: +dav2_autostart token placed at 0x81F00000");
+    end
   end
 
   // Strictly in-order queue: head answers first, as the protocol demands.

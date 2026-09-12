@@ -302,16 +302,18 @@ module rvlab_tlul_ddr (
    * per-microsecond, not per-byte. Removing the stack entirely does, and
    * leaves only the 50 MHz domain.
    *
-   * SIZE_BLOCKS must cover the arena at 0x82000000 as well as the blob at
-   * 0x80000000: blk_index truncates to IDXW bits, so a smaller memory aliases
-   * activations onto weights and corrupts the very thing being debugged.
+   * SIZE_BLOCKS must cover the whole arena, which runs from 0x82000000 to
+   * 0x86000000 -- 96 MB above the blob's base. blk_index truncates to IDXW
+   * bits, so a smaller memory aliases the top of the arena onto the blob and
+   * corrupts the very thing being debugged. 2**21 (64 MB) was too small and
+   * did exactly that; the comment above it claimed otherwise.
    */
   // Say which back end is in the path. Getting this wrong is otherwise
   // invisible until the run has burned an hour going nowhere.
   initial $display("rvlab_tlul_ddr: BEHAVIOURAL DDR3 back end (ddr3_blk_model)");
 
   ddr3_blk_model #(
-    .SIZE_BLOCKS(2**21),        // 64 MB: blob at +0, arena at +32 MB
+    .SIZE_BLOCKS(2**22),        // 128 MB: blob at +0, arena +32..+96 MB
     .DEPTH      (16),           // matches BLKMGR_REQBUF_SIZE
     .MIN_LAT    (6),
     .MAX_LAT    (40)
