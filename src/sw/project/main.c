@@ -47,8 +47,15 @@ void dav2_selftest_report(void);
 #define BLOB_ADDR   0x80000000u
 #define ARENA_ADDR  0x82000000u
 #define ARENA_SIZE  (64u * 1024u * 1024u)
-#define GO_MAGIC    0xD00DFEEDu   /* value the host writes into dav2_go */
+#define GO_MAGIC    0xD00DFEEDu   /* host: weights are loaded and verified */
+#define GO_FRAME    0xF00DF00Du   /* host: a new image is at IMAGE_ADDR, run it */
+#define GO_DONE     0xD0DEC0DEu   /* device: result printed, ready for the next */
 #define DAV2_AUTOSTART_ADDR 0x81F00000u   /* simulation-only start token */
+
+/* Where the host puts each input image. In the 8 MB gap between the end of
+ * the blob and the start of the arena, so neither weights nor activations can
+ * touch it. Layout: size*size*3 int16 (HWC), then one float32 scale. */
+#define IMAGE_ADDR  0x81E00000u
 
 /* Handshake flag, polled by main() and written over JTAG by the host loader.
  * Must live in BRAM -- see the comment at its use below. */
@@ -319,39 +326,60 @@ int main(void)
 
     dav2_cfg_t cfg = { DAV2_INPUT_SIZE, DAV2_PATCH_GRID, DAV2_N_TOKENS };
 
-    uint64_t t0 = cycles64();
-    dav2_infer(&cfg, depth);
-    uint64_t t1 = cycles64();
+    /* The weights are in and verified; from here on the program is a server.
+     * Each frame: the host writes the quantised image to IMAGE_ADDR, sets
+     * dav2_go = GO_FRAME, and waits for the result markers; the program runs
+     * one inference, prints the depth map, and sets dav2_go = GO_DONE. The
+     * 25 MB weight transfer happens once per session instead of once per
+     * image. */
+    const int16_t *image = (const int16_t *)IMAGE_ADDR;
+    const float   *image_scale =
+        (const float *)(IMAGE_ADDR + (uint32_t)cfg.size * cfg.size * 3u * 2u);
 
-    if (dav2_arena_failed) {
-        printf("FATAL: activation arena exhausted -- increase ARENA_SIZE or "
-               "lower DAV2_INPUT_SIZE\n");
-        return 1;
+    printf("DAV2_READY\n");
+    for (unsigned frame = 0;; frame++) {
+        dav2_go = GO_DONE;
+        while (dav2_go != GO_FRAME)
+            ;
+
+        dav2_set_image(image, *image_scale);
+        printf("frame %u: image scale %d/1e6\n", frame, (int)(*image_scale * 1e6f));
+
+        uint64_t t0 = cycles64();
+        dav2_infer(&cfg, depth);
+        uint64_t t1 = cycles64();
+
+        if (dav2_arena_failed) {
+            printf("FATAL: activation arena exhausted -- increase ARENA_SIZE or "
+                   "lower DAV2_INPUT_SIZE\n");
+            return 1;
+        }
+
+        {
+            /* Also in seconds and frames per second, so the number that
+             * matters does not have to be derived by hand. 50 MHz clock. */
+            uint64_t dc = t1 - t0;
+            unsigned ms = (unsigned)(dc / 50000u);            /* cycles -> ms */
+            printf("\ninference finished in %u kcycles = %u.%03u s  (%u.%04u FPS)\n",
+                   (unsigned)(dc / 1000u), ms / 1000u, ms % 1000u,
+                   (unsigned)(1000u / (ms ? ms : 1)),
+                   (unsigned)((10000000ull / (ms ? ms : 1)) % 10000u));
+        }
+        printf("arena peak %u KB\n", (unsigned)(dav2_arena_peak() / 1024u));
+
+        print_ascii_depth(depth, out_size, 63);
+
+        /* Emit the raw depth map so the host can compare it bit-for-bit
+         * against the host build of the same engine. */
+        printf("DAV2_RESULT_BEGIN %d\n", out_size * out_size);
+        {
+            const uint8_t *raw = (const uint8_t *)depth;
+            for (int i = 0; i < out_size * out_size * 4; i++) {
+                printf("%02x", raw[i]);
+                if ((i & 31) == 31)
+                    putchar('\n');
+            }
+        }
+        printf("\nDAV2_RESULT_END\n");
     }
-
-    {
-        /* Also in seconds and frames per second, so the number that matters
-         * does not have to be derived by hand. 50 MHz system clock. */
-        uint64_t dc = t1 - t0;
-        unsigned ms = (unsigned)(dc / 50000u);            /* cycles -> ms */
-        printf("\ninference finished in %u kcycles = %u.%03u s  (%u.%04u FPS)\n",
-               (unsigned)(dc / 1000u), ms / 1000u, ms % 1000u,
-               (unsigned)(1000u / (ms ? ms : 1)),
-               (unsigned)((10000000ull / (ms ? ms : 1)) % 10000u));
-    }
-    printf("arena peak %u KB\n", (unsigned)(dav2_arena_peak() / 1024u));
-
-    print_ascii_depth(depth, out_size, 63);
-
-    /* Emit the raw depth map so the host can compare it bit-for-bit against
-     * the host build of the same engine. */
-    printf("DAV2_RESULT_BEGIN %d\n", out_size * out_size);
-    const uint8_t *raw = (const uint8_t *)depth;
-    for (int i = 0; i < out_size * out_size * 4; i++) {
-        printf("%02x", raw[i]);
-        if ((i & 31) == 31)
-            putchar('\n');
-    }
-    printf("\nDAV2_RESULT_END\n");
-    return 0;
 }

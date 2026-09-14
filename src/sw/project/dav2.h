@@ -148,6 +148,17 @@ typedef struct {
  * (the same units as the PyTorch model's output). */
 void dav2_infer(const dav2_cfg_t *cfg, float *depth_out);
 
+/* Input image.
+ *
+ * The picture used to travel inside the weight blob as two tensors, which
+ * meant a new image cost a full 25 MB weight transfer. It is now supplied
+ * separately: the caller points the engine at a quantised int16 HWC buffer
+ * (size x size x 3, values in -8191..8191) and its scale, and can do so again
+ * before every dav2_infer without touching the weights. On the board the
+ * buffer lives at a fixed DDR3 address the host writes over JTAG; the host
+ * build passes a malloc'd array. */
+void dav2_set_image(const int16_t *hwc, float scale);
+
 /* Progress hook, implemented by the caller (prints to stdout on the SoC). */
 void dav2_progress(const char *stage);
 

@@ -19,6 +19,17 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Input image, supplied by the caller through dav2_set_image(). Kept as a
+ * pointer rather than copied: on the board it is 95 kB in DDR3. */
+static const int16_t *g_image;
+static float          g_image_scale = 1.0f;
+
+void dav2_set_image(const int16_t *hwc, float scale)
+{
+    g_image = hwc;
+    g_image_scale = scale;
+}
+
 extern const void *dav2_find_quiet(const char *name);
 extern void dav2_dump(const char *path, const dav2_tensor_t *t);
 extern int dav2_blob_check(void);
@@ -304,16 +315,16 @@ void dav2_infer(const dav2_cfg_t *cfg, float *depth_out)
     /* ---- patch embedding ---------------------------------------------- */
     dav2_progress("patch embedding");
 
-    uint32_t nb = 0;
-    const int16_t *img = (const int16_t *)dav2_find("image", &nb);
-    const float *img_scale = (const float *)dav2_find("image_scale", 0);
-    if (!img || !img_scale) return;
+    if (!g_image) {
+        printf("dav2: no input image set (call dav2_set_image first)\n");
+        return;
+    }
 
     dav2_tensor_t image;
-    image.v = (int16_t *)img;
+    image.v = (int16_t *)g_image;
     image.n = cfg->size * cfg->size;
     image.c = 3;
-    image.scale = *img_scale;
+    image.scale = g_image_scale;
 
     dav2_qw_t pe_w;
     dav2_qw(&pe_w, "patch_embed", DAV2_PATCH * DAV2_PATCH * 3);

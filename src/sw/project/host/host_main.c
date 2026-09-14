@@ -10,7 +10,7 @@
  * on hardware.
  *
  * Build:  make -C src/sw/project/host
- * Run:    ./dav2_host build/dav2/dav2_weights.bin out.bin
+ * Run:    ./dav2_host build/dav2/dav2_weights.bin image.dav2img out.bin
  */
 
 #include "../dav2.h"
@@ -27,11 +27,14 @@ void dav2_progress(const char *stage)
 
 int main(int argc, char **argv)
 {
-    if (argc < 3) {
-        fprintf(stderr, "usage: %s <dav2_weights.bin> <out.bin> [arena_mb]\n", argv[0]);
+    if (argc < 4) {
+        fprintf(stderr, "usage: %s <dav2_weights.bin> <image.dav2img> <out.bin> [arena_mb]\n"
+                        "  image.dav2img: size*size*3 int16 HWC followed by one float32 scale,\n"
+                        "  as written by tools/dav2_image.py -- the same bytes the board receives.\n",
+                argv[0]);
         return 2;
     }
-    const size_t arena_mb = (argc > 3) ? (size_t)atoi(argv[3]) : 256;
+    const size_t arena_mb = (argc > 4) ? (size_t)atoi(argv[4]) : 256;
 
     FILE *f = fopen(argv[1], "rb");
     if (!f) { perror(argv[1]); return 1; }
@@ -48,6 +51,24 @@ int main(int argc, char **argv)
 
     dav2_blob_init(blob);
     dav2_arena_init(arena, arena_mb << 20);
+
+    /* The image arrives separately from the weights, exactly as on the board:
+     * int16 HWC pixels then a float32 scale. Reading the identical file the
+     * runner sends over JTAG is what makes the host a bit-exact oracle. */
+    {
+        FILE *fi = fopen(argv[2], "rb");
+        if (!fi) { perror(argv[2]); return 1; }
+        fseek(fi, 0, SEEK_END);
+        long ni = ftell(fi);
+        fseek(fi, 0, SEEK_SET);
+        uint8_t *img = malloc((size_t)ni);
+        if (fread(img, 1, (size_t)ni, fi) != (size_t)ni) { perror("read image"); return 1; }
+        fclose(fi);
+        float scale;
+        memcpy(&scale, img + ni - 4, 4);
+        dav2_set_image((const int16_t *)img, scale);
+        printf("loaded %ld-byte image, scale %g\n", ni, scale);
+    }
 
     /* configuration comes from the generated header */
 #include "dav2_blob_config.h"
@@ -75,9 +96,9 @@ int main(int argc, char **argv)
     }
 #endif
 
-    FILE *o = fopen(argv[2], "wb");
+    FILE *o = fopen(argv[3], "wb");
     fwrite(depth, sizeof(float), (size_t)out_size * out_size, o);
     fclose(o);
-    printf("wrote %s (%dx%d floats)\n", argv[2], out_size, out_size);
+    printf("wrote %s (%dx%d floats)\n", argv[3], out_size, out_size);
     return 0;
 }

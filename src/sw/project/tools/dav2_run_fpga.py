@@ -58,6 +58,9 @@ from flow.tools.riscv_debug_helper import (  # noqa: E402
 BLOB_ADDR = 0x80000000
 GO_ADDR = 0x8F000000
 GO_MAGIC = 0xD00DFEED
+GO_FRAME   = 0xF00DF00D   # host -> device: a new image is at IMAGE_ADDR
+GO_DONE    = 0xD0DEC0DE   # device -> host: result printed, ready for the next
+IMAGE_ADDR = 0x81E00000   # where each input image goes; see main.c
 
 
 def read_hostio(ocd):
@@ -296,6 +299,117 @@ def verify_blob_sampled(ocd, blob_path, nsamp=300, seed=1):
     return bad
 
 
+def send_image(ocd, img_bytes, tmpdir):
+    """Write one preprocessed image to IMAGE_ADDR.
+
+    95 kB over JTAG at ~0.37 MB/s is a quarter of a second -- against a
+    25 MB weight transfer that is the whole point of loading weights once.
+    load_image wants a file, so the bytes go through a temp file; the debug
+    module's system-bus writes pass through the same DDR3 cache the CPU
+    reads from, so no explicit invalidation is needed.
+    """
+    f = Path(tmpdir) / "frame.dav2img"
+    f.write_bytes(img_bytes)
+    ocd.cmd(f"load_image {{{f}}} 0x{IMAGE_ADDR:08x} bin")
+
+
+def run_frame(ocd, go, img_bytes, tmpdir, timeout, buf):
+    """Send an image, trigger inference, return (result_text, remaining_buf).
+
+    The device sets dav2_go = GO_DONE when it is idle and waiting. Only after
+    seeing that is it safe to overwrite the image buffer: the previous frame
+    is finished with it.
+    """
+    for _ in range(int(timeout * 10)):
+        if ocd.readword(go) == GO_DONE:
+            break
+        time.sleep(0.1)
+    else:
+        raise TimeoutError("device never reported GO_DONE")
+
+    t0 = time.time()
+    send_image(ocd, img_bytes, tmpdir)
+    print(f"  image sent in {time.time() - t0:.2f} s", flush=True)
+    ocd.writeword(go, GO_FRAME)
+    text = wait_for_marker(ocd, "DAV2_RESULT_END", timeout=timeout, buf=buf)
+    # Everything up to and including this result is consumed; anything the
+    # device printed after it (the next GO_DONE banner, say) is carried over.
+    head, _, tail = text.partition("DAV2_RESULT_END")
+    return head + "DAV2_RESULT_END", tail
+
+
+def probe_stall(ocd):
+    """What to read when inference never finishes.
+
+    Sysbus reads work while the core runs and cannot perturb anything, so
+    sample the accelerator and console state first; then read the DDR3
+    watchdog register, which is the one source that still answers when the
+    core is wedged on a bus access and cannot be halted; then try the halt
+    anyway and dump registers if it takes.
+    """
+    # Sysbus reads work while the core runs, so sample the live state
+    # first: this needs no halt and therefore cannot perturb anything.
+    GEMM = 0x20010000
+    names = ("status", "dbg", "dbg2", "dbg3", "dbg4", "cycles")
+    offs  = (0x00, 0x2c, 0x30, 0x34, 0x38, 0x28)
+    for k in range(4):
+        vals = [ocd.readword(GEMM + o) for o in offs]
+        w = ocd.readword(Hostio.OBUF_WIDX)
+        r = ocd.readword(Hostio.OBUF_RIDX)
+        print("  sample%d widx=%d ridx=%d enq=%d | %s" % (
+            k, w, r, (w - r) & (Hostio.OBUF_SIZE - 1),
+            " ".join("%s=%08x" % (n, v)
+                     for n, v in zip(names, vals))), flush=True)
+        time.sleep(1.0)
+
+    # Only then try to stop it. A core wedged on a bus access that
+    # never completes cannot retire and so cannot accept a halt;
+    # "targets" staying at running is itself the diagnosis.
+    # The stalled-transaction watchdog in the DDR3 register block.
+    # This is the one source that still answers when the core cannot
+    # be halted: it records which request went unanswered, from which
+    # master, and for how long.
+    DDR_CTRL = 0x1F001000
+    wa = ocd.readword(DDR_CTRL + 0x4)
+    ws = ocd.readword(DDR_CTRL + 0x8)
+    opcode = ws & 0x7
+    outst  = (ws >> 3) & 0x1F
+    src    = (ws >> 8) & 0xFF
+    stall  = (ws >> 16) & 0xFFFF
+    opname = {0: "PutFullData", 1: "PutPartialData", 4: "Get"}.get(
+        opcode, "op%d" % opcode)
+    print("  ddr watchdog: addr=%08x %s source=%d outstanding=%d "
+          "stalled=%d cycles%s" % (
+              wa, opname, src, outst, stall,
+              " (SATURATED -- never answered)"
+              if stall == 0xFFFF else ""), flush=True)
+
+    halted, st = dm_halt(ocd)
+    print("  dm halt: allhalted=%d anyrunning=%d anyunavail=%d "
+          "anyhavereset=%d" % (st.allhalted, st.anyrunning,
+                               st.anyunavail, st.anyhavereset),
+          flush=True)
+    print("  targets:", ocd.cmd("targets").strip()[-30:], flush=True)
+    if not halted:
+        print("  core did not halt via the debug module either",
+              flush=True)
+    for r in ("pc", "ra", "sp", "a0", "a1", "a2", "a3", "a4", "a5"):
+        print("  %-4s %s" % (r, ocd.cmd("reg " + r).strip()), flush=True)
+    for csr in ("dpc", "dcsr", "mcause", "mepc", "mtval", "mstatus", "mcycle"):
+        try:
+            print("  %-8s %s" % (csr, ocd.cmd("reg " + csr).strip()),
+                  flush=True)
+        except Exception as exc:      # not all CSRs are exposed
+            print("  %-8s <%s>" % (csr, exc), flush=True)
+    for i in range(6):
+        try:
+            ocd.cmd("step")
+            print("  step%d %s" % (i, ocd.cmd("reg pc").strip()),
+                  flush=True)
+        except Exception as exc:
+            print("  step%d <%s>" % (i, exc), flush=True)
+
+
 def parse_result(text, out_path):
     """Extract the hex-encoded float depth map printed by the program."""
     try:
@@ -336,7 +450,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--elf", default="build/sw_project/build/sw.elf")
     ap.add_argument("--blob", default="build/dav2/dav2_weights.bin")
-    ap.add_argument("--out", default="build/dav2/fpga_depth.npy")
+    ap.add_argument("--out", default="build/dav2/fpga_depth.npy",
+                    help="output .npy; with several images, a numbered suffix is added")
+    ap.add_argument("--image", action="append", default=[],
+                    help="a picture (jpg/png/...) to run; repeatable, runs in order")
+    ap.add_argument("--synth", action="append", default=[],
+                    help="a built-in scene name to run; repeatable")
+    ap.add_argument("--dav2img", action="append", default=[],
+                    help="an already-preprocessed .dav2img file to run; repeatable")
+    ap.add_argument("--size", type=int, default=126)
     ap.add_argument("--cfg", default="src/design/openocd/fpga.cfg")
     ap.add_argument("--verify-sampled", action="store_true",
                     help="compare random blob words in DDR3 against the file")
@@ -355,78 +477,46 @@ def main():
         go = go_address(Path(args.elf).resolve())
         print(f"handshake flag at 0x{go:08x} (BRAM)", flush=True)
         ocd.writeword(go, GO_MAGIC)
-        print("handshake written; inference running", flush=True)
-        try:
-            text = wait_for_marker(ocd, "DAV2_RESULT_END", timeout=args.timeout,
-                                   buf=text)
-        except TimeoutError:
-            # The core is stalled. Halt it and read where -- far better than
-            # inferring the location from which printf was last seen.
-            print("\n--- inference did not finish; probing the core ---",
-                  flush=True)
-            # Sysbus reads work while the core runs, so sample the live state
-            # first: this needs no halt and therefore cannot perturb anything.
-            GEMM = 0x20010000
-            names = ("status", "dbg", "dbg2", "dbg3", "dbg4", "cycles")
-            offs  = (0x00, 0x2c, 0x30, 0x34, 0x38, 0x28)
-            for k in range(4):
-                vals = [ocd.readword(GEMM + o) for o in offs]
-                w = ocd.readword(Hostio.OBUF_WIDX)
-                r = ocd.readword(Hostio.OBUF_RIDX)
-                print("  sample%d widx=%d ridx=%d enq=%d | %s" % (
-                    k, w, r, (w - r) & (Hostio.OBUF_SIZE - 1),
-                    " ".join("%s=%08x" % (n, v)
-                             for n, v in zip(names, vals))), flush=True)
-                time.sleep(1.0)
+        text = wait_for_marker(ocd, "DAV2_READY", timeout=120, buf=text)
+        print("weights accepted; device is serving frames", flush=True)
 
-            # Only then try to stop it. A core wedged on a bus access that
-            # never completes cannot retire and so cannot accept a halt;
-            # "targets" staying at running is itself the diagnosis.
-            # The stalled-transaction watchdog in the DDR3 register block.
-            # This is the one source that still answers when the core cannot
-            # be halted: it records which request went unanswered, from which
-            # master, and for how long.
-            DDR_CTRL = 0x1F001000
-            wa = ocd.readword(DDR_CTRL + 0x4)
-            ws = ocd.readword(DDR_CTRL + 0x8)
-            opcode = ws & 0x7
-            outst  = (ws >> 3) & 0x1F
-            src    = (ws >> 8) & 0xFF
-            stall  = (ws >> 16) & 0xFFFF
-            opname = {0: "PutFullData", 1: "PutPartialData", 4: "Get"}.get(
-                opcode, "op%d" % opcode)
-            print("  ddr watchdog: addr=%08x %s source=%d outstanding=%d "
-                  "stalled=%d cycles%s" % (
-                      wa, opname, src, outst, stall,
-                      " (SATURATED -- never answered)"
-                      if stall == 0xFFFF else ""), flush=True)
+        # Build the list of images to run. With none given, run the demo
+        # picture the exporter baked in, so the default invocation still
+        # produces the familiar result.
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import dav2_image as di
+        frames = []
+        for f in args.dav2img:
+            frames.append((Path(f).stem, Path(f).read_bytes()))
+        for f in args.image:
+            q, sc = di.from_file(f, args.size)
+            frames.append((Path(f).stem, di.pack(q, sc)))
+        for n in args.synth:
+            q, sc = di.from_synth(n, args.size)
+            frames.append((n, di.pack(q, sc)))
+        if not frames:
+            demo = REPO / "build/dav2/demo.dav2img"
+            if not demo.exists():
+                raise SystemExit("no image given and build/dav2/demo.dav2img is missing")
+            frames.append(("demo", demo.read_bytes()))
 
-            halted, st = dm_halt(ocd)
-            print("  dm halt: allhalted=%d anyrunning=%d anyunavail=%d "
-                  "anyhavereset=%d" % (st.allhalted, st.anyrunning,
-                                       st.anyunavail, st.anyhavereset),
-                  flush=True)
-            print("  targets:", ocd.cmd("targets").strip()[-30:], flush=True)
-            if not halted:
-                print("  core did not halt via the debug module either",
-                      flush=True)
-            for r in ("pc", "ra", "sp", "a0", "a1", "a2", "a3", "a4", "a5"):
-                print("  %-4s %s" % (r, ocd.cmd("reg " + r).strip()), flush=True)
-            for csr in ("dpc", "dcsr", "mcause", "mepc", "mtval", "mstatus", "mcycle"):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for k, (name, img) in enumerate(frames):
+                print(f"\n=== frame {k}: {name} ===", flush=True)
                 try:
-                    print("  %-8s %s" % (csr, ocd.cmd("reg " + csr).strip()),
-                          flush=True)
-                except Exception as exc:      # not all CSRs are exposed
-                    print("  %-8s <%s>" % (csr, exc), flush=True)
-            for i in range(6):
-                try:
-                    ocd.cmd("step")
-                    print("  step%d %s" % (i, ocd.cmd("reg pc").strip()),
-                          flush=True)
-                except Exception as exc:
-                    print("  step%d <%s>" % (i, exc), flush=True)
-            raise
-        parse_result(text, args.out)
+                    result, text = run_frame(ocd, go, img, tmpdir, args.timeout, text)
+                except TimeoutError:
+                    print("\n--- inference did not finish; probing the core ---", flush=True)
+                    probe_stall(ocd)
+                    raise
+                out = Path(args.out)
+                if len(frames) > 1:
+                    out = out.with_name(f"{out.stem}_{name}{out.suffix}")
+                parse_result(result, str(out))
+                # keep the .dav2img next to the result so the host oracle can
+                # be run on exactly the bytes the board saw
+                out.with_suffix(".dav2img").write_bytes(img)
 
 
 if __name__ == "__main__":
