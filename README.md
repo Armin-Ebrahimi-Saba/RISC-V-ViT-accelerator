@@ -30,8 +30,22 @@ off the critical path; what remains is the CPU's element-wise work
 (LayerNorm, softmax, GELU, requantisation) in software floating point, and the
 25 MB of weights crossing DDR3 once per frame.
 
-More of the images it has produced, input left and depth right. All are
-bit-exact with the host build:
+Six of the Depth-Anything example photographs, run through one weight load.
+Input above, FPGA depth below; every one is bit-exact with the host build:
+
+![Depth-Anything example photographs on the FPGA](img/examples.png)
+
+Top row: a sunflower field, a sunlit interior, a lake painting. Bottom row:
+a line drawing, glass bottles in a mirror, an ink painting of two dogs. The
+first three are what the model is for and it handles them well — the interior
+in particular, read as a tunnel with the far view through the door darkest.
+The last three were chosen to be hard. The line drawing, with no shading to
+work from, is only partly resolved; the bottles defeat it the way transparency
+and reflection defeat every monocular depth model; the ink dogs contain almost
+no depth and the output says so. A bit-exact port reproduces the model's
+limitations as faithfully as its strengths.
+
+Synthetic scenes, input left and depth right:
 
 ![road](img/road.png)
 ![pillars](img/pillars.png)
@@ -182,7 +196,11 @@ Building and running
     flow rvlab_ddr_alias_tb.sim_rtl_xsim        # the cache and prefetcher tests
     flow rvlab_fpga_top.bitstream               # syn + pnr + bitstream
     flow rvlab_fpga_top.program                 # load onto the board
-    python -u src/sw/project/tools/dav2_run_fpga.py --timeout 900
+    python -u src/sw/project/tools/dav2_run_fpga.py --image photo.jpg --image other.jpg
+
+The weights load once (~66 s); each `--image` after that costs a quarter of a
+second of transfer and ~94 s of inference. `--synth NAME` runs a built-in
+scene; with no image given, the demo photograph runs.
 
 The same engine sources build natively, which is the fast way to check any
 change and the reference every board result must match bit for bit:
@@ -190,9 +208,9 @@ change and the reference every board result must match bit for bit:
     make -C src/sw/project/host
     ./src/sw/project/host/dav2_host build/dav2/dav2_weights.bin out.bin
 
-To run a different image, `src/sw/project/tools/dav2_patch_image.py` rewrites
-the image tensors in a copy of the blob — synthetic scenes built in, or any
-binary P6 PPM — with no torch required.
+`src/sw/project/tools/dav2_image.py` does the preprocessing — resize,
+ImageNet normalisation, quantisation — byte-identically to the exporter, and
+can render a `.dav2img` back to a PNG to see exactly what the board saw.
 
 Built on
 --------
