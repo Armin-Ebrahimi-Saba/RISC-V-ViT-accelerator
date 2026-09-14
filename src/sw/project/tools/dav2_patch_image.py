@@ -63,6 +63,67 @@ def synth(name, size):
                 else:
                     f = 0.25 + 0.5 * v                # floor lighter toward viewer
                     px.append((f * 0.5, f * 0.6, f * 0.7))
+            elif name == "road":            # road to a horizon under a sky
+                horizon = 0.42
+                if v < horizon:
+                    t = v / horizon
+                    px.append((0.55 + 0.3 * t, 0.7 + 0.2 * t, 0.95))        # sky, paler near horizon
+                else:
+                    d = (v - horizon) / (1 - horizon)            # 0 at horizon, 1 at bottom
+                    half = 0.02 + 0.48 * d                       # road widens toward the viewer
+                    on_road = abs(u - 0.5) < half
+                    if on_road:
+                        # dashed centre line, dashes stretch toward the viewer
+                        dash = (int((1.0 / (d + 0.05)) * 1.2) % 2 == 0) and abs(u - 0.5) < 0.012 * (0.3 + d)
+                        g = 0.25 + 0.15 * d
+                        px.append((0.9, 0.85, 0.3) if dash else (g, g, g + 0.02))
+                    else:
+                        f = 0.2 + 0.45 * d                       # grass, brighter nearer
+                        px.append((0.25 * f + 0.05, 0.6 * f + 0.1, 0.2 * f))
+            elif name == "spheres":         # near large ball, far small ball
+                floor = 0.2 + 0.5 * v
+                col = (floor * 0.55, floor * 0.6, floor * 0.7)
+                for (cx, cy, r, base) in ((0.68, 0.30, 0.10, (0.3, 0.5, 0.9)),   # far, small, high
+                                          (0.32, 0.62, 0.24, (0.9, 0.35, 0.25))): # near, large, low
+                    dx, dy = u - cx, v - cy
+                    r2 = dx * dx + dy * dy
+                    if r2 < r * r:
+                        z = (r * r - r2) ** 0.5 / r
+                        sh = 0.25 + 0.75 * max(0.0, -0.6 * dx / r - 0.5 * dy / r + 0.6 * z)
+                        col = tuple(c * sh for c in base)
+                px.append(col)
+            elif name == "stairs":          # steps receding upward
+                nsteps = 6
+                # step i occupies a band; higher (farther) steps are thinner and darker
+                y_acc = 1.0
+                col = (0.5, 0.5, 0.55)
+                for i in range(nsteps):
+                    h = 0.22 * (0.72 ** i)                       # perspective: farther steps look shorter
+                    top = y_acc - h
+                    if top <= v < y_acc:
+                        riser = v > y_acc - h * 0.35             # bottom part of the band is the vertical riser
+                        shade = 0.85 - 0.11 * i
+                        col = (shade * 0.6, shade * 0.6, shade * 0.62) if riser else (shade, shade, shade * 1.02)
+                        break
+                    y_acc = top
+                else:
+                    col = (0.15, 0.15, 0.2)                      # wall above the top step
+                px.append(col)
+            elif name == "pillars":         # a colonnade converging on the centre
+                col = (0.12 + 0.35 * v, 0.12 + 0.35 * v, 0.15 + 0.35 * v)   # floor
+                if v < 0.5:
+                    col = (0.08, 0.08, 0.12)                     # dark hall behind
+                for side in (-1, 1):
+                    for i in range(5):
+                        depth = i / 4.0                          # 0 near, 1 far
+                        x_c = 0.5 + side * (0.46 - 0.36 * depth)
+                        w = 0.07 * (1 - 0.7 * depth)
+                        top = 0.05 + 0.4 * depth
+                        if abs(u - x_c) < w and top < v < 0.5 + 0.5 * (1 - depth) * 0.9:
+                            sh = 0.9 - 0.13 * i
+                            edge = 1 - abs(u - x_c) / w          # round the pillar
+                            col = (sh * (0.5 + 0.5 * edge) * 0.95, sh * (0.5 + 0.5 * edge) * 0.9, sh * (0.5 + 0.5 * edge) * 0.8)
+                px.append(col)
             elif name == "corridor":        # one-point perspective
                 cx, cy = abs(u - 0.5), abs(v - 0.5)
                 d = max(cx, cy) * 2
@@ -121,7 +182,7 @@ def main():
     ap.add_argument("--blob", default="build/dav2/dav2_weights.bin")
     ap.add_argument("--out", required=True)
     src = ap.add_mutually_exclusive_group(required=True)
-    src.add_argument("--synth", choices=["gradient", "checker", "sphere", "corridor"])
+    src.add_argument("--synth", choices=["gradient", "checker", "sphere", "corridor", "road", "spheres", "stairs", "pillars"])
     src.add_argument("--ppm")
     args = ap.parse_args()
 

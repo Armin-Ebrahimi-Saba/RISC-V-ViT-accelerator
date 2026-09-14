@@ -30,8 +30,11 @@ off the critical path; what remains is the CPU's element-wise work
 (LayerNorm, softmax, GELU, requantisation) in software floating point, and the
 25 MB of weights crossing DDR3 once per frame.
 
-Two more of the images it has produced, input left and depth right:
+More of the images it has produced, input left and depth right. All are
+bit-exact with the host build:
 
+![road](img/road.png)
+![pillars](img/pillars.png)
 ![sphere](img/sphere.png)
 ![corridor](img/corridor.png)
 
