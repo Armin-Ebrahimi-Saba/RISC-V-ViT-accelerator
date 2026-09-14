@@ -87,19 +87,91 @@ Documentation
     docs/HANDOFF.md        current state, what is bypassed, what is not done
     CLAUDE.md              build, simulate, and run commands
 
-Layout
-------
+What each file does
+-------------------
 
-    src/rtl/student/student_gemm.sv        the accelerator
-    src/rtl/student/student_tl_watch.sv    stalled-transaction watchdog register
-    src/rtl/student/student.sv             bus integration
-    src/rtl/ddr3/rvlab_tlul_ddr.sv         DDR3 path top (request mux fix, prefetch bypass)
-    src/rtl/ddr3/rvlab_ddr_block_cache.sv  the cache (write-back fix)
-    src/design/reggen/                     register maps
-    src/sw/project/                        the inference engine
-    src/sw/project/host/                   native build — the oracle
-    src/sw/project/tools/                  weight export, board runner, image patcher
-    src/tb/                                testbenches
+Everything below was written for this project. Files not listed here belong
+to the RVLab platform or to third parties and were not touched, with the two
+exceptions marked *(platform file, fixed)*.
+
+### The hardware — `src/rtl/`
+
+| File | What it is, in plain words |
+|---|---|
+| `student/student_gemm.sv` | **The accelerator.** A block of 16 multipliers that computes matrix products far faster than the CPU can. The CPU tells it where the two input matrices are in memory and where to put the result, then presses "go". It fetches its own data over the bus. |
+| `student/student.sv` | **Wiring.** Connects the accelerator (and a small DMA block) to the system bus, both as something the CPU can program and as something that can read and write memory on its own. |
+| `student/student_tl_watch.sv` | **A debugging register.** Sits beside the memory port and remembers the last request that never got an answer — which address, from which block, for how long. Readable over the debug cable even when the CPU is frozen and cannot be stopped. This is what found the hang. |
+| `student/student_tl_rsp_hold.sv` | **A small buffer** that holds a memory reply until the receiver is ready for it, working around a cache that would otherwise drop it. Currently switched off — the real cause was fixed elsewhere — but kept and tested. |
+| `ddr3/rvlab_tlul_ddr.sv` *(platform file, fixed)* | The top of the memory path. Two fixes live here: the "ready" signal that was taken from the wrong block so requests vanished, and a switch that bypasses the faulty prefetcher. |
+| `ddr3/rvlab_ddr_block_cache.sv` *(platform file, fixed)* | The 16 kB cache in front of DDR3. One-line fix: when a line was evicted the very cycle after being written, it wrote the *old* contents back to memory and lost the write. |
+
+### Register maps — `src/design/reggen/`
+
+| File | What it is |
+|---|---|
+| `student_gemm.hjson` | Lists the accelerator's control registers — the addresses of A, W and C, the matrix sizes, start, status, and four debug counters. A generator turns this into both the hardware register block and the C header, so software and hardware always agree. |
+| `ddr_ctrl.hjson` *(extended)* | The DDR3 status registers, plus the two watchdog registers above. |
+
+### The program that runs on the RISC-V — `src/sw/project/`
+
+Plain C, no operating system, no floating-point hardware. The same source
+also compiles on a PC (see "the oracle" below), which is how it is checked.
+
+| File | What it does |
+|---|---|
+| `main.c` | **Start here.** Sets up memory, waits for the host to say the weights are loaded, runs one inference, prints the depth map as text for the host to collect, and reports the time taken. |
+| `dav2_engine.c` | **The network itself**, layer by layer: cut the image into patches, run the 12 transformer blocks, run the decoder that turns features back into a depth map. Reads like the paper's diagram. |
+| `dav2_ops.c` | **The maths kernels** the engine calls: matrix multiply (which hands off to the accelerator), LayerNorm, softmax, GELU, convolution, and the requantisation that turns each 32-bit result back into 16-bit. Also the memory arena. |
+| `dav2_accel.c` / `.h` | **The accelerator driver.** Programs the registers, splits a big matrix into 16-row tiles, waits for each to finish with a timeout, and falls back to the CPU kernel if the hardware declines a shape. Includes a boot-time self-check that compares hardware against software. |
+| `dav2_blob.c` | **Reads the weight file.** The weights arrive as one 25 MB "blob" with a directory at the front; this looks tensors up by name. |
+| `dav2_mathf.c` / `.h` | Hand-written `sqrt`, `exp` and `erf`, because the program links without a standard library. |
+| `dav2_selftest.c` | A small deterministic test that prints a checksum. The same checksum must appear on the PC and on the board, proving the two builds compute identically. |
+| `dav2.h` | Shared types: what a tensor is, what a quantised weight matrix is, the blob format. |
+| `dav2_blob_config.h` | Generated by the exporter: input size, patch grid, token count. |
+
+### The oracle — `src/sw/project/host/`
+
+| File | What it does |
+|---|---|
+| `host_main.c` | Compiles the *same* engine for the PC and runs it in about four seconds. Its output is the reference every board result must match bit for bit — and it does, on every image tried. |
+| `host_stubs.c`, `selftest_main.c`, `Makefile` | Glue: a stub for the board-only progress print, the self-test entry point, and the build. |
+
+### Python tools — `src/sw/project/tools/`
+
+These run on the PC, not the board.
+
+| File | What it does |
+|---|---|
+| `export_dav2.py` | **Makes the weight blob.** Loads the PyTorch model, quantises every weight to int8 with a per-row scale, preprocesses an input photo, and writes it all into one file with a directory. Needs `torch`, `numpy`, `pillow`. |
+| `dav2_common.py` | Shared helpers for the tools: loading the model, resizing and normalising an image, and running the PyTorch float reference used as ground truth. |
+| `dav2_numpy.py` | **The blueprint.** A NumPy re-implementation of the whole network in which every operation has a one-to-one twin in `dav2_ops.c` / `dav2_engine.c`. The C was written from this, and checked against it. |
+| `dav2_run_fpga.py` | **The board runner.** Starts the debugger, resets the CPU, loads the program, streams the 25 MB blob into DDR3 over JTAG (~1 min), presses "go", collects the printed depth map, and saves it as `.npy`. If the run stalls it reads the watchdog register and tries to halt the CPU so you see *where*. |
+| `dav2_patch_image.py` | **Swaps the picture.** Rewrites just the image inside an existing blob, so a new photo does not need `torch`. Takes a `.ppm` file or one of eight built-in synthetic scenes. |
+
+### Testbenches — `src/tb/`
+
+Simulations that check the hardware without a board. Each is a small program
+that drives the block under test and compares what comes out.
+
+| File | What it checks |
+|---|---|
+| `student_gemm_tb.sv` | The accelerator alone, against a perfect memory that always answers. Many shapes, every output word compared. |
+| `student_gemm_soc_tb.sv` | The accelerator behind the real bus arbiter, so responses can arrive out of order. |
+| `student_gemm_ddr_tb.sv` | The accelerator against a memory with DDR3-like delays. |
+| `student_gemm_ddrpath_tb.sv` | The accelerator against the **real cache** — the closest simulation to the board. |
+| `student_gemm_droprsp_tb.sv` | Deliberately drops one memory reply and confirms the accelerator's retry timer recovers. Fails without the retry, passes with it. |
+| `rvlab_ddr_dready_tb.sv` | Shows the cache drops a reply if the receiver is busy for one cycle — and that the hold buffer prevents it. |
+| `rvlab_ddr_alias_tb.sv` | Two memory regions that collide in the cache, driven back-to-back like a real CPU. Found the prefetcher fault and the write-back fault; both fixes were proven here first. |
+| `ddr3_blk_model.sv` | A **stand-in for the DDR3 chip and controller** that answers in a few cycles instead of needing a 90-minute calibration. Can preload the weight blob and place the simulation start token. Makes whole-SoC simulation practical. |
+| `tlul_test_mem.sv`, `tlul_test_host.sv` *(extended)* | Shared test helpers: a memory that can be told to drop the Nth reply, and a bus driver with a quiet mode. |
+
+### Build flow — `flow/`
+
+| File | What changed |
+|---|---|
+| `flow/__init__.py` | Registers the new testbenches so `flow <name>.sim_rtl_xsim` works. |
+| `flow/system_tb.py` | Adds `sim_ddrmodel_xsim`: the whole SoC with `ddr3_blk_model` in place of real DDR3. |
+| `flow/tools/xsim.py` | Fixed a bug that merged all simulator arguments into one, silently losing every argument but the first. |
 
 Building and running
 --------------------
