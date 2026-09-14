@@ -165,8 +165,14 @@ Two regions in DDR3 do all the work:
 
 - **The weight blob** at `0x8000_0000`. A single file produced by
   `export_dav2.py` containing every tensor the network needs — weights,
-  biases, scales, the input image — plus a directory at the front so the C
-  code can find them by name. It is loaded once over JTAG (about a minute).
+  biases, scales — plus a directory at the front so the C code can find them
+  by name. It is loaded once over JTAG (about a minute).
+- **The input image** at `0x81E0_0000`, in the gap between blob and arena:
+  126×126×3 int16 pixels then one float scale, 95 kB. It is *not* part of the
+  blob, so a new picture is a quarter-second transfer rather than a new
+  minute-long weight load. The program serves frames: it waits for the host
+  to write an image here and raise a flag, runs it, prints the result, and
+  waits for the next.
 - **The activation arena** at `0x8200_0000`. Working memory for the tensors
   the network produces as it runs. A *bump allocator* hands out space by
   advancing a pointer and can only free it all at once, which suits a
@@ -392,7 +398,7 @@ to it — and now is, on every image tried.
 | `src/rtl/ddr3/rvlab_tlul_ddr.sv` | the DDR3 path top; request mux fix; prefetch bypass |
 | `src/rtl/ddr3/rvlab_ddr_block_cache.sv` | the cache; write-back fix |
 | `src/sw/project/` | the C inference engine |
-| `src/sw/project/tools/` | exporter, board runner, image patcher |
+| `src/sw/project/tools/` | exporter, board runner, image preprocessing (`dav2_image.py`) |
 | `src/tb/` | testbenches |
 | `docs/DATAFLOW.md` | timing diagrams of the bus and one inference |
 | `docs/DEBUGGING.md` | how every defect was found |

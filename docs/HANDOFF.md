@@ -17,9 +17,16 @@ detail.
 ## 1. Where it stands
 
 **The model runs end to end on the FPGA and its output is bit-exact with the
-host build.** Verified on five images: the demo photograph and four synthetic
-scenes. All 15876 pixels identical in every case; correlation 0.999836 with
-the PyTorch reference, which is the same figure the host build achieves.
+host build.** Verified on fifteen images: the demo photograph, six more
+photographs from the Depth-Anything repository's examples, and eight
+synthetic scenes. All 15876 pixels identical in every case; correlation
+0.999836 with the PyTorch reference on the demo, which is the same figure the
+host build achieves.
+
+**Weights load once; images are separate.** The program is a frame server:
+after the 25 MB weight transfer (~66 s) it waits for images at a fixed DDR3
+address, each a 95 kB transfer (~0.26 s), and runs them in turn. Any
+JPEG/PNG works — PIL, numpy and torch are installed in the venv.
 
 | Measurement | Value |
 |---|---|
@@ -76,11 +83,11 @@ work.
   address), but the one full run was closed before the program reached the
   handshake. Run it once to completion and watch for
   `autostart token found (simulation)`.
-- **Photographs as input.** `dav2_patch_image.py` takes any binary P6 PPM
-  and rewrites the image tensors in a blob without torch. This machine has
-  no PIL or ImageMagick, so no photo other than the baked-in demo has been
-  run. `convert photo.jpg photo.ppm` elsewhere, then
-  `--ppm photo.ppm`.
+- **Photographs from a camera.** Any picture file works now, but only from
+  the PC over JTAG. A webcam is one OpenCV capture away from the same loop
+  (`dav2_image.from_file` accepts anything PIL opens; feed it a frame). A
+  camera on the board itself is an RTL project — see the options recorded in
+  `DEBUGGING.md` § 11.
 - **Performance.** The accelerator has removed the matmuls from the
   critical path; the CPU's element-wise work (LayerNorm, softmax, GELU,
   requantisation) in software floating point is now the larger share.
@@ -93,24 +100,27 @@ work.
 ```
 source .venv/bin/activate
 flow rvlab_fpga_top.program                              # board must be plugged in
-python -u src/sw/project/tools/dav2_run_fpga.py --timeout 900
+python -u src/sw/project/tools/dav2_run_fpga.py --image a.jpg --image b.jpg --synth road
 ```
 
-writes `build/dav2/fpga_depth.npy`. For another image:
+Weights load once, then every `--image` (any picture file), `--synth NAME`
+(built-in scene) or `--dav2img FILE` (already preprocessed) runs in turn.
+Results go to `build/dav2/fpga_depth_<name>.npy`, each with the exact
+`.dav2img` bytes the board received beside it. With no image given, the demo
+photograph runs.
 
-```
-python3 src/sw/project/tools/dav2_patch_image.py --synth sphere --out build/x.bin
-python -u src/sw/project/tools/dav2_run_fpga.py --blob build/x.bin --out build/x.npy --timeout 900
-```
-
-Check any result against the oracle:
+Check any result against the oracle on the same bytes:
 
 ```
 make -C src/sw/project/host
-./src/sw/project/host/dav2_host build/x.bin build/x_host.bin
+./src/sw/project/host/dav2_host build/dav2/dav2_weights.bin build/dav2/fpga_depth_a.dav2img host_a.bin
 ```
 
-and compare the floats; they must be identical.
+and compare the floats; they must be identical. To see what the board saw:
+
+```
+python3 src/sw/project/tools/dav2_image.py --show build/dav2/fpga_depth_a.dav2img a_seen.png
+```
 
 ---
 

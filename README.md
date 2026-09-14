@@ -147,7 +147,7 @@ also compiles on a PC (see "the oracle" below), which is how it is checked.
 
 | File | What it does |
 |---|---|
-| `host_main.c` | Compiles the *same* engine for the PC and runs it in about four seconds. Its output is the reference every board result must match bit for bit — and it does, on every image tried. |
+| `host_main.c` | Compiles the *same* engine for the PC and runs it in about four seconds on a blob plus a `.dav2img` — the identical bytes the board receives. Its output is the reference every board result must match bit for bit, and it does, on every image tried. |
 | `host_stubs.c`, `selftest_main.c`, `Makefile` | Glue: a stub for the board-only progress print, the self-test entry point, and the build. |
 
 ### Python tools — `src/sw/project/tools/`
@@ -159,8 +159,9 @@ These run on the PC, not the board.
 | `export_dav2.py` | **Makes the weight blob.** Loads the PyTorch model, quantises every weight to int8 with a per-row scale, preprocesses an input photo, and writes it all into one file with a directory. Needs `torch`, `numpy`, `pillow`. |
 | `dav2_common.py` | Shared helpers for the tools: loading the model, resizing and normalising an image, and running the PyTorch float reference used as ground truth. |
 | `dav2_numpy.py` | **The blueprint.** A NumPy re-implementation of the whole network in which every operation has a one-to-one twin in `dav2_ops.c` / `dav2_engine.c`. The C was written from this, and checked against it. |
-| `dav2_run_fpga.py` | **The board runner.** Starts the debugger, resets the CPU, loads the program, streams the 25 MB blob into DDR3 over JTAG (~1 min), presses "go", collects the printed depth map, and saves it as `.npy`. If the run stalls it reads the watchdog register and tries to halt the CPU so you see *where*. |
-| `dav2_patch_image.py` | **Swaps the picture.** Rewrites just the image inside an existing blob, so a new photo does not need `torch`. Takes a `.ppm` file or one of eight built-in synthetic scenes. |
+| `dav2_run_fpga.py` | **The board runner.** Starts the debugger, resets the CPU, loads the program, streams the 25 MB blob into DDR3 over JTAG once (~1 min), then serves images: each `--image`, `--synth` or `--dav2img` is preprocessed, sent as 95 kB (~0.26 s), run, and saved as `.npy` with the exact bytes the board saw beside it. If a run stalls it reads the watchdog register and tries to halt the CPU so you see *where*. |
+| `dav2_image.py` | **Prepares a picture for the board.** Resize, ImageNet normalisation, quantisation — byte-identical to the exporter — from any picture file, a built-in scene, or a raw array, into the `.dav2img` format the engine and the host oracle both read. Can also render a `.dav2img` back to PNG. |
+| `dav2_patch_image.py` | **Synthetic test scenes.** Eight generated pictures (gradient, checker, sphere, corridor, road, spheres, stairs, pillars) that `dav2_image.py --synth` draws on. Its original job — rewriting the image inside a blob — is obsolete now that images travel separately. |
 
 ### Testbenches — `src/tb/`
 

@@ -451,15 +451,16 @@ the accelerator's retry rather than fixed at source.
 - The prefetcher is bypassed; read bandwidth is lower than it could be.
 - `student_gemm`'s retry covers reads only; a lost write ack would still
   wedge it. Unlikely now that requests are never swallowed, but real.
-- `main.c` reports `inference finished in N kcycles` from two 32-bit
-  `mcycle` reads across an interval that wraps; it under-reports by multiples
-  of 85.9 s. Sum stage timestamps with wrap correction instead.
-- `sim_ddrmodel_xsim` (whole SoC with a behavioural DDR3 back end) now
-  elaborates and loads the blob, but still needs a start condition that does
-  not depend on a host writing the go flag — and the blob-header shortcut is
-  not it (section 4).
-- `student_gemm_ddrpath_tb` fails wholesale in its environment and does not
-  model the board. Do not trust it until fixed.
+- ~~`main.c` reports the frame time from two 32-bit `mcycle` reads~~ Fixed:
+  it reads `mcycleh` too and prints seconds and FPS directly.
+- ~~`sim_ddrmodel_xsim` needs a start condition~~ Fixed with a two-word token
+  at `0x81F00000` that `ddr3_blk_model` places under `+dav2_autostart`. Each
+  half is verified; the one full run was closed before they met, so a
+  complete run is still owed.
+- ~~`student_gemm_ddrpath_tb` fails wholesale~~ Fixed: the reference arrays
+  were sized for M ≤ 8 and the shapes I added overflowed them, so the weights
+  sent to memory were X. Now sized for the shapes run and guarded. All four
+  shapes pass against the real cache.
 - No profiling of the 93.6 s. The accelerator is ~36× faster than the CPU
   kernel on GEMM, so the rest is CPU-side float bookkeeping and console I/O.
 
@@ -469,3 +470,60 @@ the accelerator's retry rather than fixed at source.
 2. Accelerator-vs-CPU comparison at model shapes, in DDR3.
 3. A testbench driver that pipelines requests the way a CPU does.
 4. The negative control — every time.
+
+---
+
+## 11. Separating the image from the weights
+
+Not a bug, but the last change to how the system is used, and it closed a
+real limitation.
+
+**The problem.** The exporter baked the input picture into the weight blob
+as two tensors, so every new image cost the full 25 MB, ~66 s JTAG transfer.
+Eight images meant eight weight loads. It also meant that without `torch` on
+the machine — which there was not — no new picture could be made at all; the
+first workaround was a script that rewrote the two image tensors inside a
+blob copy from synthetic scenes drawn in pure Python.
+
+**The change.** The image is now a separate 95 kB buffer at `0x81E00000`, in
+the 8 MB gap between blob and arena. `dav2_engine.c` takes it through a
+setter instead of a blob lookup. `main.c` prints `DAV2_READY` after the
+weights are accepted and then loops: set the flag to *done*, wait for the
+host to set it to *frame*, infer, print, repeat. The runner loads weights
+once and then sends each image (~0.26 s) and collects each result. The host
+oracle takes the same `.dav2img` file as a separate argument, so it sees the
+identical bytes.
+
+**Two things checked before trusting it.**
+
+- The new preprocessing (`dav2_image.py`, PIL + numpy) had to match the
+  exporter *exactly*, or every board result would disagree with PyTorch for
+  reasons unrelated to the hardware. Rebuilding the demo picture from the
+  exporter's saved RGB and comparing against the tensor still inside the old
+  blob: 47628 of 47628 pixels equal and the same float32 scale, bit for bit.
+- An old comment in `main.c` warned that the CPU had once kept seeing a stale
+  DDR3 value after a debugger write. That observation predated the bus fixes,
+  and both paths go through the same cache, so I ran it rather than adding
+  an invalidate register pre-emptively. Fifteen frames later, all bit-exact,
+  it has not recurred — it was almost certainly one of the swallowed-write
+  bugs wearing a different hat.
+
+**Result.** Three frames in one session: weights 66 s once, then 0.26 s +
+93.7 s per frame, each 15876/15876 against the oracle. Then six photographs
+from the Depth-Anything repository through one load, likewise. The per-image
+cost fell from ~160 s to ~94 s, all of it inference.
+
+**Input options beyond JTAG**, for whoever wants a camera. Ranked by effort:
+
+1. *PC webcam through the existing loop* — no RTL. `dav2_image.from_file`
+   accepts anything PIL opens; an OpenCV frame is one conversion away.
+2. *UART* — the FTDI UART pins are in the XDC but the SoC has no UART block.
+   Add one plus a driver and the board runs standalone after the one-time
+   weight load; 95 kB at 3 Mbaud is under a second.
+3. *OV7670 on a Pmod* — ~€5, moderate RTL, the classic student project,
+   writing pixels to DDR3 through the existing `student_dma`.
+4. *HDMI in* — pins exist, but TMDS decode plus 1080p→126 downscale is a
+   large job. USB webcam is not viable: the board's USB is HID-only.
+
+Whichever path: inference is ~94 s a frame, so "camera" means one depth map
+per minute and a half. The input plumbing is not the bottleneck.
