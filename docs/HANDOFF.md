@@ -9,6 +9,7 @@ detail.
 | how the system fits together | `ARCHITECTURE.md` |
 | when things happen, cycle by cycle | `DATAFLOW.md` |
 | what went wrong and how each thing was found | `DEBUGGING.md` |
+| the memory bugs explained with no background assumed | `DDR3_FOR_BEGINNERS.md` |
 | rules to carry to the next project | `LESSONS.md` |
 | how to build, simulate, and run | `../CLAUDE.md` § Run |
 

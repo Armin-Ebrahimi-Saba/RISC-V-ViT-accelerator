@@ -97,6 +97,7 @@ Documentation
     docs/ARCHITECTURE.md   the SoC, the memory map, the accelerator, the DDR3 path — with diagrams
     docs/DATAFLOW.md       timing diagrams: the bus handshake, one inference, the write-back bug
     docs/DEBUGGING.md      every defect: symptom, wrong theories, instrument, fix, verification
+    docs/DDR3_FOR_BEGINNERS.md  the three memory bugs told from scratch, no DDR3 knowledge assumed
     docs/LESSONS.md        portable rules for the next project
     docs/HANDOFF.md        current state, what is bypassed, what is not done
     CLAUDE.md              build, simulate, and run commands
