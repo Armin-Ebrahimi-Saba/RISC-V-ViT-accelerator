@@ -199,3 +199,53 @@ stops the next person re-investigating it.
 
 **When you retract, retract in the commit.** A wrong finding committed as a
 result will be read as a result.
+
+## Making it fast
+
+**Profile before optimising, and re-profile after every step.** The first
+round of speed-up work was guided by reasoning about the code and got the
+bottleneck wrong twice. A per-operator cycle counter printed after each frame
+(`dav2_prof_*`) cost an hour and paid for itself on the first table: the
+accelerator was 20 % of the frame, not the assumed 90 %.
+
+**Measure the machine, not the model of the machine.** Two rounds of
+memory-oriented changes (word-wise access, on-chip scratch, fewer bus
+transactions) gained nothing, because on this core a DDR3 load costs about the
+same as a BRAM load and both cost about as much as a multiply. A ten-line
+microbenchmark at boot — cycles per ALU op, per load, per taken branch —
+would have said so on day one. Run one before optimising software on an
+unfamiliar core.
+
+**On the CV32E40P: instructions and taken branches, nothing else.** ~1
+instruction per cycle straight-line, ~4 cycles per taken branch, no FPU, no
+data cache to speak of. A "fast path" that is entered by a branch and left by
+a jump is slower than the slow path it replaces. Write the common case as the
+fall-through.
+
+**Bit-exactness is the cheapest regression test there is.** `cmp` on the
+host output after every change caught nothing — because every change that
+claimed to be exact was — but the two changes that were not exact by design
+were checked against the PyTorch reference instead, and one of them
+(the first reciprocal in attention) turned out to lose accuracy and was
+corrected before it reached the board. Decide for each change whether it is
+supposed to be exact, and test accordingly.
+
+**The bus is the accelerator's limit; the tile width is its lever.** The
+GEMM block was never compute-bound. Going from 16 to 64 rows per tile did not
+make the arithmetic faster; it made the weights cross the bus three times
+less often. Going from one to eight reads in flight then cut the cost of each
+crossing by 2.6×. Neither change touched a multiplier.
+
+**Anything the CPU does per element at 20+ instructions belongs in
+hardware.** The requantisation was ~70 cycles per element and a third of the
+frame. As a second job type of an existing block — reusing its bus engine
+and tile RAM — it was ~250 lines of RTL and a testbench, and took the
+operator from 392 to ~30 Mcycles.
+
+**A diagnostic that fires on every job is a bug in the diagnostic.** Twice
+in this work a "WRITE SHORTFALL" print flooded the console for a whole frame;
+both times the hardware was right and the expected count was stale (a 16-bit
+counter wrap, then the two statistics words per row). Keep expected-value
+checks next to the change that alters what is expected — and remember that
+each console line costs the frame ~15 ms.
+

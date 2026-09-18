@@ -10,6 +10,7 @@ detail.
 | when things happen, cycle by cycle | `DATAFLOW.md` |
 | what went wrong and how each thing was found | `DEBUGGING.md` |
 | the memory bugs explained with no background assumed | `DDR3_FOR_BEGINNERS.md` |
+| how the frame got 6.6x faster and what is left | `PERFORMANCE.md` |
 | rules to carry to the next project | `LESSONS.md` |
 | how to build, simulate, and run | `../CLAUDE.md` § Run |
 
@@ -18,11 +19,13 @@ detail.
 ## 1. Where it stands
 
 **The model runs end to end on the FPGA and its output is bit-exact with the
-host build.** Verified on fifteen images: the demo photograph, six more
-photographs from the Depth-Anything repository's examples, and eight
-synthetic scenes. All 15876 pixels identical in every case; correlation
-0.999836 with the PyTorch reference on the demo, which is the same figure the
-host build achieves.
+host build.** Verified on the demo photograph, twelve photographs from the
+Depth-Anything repository's examples, and eight synthetic scenes; all 15876
+pixels identical in every case. Correlation 0.999872 with the PyTorch
+reference on the demo (the host build gives the same figure). The speed-up
+work re-verified bit-exactness after every step; two of its changes altered
+the numerics deliberately (LayerNorm in fixed point, one clamp in attention)
+and both were checked against PyTorch.
 
 **Weights load once; images are separate.** The program is a frame server:
 after the 25 MB weight transfer (~66 s) it waits for images at a fixed DDR3
@@ -31,12 +34,13 @@ JPEG/PNG works — PIL, numpy and torch are installed in the venv.
 
 | Measurement | Value |
 |---|---|
-| Frame time | 93.6 s (4.681 G cycles at 50 MHz) |
-| Frames per second | 0.0107 |
+| Frame time | 14.2 s (0.71 G cycles at 50 MHz); was 93.6 s |
+| Frames per second | 0.070 |
 | Weight load (once per session, JTAG) | ~66 s at 0.37 MB/s |
-| Accelerator vs CPU on the matmul | ~36× |
-| Timing, last build | pnr WNS +0.287 ns, WHS +0.018 ns, 0 failing |
-| Resources | LUT ~12.4 %, BRAM 23.0 %, DSP 3.1 % |
+| Image in / result out | 0.3 s / 0.7 s over the JTAG system bus |
+| Accelerator | 64 rows per tile, 8 reads in flight, 3.2 cycles/beat, 0 retries per frame |
+| Timing, last build | pnr WNS +0.121 ns, WHS +0.030 ns, 0 failing |
+| Resources | LUT 14.8 %, BRAM 36.9 %, DSP 10.4 % |
 
 Three defects were found and fixed in the platform's DDR3 path. None was in
 the accelerator or the model code. They are described fully in
@@ -65,8 +69,13 @@ work.
   `a_ready` timing in ways that complicated bisecting. Left in the tree,
   switchable.
 - **Accelerator retry timer** (`RETRY_CYCLES = 2048` in `student_gemm.sv`) —
-  covers the cache's `d_ready` defect for reads. The defect itself is
-  unfixed; the CPU never trips it because it is single-outstanding.
+  covers the cache's `d_ready` defect for reads, now per reorder slot so the
+  block runs with 8 reads in flight. The board reports zero retries per
+  frame, so the defect may only bite at bus configurations no longer used;
+  it is still unfixed at source.
+- **Microbenchmark at boot** — `DAV2_BENCH 1` in `main.c` prints cycles per
+  ALU op / load / store once after DDR3 init (a fraction of a second). Set
+  to 0 to silence it.
 - **Start-up self-checks** — `DAV2_STARTUP_CHECKS 0` in `main.c`. Set to 1
   to run the DDR3 random/sequential tests and the per-shape accelerator
   comparison at boot. They cost a few seconds.
@@ -89,10 +98,14 @@ work.
   (`dav2_image.from_file` accepts anything PIL opens; feed it a frame). A
   camera on the board itself is an RTL project — see the options recorded in
   `DEBUGGING.md` § 11.
-- **Performance.** The accelerator has removed the matmuls from the
-  critical path; the CPU's element-wise work (LayerNorm, softmax, GELU,
-  requantisation) in software floating point is now the larger share.
-  Nothing has been done about it.
+- **Performance beyond 14.2 s.** The profile is flat now: LayerNorm,
+  attention's CPU side, the residual adds, im2col and GELU are each 7–18 %.
+  `PERFORMANCE.md` §5 lists the next steps with estimates; together they
+  reach roughly 6–7 s. The per-row soft-float work in requantisation
+  (`make_multiplier` and the range in float) is the cheapest to remove.
+- **Requant job constraints.** M must be even and a chunk is at most 64
+  columns × 1024 rows (the driver chunks). All shapes in this model comply;
+  `dav2_qgemm` falls back to the CPU path for odd M.
 
 ---
 

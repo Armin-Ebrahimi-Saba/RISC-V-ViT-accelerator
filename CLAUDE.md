@@ -34,7 +34,7 @@ dependencies (needed whenever RTL changed but the flow thinks it is current).
     flow rvlab_fpga_top.bitstream          # builds syn+pnr if needed
     flow rvlab_fpga_top.program            # load onto the board
 
-    # 5. run on the board: weights over JTAG once (~1 min), then each image (~0.3 s + ~94 s)
+    # 5. run on the board: weights over JTAG once (~1 min), then each image (~0.3 s in, ~14 s, ~0.7 s out)
     python -u src/sw/project/tools/dav2_run_fpga.py --image photo.jpg --synth road
 
 Changing a register in `src/design/reggen/*.hjson` shifts the offsets of every

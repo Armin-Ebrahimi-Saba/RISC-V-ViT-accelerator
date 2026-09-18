@@ -194,7 +194,7 @@ network was quantised so all the arithmetic is integer, because the CPU has
 no floating-point hardware.
 
 <figure>
-<svg viewBox="0 0 860 400" role="img" aria-label="Accelerator dataflow: A tile of 16 rows is loaded once into on-chip memory, then weight rows stream through 16 multiply-accumulate units in parallel, and each completed weight row's 16 results are drained to DDR3" style="max-width:100%;height:auto;font-family:system-ui,sans-serif;font-size:12px">
+<svg viewBox="0 0 860 400" role="img" aria-label="Accelerator dataflow: A tile of 64 rows is loaded once into on-chip memory, then weight rows stream through 64 multiply-accumulate units in parallel, and each completed weight row's 64 results are drained to DDR3 together with their max and min" style="max-width:100%;height:auto;font-family:system-ui,sans-serif;font-size:12px">
 <defs><marker id="ah2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="currentColor"/></marker></defs>
 <g fill="none" stroke="currentColor" stroke-width="1.4">
 <rect x="20" y="40" width="130" height="320" rx="6"/>
@@ -223,55 +223,89 @@ no floating-point hardware.
 <text x="195" y="90" text-anchor="middle" font-size="11">load once</text>
 <text x="195" y="245" text-anchor="middle" font-size="11">stream</text>
 <text x="315" y="65" text-anchor="middle" font-weight="600">A tile</text>
-<text x="315" y="85" text-anchor="middle" font-size="11">16 rows × K</text>
+<text x="315" y="85" text-anchor="middle" font-size="11">64 rows × K</text>
 <text x="315" y="103" text-anchor="middle" font-size="11">on-chip BRAM</text>
 <text x="315" y="130" text-anchor="middle" font-size="11">read every cycle</text>
 <text x="315" y="145" text-anchor="middle" font-size="11">for each W row</text>
 <text x="315" y="245" text-anchor="middle" font-weight="600">W beat</text>
 <text x="315" y="265" text-anchor="middle" font-size="11">4 × int8 per word</text>
 <text x="435" y="245" text-anchor="middle" font-size="11">broadcast</text>
-<text x="580" y="65" text-anchor="middle" font-weight="600">16 MAC units</text>
+<text x="580" y="65" text-anchor="middle" font-weight="600">64 MAC units</text>
 <text x="580" y="107" text-anchor="middle" font-size="11">row 0: acc += A[0][k]·W[m][k]</text>
 <text x="580" y="141" text-anchor="middle" font-size="11">row 1: acc += A[1][k]·W[m][k]</text>
 <text x="580" y="175" text-anchor="middle" font-size="11">row 2: acc += A[2][k]·W[m][k]</text>
 <text x="580" y="230" text-anchor="middle">⋮</text>
-<text x="580" y="307" text-anchor="middle" font-size="11">row 15</text>
-<text x="580" y="345" text-anchor="middle" font-size="11">all 16 in parallel, one k per cycle</text>
+<text x="580" y="307" text-anchor="middle" font-size="11">row 63</text>
+<text x="580" y="345" text-anchor="middle" font-size="11">all 64 in parallel, one k per cycle</text>
 <text x="785" y="175" text-anchor="middle" font-weight="600">drain</text>
-<text x="785" y="200" text-anchor="middle" font-size="11">16 results</text>
+<text x="785" y="200" text-anchor="middle" font-size="11">64 results</text>
 <text x="785" y="215" text-anchor="middle" font-size="11">per W row</text>
-<text x="785" y="235" text-anchor="middle" font-size="11">→ C column</text>
-<text x="435" y="375" text-anchor="middle" font-size="11">write C[m][0..15] to DDR3</text>
+<text x="785" y="235" text-anchor="middle" font-size="11">→ C column + {max,min}</text>
+<text x="435" y="375" text-anchor="middle" font-size="11">write C[m][0..63] to DDR3</text>
 </g>
 </svg>
-<figcaption>Reuse is the whole idea: 16 rows of A are loaded once and held on-chip, then every weight row streams past all 16 at once. Each int8 weight is multiplied against 16 activations the cycle it arrives, so the weight — the dominant memory traffic — crosses the bus exactly once.</figcaption>
+<figcaption>Reuse is the whole idea: 64 rows of A are loaded once and held on-chip, then every weight row streams past all 64 at once. Each int8 weight is multiplied against 64 activations the cycle it arrives, so the weight — the dominant memory traffic — crosses the bus once per tile: twice for the encoder's 82 tokens.</figcaption>
 </figure>
 
-The execution of one *job* (one 16-row tile of A against all of W):
+The execution of one *GEMM job* (one 64-row tile of A against all of W):
 
-1. **Load** the A tile — 16 rows × K int16 — from DDR3 into on-chip BRAM.
+1. **Load** the A tile — up to 64 rows × K int16 — from DDR3 into on-chip
+   BRAM (256 kB, 64 block RAMs). Rows may lie `A_STRIDE` bytes apart, so
+   the tile can be a column slice of a wider matrix.
 2. **Stream** W: each 32-bit word carries four int8 weights. As each arrives
-   it is broadcast to all 16 MAC units, each of which multiplies it against
-   its own row of A and accumulates.
-3. **Drain**: when a weight row `m` is finished, the 16 accumulated results
-   are written to DDR3 as column `m` of C, and the accumulators clear.
+   it is broadcast to all 64 MAC units, each of which multiplies it against
+   its own row of A and accumulates. W rows may also be strided.
+3. **Drain**: when a weight row `m` is finished, the accumulated results
+   are written to DDR3 as column `m` of C. With `S_ADDR` set, the row's max
+   and min go out after them — the range the requantisation needs, so the
+   CPU never reads C back for it.
 4. Repeat 2–3 for every row of W. Then the CPU starts the next tile.
 
-A matrix with N=81 rows needs six jobs: five full tiles and one of a single
-row. That last, partial tile was the shape that exposed the cache bug.
+A matrix with N=82 rows needs two jobs: one full tile and one of 18 rows.
+A reduction longer than the tile RAM (K = 3456 in the 384-channel 3×3
+convolutions, against KMAX = 2048) is run as two column-slice jobs whose
+partial sums the CPU adds.
 
-The block has a register interface the CPU programs (addresses of A, W and
-C; K, M and the tile row count; a start bit; status) and four debug registers
-that expose internal counters. Peak is 16 multiply-accumulates per cycle;
-measured throughput on the board is 9.0 cycles per weight beat on clean tiles,
-i.e. the block is memory-bound, not compute-bound.
+The block reads with **eight requests in flight** through a reorder buffer
+indexed by the bus source ID, which is what brought it from 8.3 to 3.2
+cycles per beat. It measures 3.2 because a 32-byte cache line is filled from
+DRAM once per eight beats; the bypassed prefetcher (§5) would hide that.
+
+### The requantisation job
+
+Every GEMM's int32 result has to become int16 activations again:
+`out[n][m] = sat14((C[m][n]·mult[m] + 2^(s−1)) >> s + bias[m])`, with a
+multiplier, shift and bias per weight row chosen by the CPU from the row
+ranges above. That used to be ~70 CPU cycles per element — a third of the
+frame — and is now the block's second job type (`CTRL.requant`):
+
+1. Read the per-row `{mult, shift, bias}` table (`P_ADDR`) into a small
+   parameter RAM.
+2. Read a chunk of C — up to 1024 rows × 64 columns — into the A-tile RAM
+   **transposed**: RAM row = n, word = m. This is what turns the m-major
+   result into n-major output for free.
+3. Stream out: one element per cycle through a seven-stage pipeline
+   (multiply in DSPs, round, shift, add bias, saturate), two int16 packed
+   per word, into a 16-entry FIFO that the write engine drains.
+
+The arithmetic matches the C code to the bit; `student_gemm_tb` checks it
+against a bit-level model and the board against the host build.
+
+The block has a register interface the CPU programs (addresses and strides
+of A, W and C; K, M and the tile row count; `S_ADDR`, `P_ADDR`; a control
+word with start and requant bits; status) and four debug registers that
+expose internal counters. Peak is 64 multiply-accumulates per cycle; the
+block is memory-bound, not compute-bound, so the tile width buys fewer
+passes over the weights rather than more arithmetic per pass.
 
 ### Retry timer
 
-The block also carries a **retry timer**: if a read it issued gets no response
-within 2048 cycles, it re-issues the read. This exists because the platform's
-cache can drop a response (§5); the accelerator could survive that, the CPU
-could not.
+The block also carries a **retry timer**: every outstanding read's address
+is kept in its reorder-buffer slot, and if the oldest one gets no response
+within 2048 cycles of bus silence it is re-issued. This exists because the
+platform's cache can drop a response (§5); the accelerator could survive
+that, the CPU could not. With eight reads in flight the board reports zero
+retries per frame.
 
 ---
 

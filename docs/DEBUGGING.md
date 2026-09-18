@@ -430,10 +430,13 @@ not testing what you think.
   the PyTorch reference at r = 0.9998 — the same as the host does.
 - Four additional test images (gradient, checkerboard, shaded sphere,
   corridor), each bit-exact against the host.
-- Frame time **93.6 s** (4.68 G cycles at 50 MHz), i.e. **0.0107 FPS**.
-- Timing met: WNS +0.287 ns, no failing endpoints. All syn/pnr/bitstream
-  reports checked; remaining warnings are advisories (async-reset flops
-  blocking DSP register merging, DSP pipelining headroom not needed at 50 MHz).
+- Frame time **14.2 s** (0.71 G cycles at 50 MHz), i.e. **0.070 FPS** —
+  down from 93.6 s; `PERFORMANCE.md` has the steps.
+- Timing met: WNS +0.121 ns, no failing endpoints. All syn/pnr/bitstream
+  reports checked; remaining warnings are advisories in the CPU core and the
+  platform cache (async-reset flops blocking DSP register merging, DSP
+  pipelining headroom not needed at 50 MHz); the accelerator's own were
+  removed by taking the asynchronous reset off its datapath registers.
 
 **Three real defects fixed, none in the accelerator or the model:**
 
@@ -450,7 +453,9 @@ the accelerator's retry rather than fixed at source.
 
 - The prefetcher is bypassed; read bandwidth is lower than it could be.
 - `student_gemm`'s retry covers reads only; a lost write ack would still
-  wedge it. Unlikely now that requests are never swallowed, but real.
+  wedge it. Unlikely now that requests are never swallowed, but real. The
+  retry is per reorder slot since the block runs with eight reads in flight;
+  the board reports zero retries per frame.
 - ~~`main.c` reports the frame time from two 32-bit `mcycle` reads~~ Fixed:
   it reads `mcycleh` too and prints seconds and FPS directly.
 - ~~`sim_ddrmodel_xsim` needs a start condition~~ Fixed with a two-word token
@@ -461,8 +466,8 @@ the accelerator's retry rather than fixed at source.
   were sized for M ≤ 8 and the shapes I added overflowed them, so the weights
   sent to memory were X. Now sized for the shapes run and guarded. All four
   shapes pass against the real cache.
-- No profiling of the 93.6 s. The accelerator is ~36× faster than the CPU
-  kernel on GEMM, so the rest is CPU-side float bookkeeping and console I/O.
+- ~~No profiling of the 93.6 s~~ Done: a per-operator profile prints after
+  every frame, and drove the work in `PERFORMANCE.md`.
 
 **Instruments that made the difference**, most leverage first:
 

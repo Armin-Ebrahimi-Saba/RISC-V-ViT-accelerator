@@ -19,16 +19,18 @@ Results
 | | |
 |---|---|
 | FPGA output vs. the same C engine on a PC | **bit-exact**, 15876/15876 pixels, on every image tried |
-| FPGA output vs. PyTorch reference | correlation **0.99984** |
-| Frame time on the board | **93.6 s** (0.0107 FPS) at 50 MHz |
-| Accelerator vs. CPU on the matmul | **~36×** |
-| Timing | met, WNS **+0.287 ns** at 50 MHz, 0 failing endpoints |
-| Resources | LUT 12.4 %, BRAM 23.0 %, DSP 3.1 % of an XC7A200T |
+| FPGA output vs. PyTorch reference | correlation **0.99987** |
+| Frame time on the board | **14.2 s** (0.070 FPS) at 50 MHz — was 93.6 s before the speed-up work |
+| Weights load (once per session) | ~66 s over JTAG; each image then 0.3 s in, 0.7 s out |
+| Timing | met, WNS **+0.121 ns** at 50 MHz, 0 failing endpoints |
+| Resources | LUT 14.8 %, BRAM 36.9 %, DSP 10.4 % of an XC7A200T |
 
-One frame at 126×126 is 2.4 G multiply-accumulates. The accelerator takes those
-off the critical path; what remains is the CPU's element-wise work
-(LayerNorm, softmax, GELU, requantisation) in software floating point, and the
-25 MB of weights crossing DDR3 once per frame.
+One frame at 126×126 is 2.4 G multiply-accumulates. The accelerator does all
+of them — the four GEMMs of every transformer block, the convolutions, and
+both matrix products inside attention — and also turns its int32 sums back
+into int16 activations. What remains on the CPU is LayerNorm, softmax, GELU,
+the residual adds and the convolution patch gathers; `docs/PERFORMANCE.md`
+has the profile and the story of how 93.6 s became 14.2 s.
 
 Six of the Depth-Anything example photographs, run through one weight load.
 Input above, FPGA depth below; every one is bit-exact with the host build:
@@ -67,12 +69,17 @@ Every matmul in the network — patch embedding, attention projections, MLPs,
 the DPT head — funnels through one function, `dav2_qgemm()`. That single choke
 point is why the accelerator needed exactly one attachment point.
 
-**Hardware** (`src/rtl/student/student_gemm.sv`) — a 16-wide
-int8×int16 → int32 MAC array with its own TL-UL host port. A tile of 16
-activation rows loads into on-chip BRAM once, then the weight matrix streams
-past as one contiguous byte stream, each weight broadcasting to all 16
-multipliers. Weights — the dominant memory traffic — cross the bus exactly
-once. A retry timer re-issues any read the platform's cache fails to answer.
+**Hardware** (`src/rtl/student/student_gemm.sv`) — a 64-wide
+int8×int16 → int32 MAC array with its own TL-UL host port and eight reads in
+flight. A tile of 64 activation rows loads into on-chip BRAM once, then the
+weight matrix streams past, each weight broadcasting to all 64 multipliers.
+Rows of either operand may be read at a stride, so a job can take a column
+slice of a wider matrix — that is how attention's Q·Kᵀ reads a head out of
+the qkv tensor, and how a reduction longer than the tile is split. While it
+drains a result row it reports the row's max and min, and a second job type
+requantises a whole int32 result matrix to int16 with per-row scale and
+bias, transposing it on the way. Any read the platform's cache fails to
+answer is re-issued.
 
 The software kernel never leaves: `dav2_accel_qgemm()` declines any shape the
 hardware cannot take, and a boot-time cross-check disables the block on
@@ -100,6 +107,7 @@ Documentation
     docs/DDR3_FOR_BEGINNERS.md  the three memory bugs told from scratch, no DDR3 knowledge assumed
     docs/LESSONS.md        portable rules for the next project
     docs/HANDOFF.md        current state, what is bypassed, what is not done
+    docs/PERFORMANCE.md    the speed-up from 93.6 s to 14.2 s: profile, each step, what is left
     CLAUDE.md              build, simulate, and run commands
 
 What each file does
@@ -113,7 +121,7 @@ exceptions marked *(platform file, fixed)*.
 
 | File | What it is, in plain words |
 |---|---|
-| `student/student_gemm.sv` | **The accelerator.** A block of 16 multipliers that computes matrix products far faster than the CPU can. The CPU tells it where the two input matrices are in memory and where to put the result, then presses "go". It fetches its own data over the bus. |
+| `student/student_gemm.sv` | **The accelerator.** 64 multipliers that compute a matrix product against 64 rows of activations held on-chip while the weights stream past once; it also reports the per-row range of its results and, as a second job type, requantises them back to int16. The CPU programs it through registers (`student_gemm.hjson`). |
 | `student/student.sv` | **Wiring.** Connects the accelerator (and a small DMA block) to the system bus, both as something the CPU can program and as something that can read and write memory on its own. |
 | `student/student_tl_watch.sv` | **A debugging register.** Sits beside the memory port and remembers the last request that never got an answer — which address, from which block, for how long. Readable over the debug cable even when the CPU is frozen and cannot be stopped. This is what found the hang. |
 | `student/student_tl_rsp_hold.sv` | **A small buffer** that holds a memory reply until the receiver is ready for it, working around a cache that would otherwise drop it. Currently switched off — the real cause was fixed elsewhere — but kept and tested. |

@@ -79,35 +79,35 @@ What each of the three fixed bugs did to this picture:
 Wall-clock view of a single frame on the board. Total 94 s; 50 MHz clock.
 
 <figure>
-<svg viewBox="0 0 860 330" role="img" aria-label="Gantt-style timeline of one inference: weight load over JTAG about 66 seconds, patch embedding under a second, twelve transformer blocks about five seconds each, DPT head about eight seconds. Within each block, GEMMs run on the accelerator and everything else on the CPU." style="max-width:100%;height:auto;font-family:system-ui,sans-serif;font-size:12px">
+<svg viewBox="0 0 860 330" role="img" aria-label="Gantt-style timeline of one inference: weight load over JTAG about 66 seconds, patch embedding under a second, twelve transformer blocks about 0.7 seconds each, DPT head about five seconds. Within each block, GEMMs and requantisation run on the accelerator and the element-wise work on the CPU." style="max-width:100%;height:auto;font-family:system-ui,sans-serif;font-size:12px">
 <g fill="none" stroke="currentColor" stroke-width="1.2">
 <line x1="60" y1="70" x2="840" y2="70"/>
-<line x1="60" y1="66" x2="60" y2="74"/><line x1="357" y1="66" x2="357" y2="74"/>
-<line x1="365" y1="66" x2="365" y2="74"/><line x1="770" y1="66" x2="770" y2="74"/>
+<line x1="60" y1="66" x2="60" y2="74"/><line x1="703" y1="66" x2="703" y2="74"/>
+<line x1="708" y1="66" x2="708" y2="74"/><line x1="793" y1="66" x2="793" y2="74"/>
 <line x1="840" y1="66" x2="840" y2="74"/>
 </g>
 <g fill="currentColor" font-size="11">
 <text x="60" y="58" text-anchor="middle">0 s</text>
-<text x="357" y="58" text-anchor="middle">66 s</text>
-<text x="770" y="58" text-anchor="middle">156 s</text>
-<text x="840" y="58" text-anchor="middle">160 s</text>
+<text x="703" y="58" text-anchor="middle">66 s</text>
+<text x="793" y="58" text-anchor="middle">75 s</text>
+<text x="840" y="58" text-anchor="middle">80 s</text>
 </g>
 <!-- phase bars -->
-<rect x="60" y="85" width="297" height="26" rx="3" fill="currentColor" opacity="0.15"/>
-<rect x="357" y="85" width="8" height="26" rx="3" fill="#d9480f"/>
-<rect x="365" y="85" width="405" height="26" rx="3" fill="#1c7ed6" opacity="0.6"/>
-<rect x="770" y="85" width="70" height="26" rx="3" fill="#2b8a3e" opacity="0.6"/>
+<rect x="60" y="85" width="643" height="26" rx="3" fill="currentColor" opacity="0.15"/>
+<rect x="703" y="85" width="5" height="26" rx="3" fill="#d9480f"/>
+<rect x="708" y="85" width="85" height="26" rx="3" fill="#1c7ed6" opacity="0.6"/>
+<rect x="793" y="85" width="47" height="26" rx="3" fill="#2b8a3e" opacity="0.6"/>
 <g fill="currentColor" font-size="11">
-<text x="208" y="102" text-anchor="middle">weight load, JTAG, 0.37 MB/s</text>
-<text x="567" y="102" text-anchor="middle" fill="#fff">12 transformer blocks</text>
-<text x="805" y="102" text-anchor="middle" fill="#fff">DPT head</text>
-<text x="361" y="130" text-anchor="middle" fill="#d9480f">patch embed</text>
+<text x="380" y="102" text-anchor="middle">weight load, JTAG, 0.37 MB/s — once per session</text>
+<text x="750" y="102" text-anchor="middle" fill="#fff">12 blocks</text>
+<text x="816" y="102" text-anchor="middle" fill="#fff" font-size="10">head</text>
+<text x="705" y="130" text-anchor="middle" fill="#d9480f">patch embed</text>
 </g>
 <!-- zoom into one block -->
 <g fill="none" stroke="currentColor" stroke-width="1" stroke-dasharray="3 3">
-<line x1="400" y1="111" x2="60" y2="170"/><line x1="434" y1="111" x2="840" y2="170"/>
+<line x1="708" y1="111" x2="60" y2="170"/><line x1="715" y1="111" x2="840" y2="170"/>
 </g>
-<g fill="currentColor" font-size="11"><text x="450" y="160" text-anchor="middle">one block, ≈5 s</text></g>
+<g fill="currentColor" font-size="11"><text x="450" y="160" text-anchor="middle">one block, ≈0.7 s (was ≈5 s)</text></g>
 <g fill="none" stroke="currentColor" stroke-width="1.2"><line x1="60" y1="185" x2="840" y2="185"/></g>
 <!-- block internals: attention then MLP; each has GEMMs (accel) and CPU work -->
 <rect x="60" y="195" width="60" height="22" rx="3" fill="currentColor" opacity="0.2"/>
@@ -121,7 +121,7 @@ Wall-clock view of a single frame on the board. Total 94 s; 50 MHz clock.
 <g fill="currentColor" font-size="10">
 <text x="90" y="210" text-anchor="middle">norm</text>
 <text x="175" y="210" text-anchor="middle" fill="#fff">qkv GEMM</text>
-<text x="300" y="210" text-anchor="middle">attention (CPU)</text>
+<text x="300" y="210" text-anchor="middle">attention (CPU + accel)</text>
 <text x="400" y="210" text-anchor="middle" fill="#fff">proj</text>
 <text x="460" y="210" text-anchor="middle">norm</text>
 <text x="555" y="210" text-anchor="middle" fill="#fff">fc1 GEMM</text>
@@ -129,14 +129,14 @@ Wall-clock view of a single frame on the board. Total 94 s; 50 MHz clock.
 <text x="770" y="210" text-anchor="middle" fill="#fff">fc2 GEMM</text>
 </g>
 <g fill="currentColor" font-size="11">
-<text x="60" y="250">Blue = matrix multiply on the accelerator. Grey = element-wise work on the CPU: LayerNorm, the</text>
-<text x="60" y="266">attention softmax, GELU, and the requantisation that turns each GEMM's int32 output back into int16.</text>
-<text x="60" y="292">The accelerator has removed the multiplications from the critical path; what remains is CPU work</text>
-<text x="60" y="308">and the 25 MB of weights crossing DDR3 once per frame. Note the weight load itself is not part of a</text>
-<text x="60" y="324">frame — it happens once per session — so the model's own time is 94 s, of which ~60 s is the 12 blocks.</text>
+<text x="60" y="250">Blue = on the accelerator: every matrix multiply, and the requantisation that turns its int32 output back</text>
+<text x="60" y="266">into int16. Grey = element-wise work on the CPU: LayerNorm, the attention softmax and gathers, GELU, adds.</text>
+<text x="60" y="292">The model's own time is 14.2 s per frame (it was 93.6 s — see PERFORMANCE.md), of which 8.7 s is the</text>
+<text x="60" y="308">12 blocks and 5 s the DPT head. The weight load is not part of a frame: it happens once per session,</text>
+<text x="60" y="324">after which images go in over JTAG in 0.3 s and depth maps come out in 0.7 s.</text>
 </g>
 </svg>
-<figcaption>The JTAG weight load dominates the wall clock but is a one-time setup cost. Inside the model, every block alternates accelerator GEMMs with CPU element-wise work; the CPU work is now the larger share.</figcaption>
+<figcaption>The JTAG weight load dominates the wall clock but is a one-time setup cost. Inside the model, every block alternates accelerator jobs (GEMM, requantisation) with CPU element-wise work; after the speed-up the two are of similar size.</figcaption>
 </figure>
 
 Terms:
@@ -151,7 +151,8 @@ Terms:
   a full-resolution depth map.
 - **LayerNorm, GELU, softmax** — element-wise normalisation and activation
   functions. Cheap per element, but there are millions of elements and they
-  run on a scalar CPU with software floating point.
+  run on a scalar CPU that retires about one instruction per cycle; they are
+  in fixed point now, the per-row statistics excepted.
 
 ---
 
