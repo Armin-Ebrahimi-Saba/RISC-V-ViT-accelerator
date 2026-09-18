@@ -31,7 +31,7 @@ module student_gemm_ddrpath_tb;
   // Reads in flight. 1 is the board setting; the tb takes it as a plusarg so
   // a deeper pipeline can be tried against the cache without editing RTL:
   //   flow student_gemm_ddrpath_tb.sim_rtl_xsim  (plusarg +inflight=8)
-  localparam int unsigned MAX_INFLIGHT_P = `ifdef INFLIGHT `INFLIGHT `else 8 `endif;
+  localparam int unsigned MAX_INFLIGHT_P = `ifdef INFLIGHT `INFLIGHT `else 8 `endif;   // 8 matches student.sv
 
   localparam logic [31:0] A_BASE = 32'h8000_0000;
   localparam logic [31:0] W_BASE = 32'h8002_0000;

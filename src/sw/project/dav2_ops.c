@@ -208,6 +208,23 @@ void dav2_make_multiplier(float m, int32_t *mult, int *shift)
 
 static inline int32_t apply_multiplier(int32_t acc, int32_t mult, int shift)
 {
+    /* round(acc * mult / 2^shift). The multiplier is scaled into
+     * [2^30, 2^31) by dav2_make_multiplier, so for any real factor below
+     * 1/4 the shift is at least 33 -- the common case everywhere in this
+     * engine. Then the rounding constant 2^(shift-1) lies entirely in the
+     * high word of the 64-bit product, and
+     *
+     *   (acc*mult + 2^(s-1)) >> s  ==  (hi + 2^(s-33)) >> (s-32),
+     *   hi = (acc*mult) >> 32,
+     *
+     * exactly, because the low word only contributes a fraction below one to
+     * a value that is then floored. That is one mulh (5 cycles on the
+     * CV32E40P) and a 32-bit shift instead of a full 64-bit product and a
+     * 64-bit variable shift (~30 cycles in library code). Bit-identical. */
+    if (shift >= 33) {
+        int32_t hi = (int32_t)(((int64_t)acc * (int64_t)mult) >> 32);
+        return (hi + (1 << (shift - 33))) >> (shift - 32);
+    }
     int64_t p = (int64_t)acc * (int64_t)mult;
     if (shift > 0)
         p += ((int64_t)1 << (shift - 1));
@@ -382,7 +399,21 @@ void dav2_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, dav2_tensor_t *out)
                             (size_t)nb * 2);
             for (int n = 0; n < nb; n++) {
                 int16_t *orow = out->v + (size_t)(n0 + n) * M + m0;
-                for (int j = 0; j < mb; j++) {
+                int j = 0;
+                /* Two outputs per word store: every store is a bus
+                 * transaction on this core, so pairs halve them. M is a
+                 * multiple of 16 in this model, but odd tails are handled. */
+                if ((((uintptr_t)orow) & 3u) == 0) {
+                    for (; j + 1 < mb; j += 2) {
+                        int m = m0 + j;
+                        uint32_t lo = (uint16_t)sat_act(apply_multiplier(tile[(size_t)j * nb + n],
+                                                                        mult[m], shift[m]) + biasq[m]);
+                        uint32_t hi = (uint16_t)sat_act(apply_multiplier(tile[(size_t)(j + 1) * nb + n],
+                                                                        mult[m + 1], shift[m + 1]) + biasq[m + 1]);
+                        *(uint32_t *)(orow + j) = lo | (hi << 16);
+                    }
+                }
+                for (; j < mb; j++) {
                     int m = m0 + j;
                     orow[j] = sat_act(apply_multiplier(tile[(size_t)j * nb + n],
                                                        mult[m], shift[m]) + biasq[m]);
@@ -401,11 +432,37 @@ void dav2_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, dav2_tensor_t *out)
 
 /* -------------------------------------------------------------- LayerNorm */
 
+/* The elementwise operators below read and write two int16 per 32-bit word
+ * wherever the buffers allow it (they always do: the arena is 16-byte aligned
+ * and every tensor here has an even element count). On this core each load
+ * or store is a bus transaction of ~8 cycles, so halving them is the single
+ * biggest lever these loops have. Results are the same as the scalar code. */
+static inline int32_t lo16(uint32_t w) { return (int32_t)(int16_t)(w & 0xffffu); }
+static inline int32_t hi16(uint32_t w) { return (int32_t)(int16_t)(w >> 16); }
+static inline uint32_t pack16(int32_t lo, int32_t hi)
+{
+    return ((uint32_t)(uint16_t)lo) | ((uint32_t)(uint16_t)hi << 16);
+}
+static inline int words_ok(const void *p, const void *q, const void *r, int total)
+{
+    return ((((uintptr_t)p | (uintptr_t)q | (uintptr_t)r) & 3u) == 0) && (total & 1) == 0;
+}
+
+/* One LayerNorm output in Q16: (x - mean) / std * g + b, see dav2_layernorm. */
+static inline int32_t ln_y(int32_t x, int32_t mean16, int32_t am, int ash,
+                           int32_t gq, int32_t bq)
+{
+    int32_t d16 = (x << 16) - mean16;
+    int32_t z16 = apply_multiplier(d16, am, ash);        /* (x-mean)/std, Q16 */
+    int64_t pg  = (int64_t)z16 * (int64_t)gq;
+    return (int32_t)((pg + (1 << 14)) >> 15) + bq;
+}
+
+
 void dav2_layernorm(const dav2_tensor_t *in, const float *g, const float *b,
                     dav2_tensor_t *out)
 {
     const int N = in->n, C = in->c;
-    const size_t mark = dav2_arena_mark();
     PROF_START();
 
     /* The core has no FPU: every float operation is a library call of
@@ -417,25 +474,45 @@ void dav2_layernorm(const dav2_tensor_t *in, const float *g, const float *b,
      * with x - mean in Q16, s*inv_std as a (mult, shift) pair per row, g in
      * Q15 and b in Q16. y comes out in Q16 -- resolution 1.5e-5 against an
      * output step of ~1e-3 after quantisation to 14 bits -- and is then
-     * requantised to the tensor's common scale exactly as before. */
-    int32_t *y16 = (int32_t *)dav2_arena_alloc((size_t)N * C * sizeof(int32_t));
-    int32_t *gq  = (int32_t *)dav2_scratch;               /* g[c] in Q15 */
-    int32_t *bq  = gq + C;                                /* b[c] in Q16 */
+     * requantised to the tensor's common scale.
+     *
+     * Two passes over the input, both reading two int16 per word: the first
+     * finds the row statistics and the output range, the second recomputes y
+     * (cheap arithmetic) and writes the result in word pairs. Nothing
+     * intermediate goes to DDR3 -- an earlier version stored y as int32 and
+     * read it back, three more bus transactions per element. Everything per
+     * row or per channel lives in on-chip scratch. */
+    int32_t *gq   = (int32_t *)dav2_scratch;          /* g[c] in Q15          */
+    int32_t *bq   = gq + C;                           /* b[c] in Q16          */
+    int32_t *rm   = bq + C;                           /* per row: mean in Q16 */
+    int32_t *ram  = rm + N;                           /* per row: mult        */
+    int32_t *rsh  = ram + N;                          /* per row: shift       */
     for (int c = 0; c < C; c++) {
         gq[c] = iround(g[c] * 32768.0f);
         bq[c] = iround(b[c] * 65536.0f);
     }
 
     const float s = in->scale;
+    const int wide = (((uintptr_t)in->v | (uintptr_t)out->v) & 3u) == 0 && (C & 1) == 0;
     int32_t amax = 0;
     for (int n = 0; n < N; n++) {
         const int16_t *row = in->v + (size_t)n * C;
         int32_t sum = 0;
         int64_t sq = 0;
-        for (int c = 0; c < C; c++) {
-            int32_t d = (int32_t)row[c];
-            sum += d;
-            sq += (int64_t)d * (int64_t)d;
+        if (wide) {
+            const uint32_t *rw = (const uint32_t *)row;
+            for (int c = 0; c < C / 2; c++) {
+                uint32_t x = rw[c];
+                int32_t d0 = lo16(x), d1 = hi16(x);
+                sum += d0 + d1;
+                sq += (int64_t)d0 * d0 + (int64_t)d1 * d1;
+            }
+        } else {
+            for (int c = 0; c < C; c++) {
+                int32_t d = (int32_t)row[c];
+                sum += d;
+                sq += (int64_t)d * (int64_t)d;
+            }
         }
         /* mean/variance in the integer domain, then converted once per row.
          * sq <= 384 * 8191^2 = 2.6e10, so sq/C fits comfortably in int32 */
@@ -447,40 +524,65 @@ void dav2_layernorm(const dav2_tensor_t *in, const float *g, const float *b,
         /* variance in real units = var_q * s^2; eps matches PyTorch's 1e-6 */
         float inv_std = 1.0f / dav2_sqrtf(var_q * s * s + 1e-6f);
 
-        int32_t mean16 = iround(mean_q * 65536.0f);       /* |x| <= 8191: fits */
         int32_t am; int ash;
         dav2_make_multiplier(s * inv_std, &am, &ash);
+        rm[n]  = iround(mean_q * 65536.0f);              /* |x| <= 8191: fits */
+        ram[n] = am;
+        rsh[n] = ash;
 
-        int32_t *orow = y16 + (size_t)n * C;
-        for (int c = 0; c < C; c++) {
-            int32_t d16 = ((int32_t)row[c] << 16) - mean16;
-            int32_t z16 = apply_multiplier(d16, am, ash);   /* (x-mean)/std, Q16 */
-            int64_t pg  = (int64_t)z16 * (int64_t)gq[c];
-            int32_t y   = (int32_t)((pg + (1 << 14)) >> 15) + bq[c];
-            orow[c] = y;
-            int32_t a = y < 0 ? -y : y;
-            if (a > amax) amax = a;
+        /* the range, from the same y the second pass will produce */
+        if (wide) {
+            const uint32_t *rw = (const uint32_t *)row;
+            for (int c = 0; c < C / 2; c++) {
+                uint32_t x = rw[c];
+                int32_t y0 = ln_y(lo16(x), rm[n], am, ash, gq[2 * c],     bq[2 * c]);
+                int32_t y1 = ln_y(hi16(x), rm[n], am, ash, gq[2 * c + 1], bq[2 * c + 1]);
+                if (y0 < 0) y0 = -y0;
+                if (y1 < 0) y1 = -y1;
+                if (y0 > amax) amax = y0;
+                if (y1 > amax) amax = y1;
+            }
+        } else {
+            for (int c = 0; c < C; c++) {
+                int32_t y = ln_y(row[c], rm[n], am, ash, gq[c], bq[c]);
+                if (y < 0) y = -y;
+                if (y > amax) amax = y;
+            }
         }
     }
 
-    /* common output scale, then requantise -- same as dav2_quantize_f32 */
+    /* common output scale, then the second pass writes the result */
     float out_scale = (amax > 0) ? (float)amax * (1.0f / 65536.0f)
                                   * (1.0f / (float)DAV2_ACT_QMAX) : 1.0f;
     int32_t om; int osh;
     dav2_make_multiplier((1.0f / 65536.0f) / out_scale, &om, &osh);
-    const int total = N * C;
-    for (int i = 0; i < total; i++)
-        out->v[i] = sat_act(apply_multiplier(y16[i], om, osh));
+    for (int n = 0; n < N; n++) {
+        const int16_t *row = in->v + (size_t)n * C;
+        int16_t *orow = out->v + (size_t)n * C;
+        if (wide) {
+            const uint32_t *rw = (const uint32_t *)row;
+            uint32_t *ow = (uint32_t *)orow;
+            for (int c = 0; c < C / 2; c++) {
+                uint32_t x = rw[c];
+                int32_t y0 = ln_y(lo16(x), rm[n], ram[n], rsh[n], gq[2 * c],     bq[2 * c]);
+                int32_t y1 = ln_y(hi16(x), rm[n], ram[n], rsh[n], gq[2 * c + 1], bq[2 * c + 1]);
+                ow[c] = pack16(sat_act(apply_multiplier(y0, om, osh)),
+                               sat_act(apply_multiplier(y1, om, osh)));
+            }
+        } else {
+            for (int c = 0; c < C; c++) {
+                int32_t y = ln_y(row[c], rm[n], ram[n], rsh[n], gq[c], bq[c]);
+                orow[c] = sat_act(apply_multiplier(y, om, osh));
+            }
+        }
+    }
     out->scale = out_scale;
     out->n = N;
     out->c = C;
 
     PROF_STOP(DAV2_PROF_LAYERNORM);
     trace_tensor("layernorm", out);
-    dav2_arena_release(mark);
 }
-
-/* ----------------------------------------------------------- elementwise */
 
 void dav2_add(const dav2_tensor_t *a, const dav2_tensor_t *b, dav2_tensor_t *out)
 {
@@ -488,11 +590,28 @@ void dav2_add(const dav2_tensor_t *a, const dav2_tensor_t *b, dav2_tensor_t *out
     PROF_START();
     /* Upper bound on the sum's magnitude; at most one bit of range is lost. */
     int32_t amax_a = 0, amax_b = 0;
-    for (int i = 0; i < total; i++) {
-        int32_t va = a->v[i] < 0 ? -a->v[i] : a->v[i];
-        int32_t vb = b->v[i] < 0 ? -b->v[i] : b->v[i];
-        if (va > amax_a) amax_a = va;
-        if (vb > amax_b) amax_b = vb;
+    const int wide = words_ok(a->v, b->v, out->v, total);
+    if (wide) {
+        const uint32_t *aw = (const uint32_t *)a->v, *bw = (const uint32_t *)b->v;
+        for (int i = 0; i < total / 2; i++) {
+            uint32_t x = aw[i], y = bw[i];
+            int32_t v0 = lo16(x), v1 = hi16(x), u0 = lo16(y), u1 = hi16(y);
+            if (v0 < 0) v0 = -v0;
+            if (v1 < 0) v1 = -v1;
+            if (u0 < 0) u0 = -u0;
+            if (u1 < 0) u1 = -u1;
+            if (v0 > amax_a) amax_a = v0;
+            if (v1 > amax_a) amax_a = v1;
+            if (u0 > amax_b) amax_b = u0;
+            if (u1 > amax_b) amax_b = u1;
+        }
+    } else {
+        for (int i = 0; i < total; i++) {
+            int32_t va = a->v[i] < 0 ? -a->v[i] : a->v[i];
+            int32_t vb = b->v[i] < 0 ? -b->v[i] : b->v[i];
+            if (va > amax_a) amax_a = va;
+            if (vb > amax_b) amax_b = vb;
+        }
     }
     float bound = (float)amax_a * a->scale + (float)amax_b * b->scale;
     float out_scale = (bound > 0.0f) ? bound * (1.0f / (float)DAV2_ACT_QMAX) : 1.0f;
@@ -502,10 +621,21 @@ void dav2_add(const dav2_tensor_t *a, const dav2_tensor_t *b, dav2_tensor_t *out
     dav2_make_multiplier(a->scale * inv, &ma, &sa);
     dav2_make_multiplier(b->scale * inv, &mb, &sb);
 
-    for (int i = 0; i < total; i++) {
-        int32_t v = apply_multiplier(a->v[i], ma, sa)
-                  + apply_multiplier(b->v[i], mb, sb);
-        out->v[i] = sat_act(v);
+    if (wide) {
+        const uint32_t *aw = (const uint32_t *)a->v, *bw = (const uint32_t *)b->v;
+        uint32_t *ow = (uint32_t *)out->v;
+        for (int i = 0; i < total / 2; i++) {
+            uint32_t x = aw[i], y = bw[i];
+            int32_t r0 = sat_act(apply_multiplier(lo16(x), ma, sa) + apply_multiplier(lo16(y), mb, sb));
+            int32_t r1 = sat_act(apply_multiplier(hi16(x), ma, sa) + apply_multiplier(hi16(y), mb, sb));
+            ow[i] = pack16(r0, r1);
+        }
+    } else {
+        for (int i = 0; i < total; i++) {
+            int32_t v = apply_multiplier(a->v[i], ma, sa)
+                      + apply_multiplier(b->v[i], mb, sb);
+            out->v[i] = sat_act(v);
+        }
     }
     out->n = a->n;
     out->c = a->c;
@@ -518,8 +648,18 @@ void dav2_relu(dav2_tensor_t *t)
 {
     const int total = t->n * t->c;
     PROF_START();
-    for (int i = 0; i < total; i++)
-        if (t->v[i] < 0) t->v[i] = 0;
+    if (words_ok(t->v, t->v, t->v, total)) {
+        uint32_t *w = (uint32_t *)t->v;
+        for (int i = 0; i < total / 2; i++) {
+            uint32_t x = w[i];
+            /* clear each half whose sign bit is set; skip the store if nothing changed */
+            uint32_t neg = ((x >> 15) & 1u) * 0xffffu | ((x >> 31) & 1u) * 0xffff0000u;
+            if (neg) w[i] = x & ~neg;
+        }
+    } else {
+        for (int i = 0; i < total; i++)
+            if (t->v[i] < 0) t->v[i] = 0;
+    }
     PROF_STOP(DAV2_PROF_ADD_RELU);
 }
 
@@ -547,13 +687,22 @@ void dav2_gelu(dav2_tensor_t *t)
         lut[i] = sat_act(iround(lut_f[i] * inv));
 
     const int total = t->n * t->c;
-    for (int i = 0; i < total; i++) {
-        int32_t u = (int32_t)t->v[i] + 8192;     /* [1, 16383] */
-        int32_t idx = u >> 6;                    /* [0, 255]   */
-        int32_t frac = u & 63;
-        int32_t lo = lut[idx], hi = lut[idx + 1];
-        t->v[i] = (int16_t)(lo + (((hi - lo) * frac) >> 6));
+#define GELU_LUT(x) ({ int32_t u_ = (int32_t)(x) + 8192;   /* [1, 16383] */ \
+                       int32_t i_ = u_ >> 6;              /* [0, 255]   */ \
+                       int32_t f_ = u_ & 63;                               \
+                       int32_t l_ = lut[i_], h_ = lut[i_ + 1];             \
+                       l_ + (((h_ - l_) * f_) >> 6); })
+    if (words_ok(t->v, t->v, t->v, total)) {
+        uint32_t *w = (uint32_t *)t->v;
+        for (int i = 0; i < total / 2; i++) {
+            uint32_t x = w[i];
+            w[i] = pack16(GELU_LUT(lo16(x)), GELU_LUT(hi16(x)));
+        }
+    } else {
+        for (int i = 0; i < total; i++)
+            t->v[i] = (int16_t)GELU_LUT(t->v[i]);
     }
+#undef GELU_LUT
     t->scale = out_scale;
     PROF_STOP(DAV2_PROF_GELU);
     trace_tensor("gelu", t);
@@ -663,9 +812,15 @@ dav2_tensor_t dav2_conv2d(const dav2_tensor_t *in, int h, int w,
 
     dav2_tensor_t out = dav2_tensor_new(oh * ow, wt->m);
     const size_t mark = dav2_arena_mark();
-    dav2_tensor_t cols = dav2_tensor_new(oh * ow, k * k * in->c);
-    dav2_im2col(in, h, w, k, k, stride, pad, &cols);
-    dav2_qgemm(&cols, wt, &out);
+    if (k == 1 && stride == 1 && pad == 0) {
+        /* A 1x1 convolution is a GEMM over the pixels as they are; im2col
+         * would only copy the tensor. */
+        dav2_qgemm(in, wt, &out);
+    } else {
+        dav2_tensor_t cols = dav2_tensor_new(oh * ow, k * k * in->c);
+        dav2_im2col(in, h, w, k, k, stride, pad, &cols);
+        dav2_qgemm(&cols, wt, &out);
+    }
     dav2_arena_release(mark);
 
     if (oh_out) *oh_out = oh;

@@ -117,18 +117,17 @@ module student (
     .tl_host_i (host_d2h[0])
   );
 
-  // MAX_INFLIGHT(1): the rvlab DDR3 cache pulses its response for a single
-  // cycle regardless of d_ready, so a master with more than one request in
-  // flight can miss one. One at a time is the safe setting against that
-  // memory. See the parameter comment in student_gemm.sv.
-  // NROWS(64): 64 activation rows per tile, 64 multipliers. The weight
-  // matrix is streamed from DDR3 once per tile, so with 82 tokens this is
-  // two passes instead of six; on the 15876-row convolutions of the DPT
-  // head, 249 instead of 993. Costs 64 block RAMs and 64 DSPs of the
-  // chip's 365 and 740.
+  // MAX_INFLIGHT(8): eight reads in flight. The rvlab DDR3 cache pulses its
+  // response for a single cycle regardless of d_ready, so a master with more
+  // than one request outstanding can lose one; this used to force 1, at
+  // 8.3 cycles per beat of pure latency. The block now remembers every
+  // outstanding read's address in its reorder slot and re-issues the head
+  // request when it stays unanswered, so a lost response costs RETRY_CYCLES
+  // rather than the result. The retry counter (dbg4[31:16]) says how often
+  // that happens on the board.
   student_gemm #(
     .NROWS       (64),
-    .MAX_INFLIGHT(1)
+    .MAX_INFLIGHT(8)
   ) gemm_i (
     .clk_i,
     .rst_ni,

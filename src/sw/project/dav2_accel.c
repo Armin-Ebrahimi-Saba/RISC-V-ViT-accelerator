@@ -81,6 +81,8 @@ static unsigned accel_kmax;
 /* Cumulative hardware cycles, for the boot log. */
 static unsigned long accel_cycles;
 static unsigned long accel_jobs;
+static unsigned long accel_beats;     /* words read + written by the block  */
+static unsigned long accel_retries;   /* lost responses re-issued (dbg4 hi) */
 
 int dav2_accel_init(void)
 {
@@ -111,6 +113,14 @@ void dav2_accel_report(void)
         return;
     }
     printf("GEMM accelerator: %u rows/pass, K<=%u\n", accel_nrows, accel_kmax);
+    if (accel_jobs)
+        printf("  %lu jobs, %lu kcycles, %lu kbeats (%lu.%lu cycles/beat), "
+               "%lu lost-response retries\n",
+               accel_jobs, accel_cycles / 1000u, accel_beats / 1000u,
+               accel_cycles / (accel_beats ? accel_beats : 1),
+               (accel_cycles * 10u / (accel_beats ? accel_beats : 1)) % 10u,
+               accel_retries);
+    accel_jobs = 0; accel_cycles = 0; accel_beats = 0; accel_retries = 0;
 }
 
 /* One accelerator pass over all N rows: acc[m][n] = sum_k A[n][k] W[m][k]
@@ -216,6 +226,9 @@ static int accel_run(const int16_t *av, uint32_t a_stride,
             uint32_t jc = REG32(GEMM_CYCLES);
             accel_cycles += jc;
             accel_jobs++;
+            accel_beats += (unsigned long)M * (K / 4) + (unsigned long)nt * (K / 2)
+                         + (unsigned long)nt * M;
+            accel_retries += REG32(GEMM_DBG4) >> 16;
             /* First few jobs only: enough to measure cycles-per-beat on real
              * DDR3 without flooding the hostio link. */
             /* Print the first few tiles of each large job. dbg4 packs the

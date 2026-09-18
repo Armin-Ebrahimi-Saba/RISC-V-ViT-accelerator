@@ -95,6 +95,92 @@ void dav2_progress(const char *stage)
     printf("  [%s] t=%u kcycles\n", stage, (unsigned)(cycles64() / 1000u));
 }
 
+
+/* ------------------------------------------------------------ microbench */
+
+/* How many cycles does this core really spend on one instruction, one BRAM
+ * load, one DDR3 load? The optimisation work kept assuming numbers for these
+ * and kept being wrong about which one dominated, so they are measured once
+ * at boot and printed. Loops are written so the compiler cannot remove them
+ * (results feed a volatile sink). DAV2_BENCH 0 turns this off. */
+#define DAV2_BENCH 1
+#if DAV2_BENCH
+static volatile uint32_t bench_sink;
+__attribute__((noinline)) static void dav2_bench(void)
+{
+    enum { N = 65536 };
+    uint32_t t0, t1, x = 1, s = 0;
+    const uint32_t *bram = (const uint32_t *)dav2_scratch;          /* 40 kB */
+    volatile uint32_t *ddr = (volatile uint32_t *)ARENA_ADDR;
+
+    printf("microbench (cycles per iteration, %d iterations each):\n", N);
+
+    /* ALU only: add + shift + xor + loop */
+    t0 = (uint32_t)cycles64();
+    for (uint32_t i = 0; i < N; i++) { x = (x << 1) ^ (x + i); }
+    t1 = (uint32_t)cycles64(); bench_sink = x;
+    printf("  alu (3 ops + loop)    %u.%u\n", (t1 - t0) / N, ((t1 - t0) * 10u / N) % 10u);
+
+    /* Straight-line code: 32 dependent ALU ops per iteration. If this runs
+     * at ~1 cycle per op the loop above is paying a taken-branch penalty;
+     * if it also takes ~2 per op the instruction fetch cannot keep up. */
+    {
+        uint32_t i0, i1;
+        __asm__ volatile ("csrr %0, minstret" : "=r"(i0));
+        t0 = (uint32_t)cycles64();
+        for (uint32_t i = 0; i < N / 8; i++) {
+#define A4 x = (x << 1) ^ i; x = x + 7u; x = x ^ (x >> 3); x = x + i;
+            A4 A4 A4 A4 A4 A4 A4 A4
+#undef A4
+        }
+        t1 = (uint32_t)cycles64();
+        __asm__ volatile ("csrr %0, minstret" : "=r"(i1));
+        bench_sink = x;
+        printf("  32 alu ops unrolled   %u.%u cycles, %u instructions retired per iteration\n",
+               (t1 - t0) / (N / 8), ((t1 - t0) * 10u / (N / 8)) % 10u, (i1 - i0) / (N / 8));
+    }
+
+    /* 32x32->64 high multiply */
+    t0 = (uint32_t)cycles64();
+    for (uint32_t i = 0; i < N; i++) { x += (uint32_t)(((int64_t)(int32_t)x * (int32_t)(i | 1)) >> 32); }
+    t1 = (uint32_t)cycles64(); bench_sink = x;
+    printf("  mulh + add + loop     %u.%u\n", (t1 - t0) / N, ((t1 - t0) * 10u / N) % 10u);
+
+    /* BRAM word loads, sequential over 40 kB (wraps) */
+    t0 = (uint32_t)cycles64();
+    for (uint32_t i = 0; i < N; i++) { s += bram[i & 8191u]; }
+    t1 = (uint32_t)cycles64(); bench_sink = s;
+    printf("  lw from BRAM          %u.%u\n", (t1 - t0) / N, ((t1 - t0) * 10u / N) % 10u);
+
+    /* DDR3 word loads, sequential (cache-line hits 7 of 8) */
+    t0 = (uint32_t)cycles64();
+    for (uint32_t i = 0; i < N; i++) { s += ddr[i]; }
+    t1 = (uint32_t)cycles64(); bench_sink = s;
+    printf("  lw from DDR3, seq     %u.%u\n", (t1 - t0) / N, ((t1 - t0) * 10u / N) % 10u);
+
+    /* DDR3 word loads, one per 32-byte line (every access a miss) */
+    t0 = (uint32_t)cycles64();
+    for (uint32_t i = 0; i < N; i++) { s += ddr[i * 8u]; }
+    t1 = (uint32_t)cycles64(); bench_sink = s;
+    printf("  lw from DDR3, stride  %u.%u\n", (t1 - t0) / N, ((t1 - t0) * 10u / N) % 10u);
+
+    /* DDR3 word stores, sequential */
+    t0 = (uint32_t)cycles64();
+    for (uint32_t i = 0; i < N; i++) { ddr[i] = i; }
+    t1 = (uint32_t)cycles64();
+    printf("  sw to DDR3, seq       %u.%u\n", (t1 - t0) / N, ((t1 - t0) * 10u / N) % 10u);
+
+    /* BRAM half-word loads + stores, the elementwise pattern */
+    {
+        volatile int16_t *h = (volatile int16_t *)dav2_scratch;
+        t0 = (uint32_t)cycles64();
+        for (uint32_t i = 0; i < N; i++) { h[i & 16383u] = (int16_t)(h[(i + 1) & 16383u] + 1); }
+        t1 = (uint32_t)cycles64();
+        printf("  lh + sh on BRAM       %u.%u\n", (t1 - t0) / N, ((t1 - t0) * 10u / N) % 10u);
+    }
+}
+#endif
+
 /* Print the depth map as coarse ASCII art so the result is visible over the
  * hostio link without transferring the whole image. */
 static void print_ascii_depth(const float *depth, int size, int cols)
@@ -146,6 +232,9 @@ int main(void)
         printf("FATAL: DDR3 init failed; weights cannot be stored.\n");
         return 1;
     }
+#if DAV2_BENCH
+    dav2_bench();
+#endif
 
     /* Quick DDR3 sanity check before trusting 25 MB of it. */
     volatile uint32_t *probe = (volatile uint32_t *)(ARENA_ADDR);
@@ -371,6 +460,7 @@ int main(void)
                    (unsigned)((10000000ull / (ms ? ms : 1)) % 10000u));
         }
         printf("arena peak %u KB\n", (unsigned)(dav2_arena_peak() / 1024u));
+        dav2_accel_report();        /* jobs, cycles/beat and retries this frame */
 
         print_ascii_depth(depth, out_size, 63);
 
