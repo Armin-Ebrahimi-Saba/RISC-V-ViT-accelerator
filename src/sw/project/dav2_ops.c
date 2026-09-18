@@ -208,27 +208,32 @@ void dav2_make_multiplier(float m, int32_t *mult, int *shift)
 
 static inline int32_t apply_multiplier(int32_t acc, int32_t mult, int shift)
 {
-    /* round(acc * mult / 2^shift). The multiplier is scaled into
-     * [2^30, 2^31) by dav2_make_multiplier, so for any real factor below
-     * 1/4 the shift is at least 33 -- the common case everywhere in this
-     * engine. Then the rounding constant 2^(shift-1) lies entirely in the
-     * high word of the 64-bit product, and
+    /* round(acc * mult / 2^shift), exactly, without a 64-bit shift.
      *
-     *   (acc*mult + 2^(s-1)) >> s  ==  (hi + 2^(s-33)) >> (s-32),
-     *   hi = (acc*mult) >> 32,
+     * The multiplier is scaled into [2^30, 2^31) by dav2_make_multiplier,
+     * so the shift is 31..62 for factors below 1 and smaller for larger
+     * factors. Two straight-line cases cover everything this engine does;
+     * on the CV32E40P a taken branch costs ~4 cycles, as much as the
+     * multiply itself, so both are written without one.
      *
-     * exactly, because the low word only contributes a fraction below one to
-     * a value that is then floored. That is one mulh (5 cycles on the
-     * CV32E40P) and a 32-bit shift instead of a full 64-bit product and a
-     * 64-bit variable shift (~30 cycles in library code). Bit-identical. */
-    if (shift >= 33) {
-        int32_t hi = (int32_t)(((int64_t)acc * (int64_t)mult) >> 32);
+     * shift >= 33: the rounding constant 2^(shift-1) lies entirely in the
+     * high word of the product, and the low word only adds a fraction below
+     * one to a value that is then floored:
+     *     (acc*mult + 2^(s-1)) >> s  ==  (hi + 2^(s-33)) >> (s-32).
+     *
+     * 1 <= shift <= 32 (the residual adds, factors near 1): add the rounding
+     * constant to the low word, carry into the high word, and assemble the
+     * shifted result from both halves. ">> (s-1) >> 1" is ">> s" that is
+     * also defined for s == 32. */
+    int32_t  hi = (int32_t)(((int64_t)acc * (int64_t)mult) >> 32);   /* mulh */
+    if (shift >= 33)
         return (hi + (1 << (shift - 33))) >> (shift - 32);
-    }
-    int64_t p = (int64_t)acc * (int64_t)mult;
-    if (shift > 0)
-        p += ((int64_t)1 << (shift - 1));
-    return (int32_t)(p >> shift);
+    uint32_t lo  = (uint32_t)acc * (uint32_t)mult;                   /* mul  */
+    if (shift == 0)                       /* factor >= 1 with no fraction bits */
+        return (int32_t)lo;
+    uint32_t lo2 = lo + (1u << (shift - 1));
+    hi += (lo2 < lo);
+    return (int32_t)(((uint32_t)hi << (32 - shift)) | ((lo2 >> (shift - 1)) >> 1));
 }
 
 static inline int16_t sat_act(int32_t v)
@@ -328,10 +333,10 @@ void dav2_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, dav2_tensor_t *out)
 
     const size_t mark = dav2_arena_mark();
     int32_t *acc    = (int32_t *)dav2_arena_alloc((size_t)N * M * sizeof(int32_t));
-    int32_t *mult   = (int32_t *)dav2_arena_alloc((size_t)M * sizeof(int32_t));
-    int32_t *biasq  = (int32_t *)dav2_arena_alloc((size_t)M * sizeof(int32_t));
-    int     *shift  = (int     *)dav2_arena_alloc((size_t)M * sizeof(int));
-    if (!acc || !mult || !biasq || !shift) {
+    /* per-row requantisation parameters, {mult, shift, bias} interleaved:
+     * the layout the accelerator's requantisation job reads */
+    int32_t *par    = (int32_t *)dav2_arena_alloc((size_t)M * 3 * sizeof(int32_t));
+    if (!acc || !par) {
         /* dav2_arena_failed is set; unwinding here beats faulting on NULL,
          * which on the target just hangs the core. */
         dav2_arena_release(mark);
@@ -342,23 +347,35 @@ void dav2_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, dav2_tensor_t *out)
     }
 
     PROF_START();
-    if (dav2_accel_qgemm(a, wt, acc)) {
+    dav2_accel_stats_t st;
+    if (dav2_accel_qgemm(a, wt, acc, &st)) {
         PROF_LAP(DAV2_PROF_GEMM_ACCEL);
     } else {
         dav2_qgemm_cpu(a->v, wt->w, acc, N, K, M);
         PROF_LAP(DAV2_PROF_GEMM_CPU);
     }
 
-    /* Exact output range, including bias, so nothing clips. The min/max scan
-     * is O(N*M) against the O(N*M*K) product, so it stays in software even
-     * when the accelerator ran. */
+    /* Exact output range, including bias, so nothing clips. The per-row
+     * extremes come from the accelerator's drain when it produced them (two
+     * words per row per tile); otherwise from a scan of acc. */
     float amax = 0.0f;
     for (int m = 0; m < M; m++) {
-        const int32_t *ar = acc + (size_t)m * N;
-        int32_t cmax = ar[0], cmin = ar[0];
-        for (int n = 1; n < N; n++) {
-            if (ar[n] > cmax) cmax = ar[n];
-            if (ar[n] < cmin) cmin = ar[n];
+        int32_t cmax, cmin;
+        if (st.tiles) {
+            const int32_t *sv = st.v + (size_t)m * 2;
+            cmax = sv[0]; cmin = sv[1];
+            for (int t = 1; t < st.tiles; t++) {
+                const int32_t *tv = sv + (size_t)t * M * 2;
+                if (tv[0] > cmax) cmax = tv[0];
+                if (tv[1] < cmin) cmin = tv[1];
+            }
+        } else {
+            const int32_t *ar = acc + (size_t)m * N;
+            cmax = ar[0]; cmin = ar[0];
+            for (int n = 1; n < N; n++) {
+                if (ar[n] > cmax) cmax = ar[n];
+                if (ar[n] < cmin) cmin = ar[n];
+            }
         }
         float k_c = a->scale * wt->s[m];
         float bias = wt->b ? wt->b[m] : 0.0f;
@@ -372,8 +389,20 @@ void dav2_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, dav2_tensor_t *out)
     float inv_out = 1.0f / out_scale;
 
     for (int m = 0; m < M; m++) {
-        dav2_make_multiplier(a->scale * wt->s[m] * inv_out, &mult[m], &shift[m]);
-        biasq[m] = wt->b ? iround(wt->b[m] * inv_out) : 0;
+        int sh;
+        dav2_make_multiplier(a->scale * wt->s[m] * inv_out, &par[3 * m], &sh);
+        par[3 * m + 1] = sh;
+        par[3 * m + 2] = wt->b ? iround(wt->b[m] * inv_out) : 0;
+    }
+
+    if ((M & 1) == 0 && dav2_accel_requant(acc, N, M, par, out->v)) {
+        PROF_STOP(DAV2_PROF_REQUANT);
+        out->n = N;
+        out->c = M;
+        out->scale = out_scale;
+        trace_tensor("qgemm", out);
+        dav2_arena_release(mark);
+        return;
     }
 
     /* acc is [m][n]; out is [n][m]. Either loop order strides one side by
@@ -407,16 +436,16 @@ void dav2_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, dav2_tensor_t *out)
                     for (; j + 1 < mb; j += 2) {
                         int m = m0 + j;
                         uint32_t lo = (uint16_t)sat_act(apply_multiplier(tile[(size_t)j * nb + n],
-                                                                        mult[m], shift[m]) + biasq[m]);
+                                                                        par[3 * m], par[3 * m + 1]) + par[3 * m + 2]);
                         uint32_t hi = (uint16_t)sat_act(apply_multiplier(tile[(size_t)(j + 1) * nb + n],
-                                                                        mult[m + 1], shift[m + 1]) + biasq[m + 1]);
+                                                                        par[3 * m + 3], par[3 * m + 4]) + par[3 * m + 5]);
                         *(uint32_t *)(orow + j) = lo | (hi << 16);
                     }
                 }
                 for (; j < mb; j++) {
                     int m = m0 + j;
                     orow[j] = sat_act(apply_multiplier(tile[(size_t)j * nb + n],
-                                                       mult[m], shift[m]) + biasq[m]);
+                                                       par[3 * m], par[3 * m + 1]) + par[3 * m + 2]);
                 }
             }
         }

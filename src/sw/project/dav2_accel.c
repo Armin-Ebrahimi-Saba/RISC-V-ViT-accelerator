@@ -54,6 +54,10 @@
 #define GEMM_DBG4     STUDENT_GEMM_DBG4(0)
 #define GEMM_A_STRIDE STUDENT_GEMM_A_STRIDE(0)
 #define GEMM_W_STRIDE STUDENT_GEMM_W_STRIDE(0)
+#define GEMM_S_ADDR   STUDENT_GEMM_S_ADDR(0)
+#define GEMM_P_ADDR   STUDENT_GEMM_P_ADDR(0)
+#define CTRL_START    0x1u
+#define CTRL_REQUANT  0x2u
 
 #define STATUS_BUSY 0x1u
 #define STATUS_DONE 0x2u
@@ -129,10 +133,11 @@ void dav2_accel_report(void)
  * the block's contract. Returns 0 if the block failed and disabled itself. */
 static int accel_run(const int16_t *av, uint32_t a_stride,
                      const int8_t *w, uint32_t w_stride,
-                     int32_t *acc, int N, int K, int M)
+                     int32_t *acc, int N, int K, int M, int32_t *stats)
 {
     const int nrows = (int)accel_nrows;
     const size_t a_row = a_stride ? a_stride / 2 : (size_t)K;   /* int16 elements */
+    int tile = 0;
 
     REG32(GEMM_W_ADDR)   = (uint32_t)(uintptr_t)w;
     REG32(GEMM_A_STRIDE) = a_stride;
@@ -149,7 +154,10 @@ static int accel_run(const int16_t *av, uint32_t a_stride,
         REG32(GEMM_A_ADDR) = (uint32_t)(uintptr_t)(av + (size_t)n0 * a_row);
         REG32(GEMM_C_ADDR) = (uint32_t)(uintptr_t)(acc + n0);
         REG32(GEMM_N_ROWS) = (uint32_t)nt;
-        REG32(GEMM_CTRL)   = 1u;
+        /* per-row {max, min} of this tile, 2 words per weight row */
+        REG32(GEMM_S_ADDR) = stats ? (uint32_t)(uintptr_t)(stats + (size_t)tile * M * 2) : 0u;
+        REG32(GEMM_CTRL)   = CTRL_START;
+        tile++;
 
         /* Bounded wait. The block has only ever been exercised against BRAM
          * (dav2_accel_check runs from .bss); the model's tensors live in the
@@ -257,7 +265,8 @@ static int accel_run(const int16_t *av, uint32_t a_stride,
                 uint32_t issued = d2 >> 16, acked = d2 & 0xffffu;
                 /* The hardware counters are 16 bits wide and a 64-row tile
                  * with M = 1536 owes 98304 writes, so compare modulo 2^16. */
-                uint32_t owed = ((uint32_t)nt * (uint32_t)M) & 0xffffu;
+                uint32_t owed = ((uint32_t)nt * (uint32_t)M
+                                 + (stats ? 2u * (uint32_t)M : 0u)) & 0xffffu;
                 /* (This used to print the last tile of every job as well,
                  * as a check that the counters were wired. They are; the
                  * console link is slow enough that the lines cost more than
@@ -275,6 +284,67 @@ static int accel_run(const int16_t *av, uint32_t a_stride,
     return 1;
 }
 
+/* Wait for the current job. Returns 0 on timeout or bus error (and disables
+ * the block), 1 when done. The GEMM path has its own, more talkative wait. */
+static int accel_wait_simple(const char *what)
+{
+    uint32_t t0 = accel_mcycle();
+    while (REG32(GEMM_STATUS) & STATUS_BUSY) {
+        if ((accel_mcycle() - t0) > ACCEL_TIMEOUT_CYCLES) {
+            printf("GEMM accelerator: TIMEOUT in %s, status=0x%08lx dbg=%08lx; disabled\n",
+                   what, (unsigned long)REG32(GEMM_STATUS), (unsigned long)REG32(GEMM_DBG));
+            accel_ok = 0;
+            return 0;
+        }
+    }
+    if (REG32(GEMM_STATUS) & STATUS_ERR) {
+        printf("GEMM accelerator: bus error in %s; disabled\n", what);
+        accel_ok = 0;
+        return 0;
+    }
+    return 1;
+}
+
+int dav2_accel_requant(const int32_t *acc, int N, int M, const int32_t *params,
+                       int16_t *out)
+{
+    if (!dav2_accel_init())
+        return 0;
+    /* Contract: M even (pairs of int16 per word), everything word aligned,
+     * a chunk at most CAPS.NROWS columns by KMAX/2 rows. */
+    if (N < 1 || M < 2 || (M & 1))
+        return 0;
+    if ((((uintptr_t)acc) | ((uintptr_t)params) | ((uintptr_t)out)) & 3u)
+        return 0;
+    const int nc_max = (int)accel_nrows;
+    const int mc_max = (int)(accel_kmax / 2u) & ~1;
+
+    REG32(GEMM_A_STRIDE) = (uint32_t)N * 4u;
+    REG32(GEMM_C_STRIDE) = (uint32_t)M * 2u;
+    REG32(GEMM_S_ADDR)   = 0u;
+    for (int n0 = 0; n0 < N; n0 += nc_max) {
+        int nc = N - n0;
+        if (nc > nc_max) nc = nc_max;
+        for (int m0 = 0; m0 < M; m0 += mc_max) {
+            int mc = M - m0;
+            if (mc > mc_max) mc = mc_max;
+            REG32(GEMM_A_ADDR) = (uint32_t)(uintptr_t)(acc + (size_t)m0 * N + n0);
+            REG32(GEMM_P_ADDR) = (uint32_t)(uintptr_t)(params + (size_t)m0 * 3);
+            REG32(GEMM_C_ADDR) = (uint32_t)(uintptr_t)(out + (size_t)n0 * M + m0);
+            REG32(GEMM_M_LEN)  = (uint32_t)mc;
+            REG32(GEMM_N_ROWS) = (uint32_t)nc;
+            REG32(GEMM_CTRL)   = CTRL_START | CTRL_REQUANT;
+            if (!accel_wait_simple("requant"))
+                return 0;
+            accel_cycles += REG32(GEMM_CYCLES);
+            accel_jobs++;
+            accel_beats += (unsigned long)mc * 3u + (unsigned long)mc * nc
+                         + (unsigned long)mc * nc / 2u;
+        }
+    }
+    return 1;
+}
+
 int dav2_accel_gemm_raw(const int16_t *a, uint32_t a_stride,
                         const int8_t *w, uint32_t w_stride,
                         int32_t *acc, int N, int K, int M)
@@ -285,11 +355,13 @@ int dav2_accel_gemm_raw(const int16_t *a, uint32_t a_stride,
         return 0;
     if ((((uintptr_t)a) | ((uintptr_t)w) | ((uintptr_t)acc) | a_stride | w_stride) & 3u)
         return 0;
-    return accel_run(a, a_stride, w, w_stride, acc, N, K, M);
+    return accel_run(a, a_stride, w, w_stride, acc, N, K, M, 0);
 }
 
-int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc)
+int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc,
+                     dav2_accel_stats_t *st)
 {
+    if (st) { st->v = 0; st->tiles = 0; }
     if (!dav2_accel_init())
         return 0;
 
@@ -304,8 +376,15 @@ int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc)
     if ((((uintptr_t)a->v) | ((uintptr_t)wt->w) | ((uintptr_t)acc)) & 3u)
         return 0;
 
-    if ((unsigned)K <= accel_kmax)
-        return accel_run(a->v, 0, wt->w, 0, acc, N, K, M);
+    if ((unsigned)K <= accel_kmax) {
+        int32_t *stats = 0;
+        int tiles = (N + (int)accel_nrows - 1) / (int)accel_nrows;
+        if (st) {
+            stats = (int32_t *)dav2_arena_alloc((size_t)tiles * M * 2 * sizeof(int32_t));
+            if (stats) { st->v = stats; st->tiles = tiles; }
+        }
+        return accel_run(a->v, 0, wt->w, 0, acc, N, K, M, stats);
+    }
 
     /* K longer than the A-tile RAM: the 3x3 convolutions on the 384-channel
      * level have K = 9*384 = 3456 against KMAX = 2048. The row strides let a
@@ -325,9 +404,11 @@ int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc)
         int kc = K - k0;
         if (kc > kc_max) kc = kc_max;
         int32_t *dst = k0 ? part : acc;
+        /* no statistics here: the extremes of partial sums say nothing
+         * about the extremes of the total, so the caller scans acc */
         ok = accel_run(a->v + k0, (uint32_t)K * 2u,
                        wt->w + k0, (uint32_t)K,
-                       dst, N, kc, M);
+                       dst, N, kc, M, 0);
         if (ok && k0) {
             const size_t total = (size_t)N * M;
             for (size_t i = 0; i < total; i++)
@@ -400,7 +481,7 @@ int dav2_accel_bigcheck(int N, int K, int M)
     dav2_qw_t     wt = { w, 0, 0, M, K };
 
     dav2_qgemm_cpu(a, w, sw, N, K, M);
-    if (!dav2_accel_qgemm(&at, &wt, hw)) {
+    if (!dav2_accel_qgemm(&at, &wt, hw, 0)) {
         printf("GEMM bigcheck: accelerator declined\n");
         dav2_arena_release(mark);
         return -1;
@@ -460,7 +541,7 @@ int dav2_accel_check(void)
 
     dav2_qgemm_cpu(chk_a, chk_w, chk_sw, CHK_N, CHK_K, CHK_M);
 
-    if (!dav2_accel_qgemm(&a, &w, chk_hw)) {
+    if (!dav2_accel_qgemm(&a, &w, chk_hw, 0)) {
         printf("GEMM accelerator: self-test could not run\n");
         return 0;
     }
@@ -493,9 +574,18 @@ int  dav2_accel_present(void) { return 0; }
 void dav2_accel_report(void)  { }
 int  dav2_accel_check(void)   { return 0; }
 
-int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc)
+int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc,
+                     dav2_accel_stats_t *st)
 {
     (void)a; (void)wt; (void)acc;
+    if (st) { st->v = 0; st->tiles = 0; }
+    return 0;
+}
+
+int dav2_accel_requant(const int32_t *acc, int N, int M, const int32_t *params,
+                       int16_t *out)
+{
+    (void)acc; (void)N; (void)M; (void)params; (void)out;
     return 0;
 }
 

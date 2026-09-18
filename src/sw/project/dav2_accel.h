@@ -31,7 +31,24 @@ void dav2_accel_report(void);
  * declined (absent, or the shape/alignment is outside what it supports, or a
  * bus error occurred). On 0 the contents of acc are undefined and the caller
  * must run the software kernel instead. */
-int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc);
+/* Per-weight-row accumulator statistics the GEMM job writes as it drains:
+ * v[(tile*M + m)*2] = max, v[..+1] = min over that tile's rows. tiles = 0 when
+ * the block produced none (absent, or a K-split job), in which case the
+ * caller scans acc itself. Allocated from the arena inside the caller's
+ * mark/release. */
+typedef struct {
+    const int32_t *v;
+    int            tiles;
+} dav2_accel_stats_t;
+
+int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc,
+                     dav2_accel_stats_t *st);
+
+/* Requantisation job: out[n][m] = sat14((acc[m][n]*mult + 2^(sh-1)) >> sh + bias)
+ * with params[3m] = mult, [3m+1] = shift, [3m+2] = bias. M must be even.
+ * Returns 1 when done in hardware, 0 when the caller must do it. */
+int dav2_accel_requant(const int32_t *acc, int N, int M, const int32_t *params,
+                       int16_t *out);
 
 /* The same product on raw pointers with explicit row strides (bytes; 0 =
  * contiguous), for operands that are slices of larger tensors -- attention

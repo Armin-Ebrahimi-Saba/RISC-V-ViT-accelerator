@@ -22,6 +22,15 @@
 //   N   1 <= N_ROWS <= CAPS.NROWS
 //   all three addresses 4-byte aligned, both strides multiples of 4
 //
+// Two extras around the GEMM:
+//   S_ADDR != 0  : after draining weight row m the block also writes the
+//                  {max, min} of that row's N_ROWS accumulators to
+//                  S_ADDR + m*8 -- the per-row range the requantisation needs,
+//                  without software reading the whole accumulator matrix.
+//   CTRL.requant : a separate job type that turns an int32 accumulator matrix
+//                  into int16 activations with per-row multiplier, shift and
+//                  bias (see the ctrl register), transposing [m][n] -> [n][m].
+//
 // A stride larger than the row lets a job read a column slice of a wider
 // matrix: software uses it to split a reduction longer than KMAX into chunks
 // (partial sums are added on the CPU), and it is what an attention head's
@@ -65,6 +74,11 @@
           bits: 0
           name: "start"
           desc: "1 - start a job"
+        }
+        {
+          bits: 1
+          name: "requant"
+          desc: "0 - GEMM job. 1 - requantisation job: A_ADDR/A_STRIDE address an int32 acc[m][n] chunk (M_LEN rows m, N_ROWS columns n, N_ROWS <= CAPS.NROWS, M_LEN <= CAPS.KMAX/2, M_LEN even), P_ADDR a table of {mult, shift, bias} words per row m, and the block writes out[n][m] = sat14((acc*mult + 2^(shift-1)) >> shift + bias) as int16 to C_ADDR + n*C_STRIDE + m*2."
         }
       ]
     }
@@ -273,6 +287,34 @@
     {
       name: w_stride
       desc: "Bytes between consecutive rows of W. 0 means contiguous (K). Multiple of 4."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+      {
+      name: s_addr
+      desc: "GEMM job: byte address for per-row accumulator statistics, {max, min} int32 at S_ADDR + m*8 for every weight row m. 0 disables. 4-byte aligned."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: p_addr
+      desc: "Requantisation job: byte address of the parameter table, three words {mult, shift, bias} per row m. 4-byte aligned."
       swaccess: rw
       hwaccess: hro
       fields:
