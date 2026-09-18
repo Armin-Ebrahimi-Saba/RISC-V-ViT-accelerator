@@ -13,7 +13,10 @@
  * resolution).
  */
 
+#pragma GCC optimize ("O2")    /* the flow's -Os is wrong for these loops */
+
 #include "dav2.h"
+#include "dav2_accel.h"
 #include "dav2_mathf.h"
 
 #include <stdio.h>
@@ -41,27 +44,86 @@ static const int INTERMEDIATE[4] = {2, 5, 8, 11};
 /* Scores for one head, then softmax, then the context vector. Q/K are
  * requantised to 11 bits so that the K=64 dot product cannot overflow int32:
  * 64 * 2047^2 = 2.7e8. */
+/* acc[m*N + n] = sum_k a[n*a_stride + k] * w[m*w_stride + k], strides in
+ * elements. The accelerator when there is one, otherwise the same sum on the
+ * CPU -- integer either way, so host and board agree to the bit. */
+static void gemm_i32(const int16_t *a, int a_stride, const int8_t *w, int w_stride,
+                     int32_t *acc, int N, int K, int M)
+{
+    if (dav2_accel_gemm_raw(a, (uint32_t)a_stride * 2u, w, (uint32_t)w_stride,
+                            acc, N, K, M))
+        return;
+    for (int m = 0; m < M; m++) {
+        const int8_t *wr = w + (size_t)m * w_stride;
+        for (int n = 0; n < N; n++) {
+            const int16_t *ar = a + (size_t)n * a_stride;
+            int32_t s = 0;
+            for (int k = 0; k < K; k++)
+                s += (int32_t)ar[k] * (int32_t)wr[k];
+            acc[(size_t)m * N + n] = s;
+        }
+    }
+}
+
+/* One attention head, on the GEMM accelerator.
+ *
+ * Both products of attention are matrix multiplications, but neither has an
+ * int8 operand: q, k and v are all int16 activations. The accelerator only
+ * multiplies int16 by int8, so the second operand is split into a high and a
+ * low int8 part and the product is run twice:
+ *
+ *     x = hi * 2^s + lo,  a.x = 2^s * (a.hi) + (a.lo)         exactly.
+ *
+ * Scores:  S[t][m] = q_t . k_m      A = k (int16, shifted to 11 bits),
+ *                                   W = q_hi (q >> 4), q_lo (q & 15)
+ * Context: C[t][d] = sum_m P[t][m] v[m][d]
+ *                                   A = P (int16 probabilities, Q15),
+ *                                   W = v^T_hi (v >> 6), v^T_lo (v & 63)
+ *
+ * so the accelerator does the 2 x 82 x 82 x 64 multiply-accumulates per head
+ * that the CPU spent ~16 cycles each on (47 % of the frame), and the CPU is
+ * left with the gathers, the softmax and the final normalisation. The
+ * numbers are identical to the all-CPU version except that the largest
+ * probability, exactly 2^15, is clamped to 32767 so it fits an int16.
+ *
+ * Operands are built in the DDR3 arena, packed four int8 per word, since a
+ * byte store costs the CPU the same bus transaction as a word store. */
 static void attention_head(const dav2_tensor_t *qkv, int head, int n_tokens,
                            dav2_tensor_t *ctx)
 {
     const int HD = DAV2_HEAD_DIM;
     const int ED = DAV2_EMBED_DIM;
+    const int n  = n_tokens;
+    const int Kp = (n + 3) & ~3;                 /* K must be a multiple of 4 */
     const size_t mark = dav2_arena_mark();
 
-    int16_t *q = (int16_t *)dav2_arena_alloc((size_t)n_tokens * HD * sizeof(int16_t));
-    int16_t *k = (int16_t *)dav2_arena_alloc((size_t)n_tokens * HD * sizeof(int16_t));
-    int32_t *scores = (int32_t *)dav2_arena_alloc((size_t)n_tokens * sizeof(int32_t));
-    int32_t *probs = (int32_t *)dav2_arena_alloc((size_t)n_tokens * sizeof(int32_t));
+    int16_t *k16   = (int16_t *)dav2_arena_alloc((size_t)n * HD * sizeof(int16_t));
+    int8_t  *q_hi  = (int8_t  *)dav2_arena_alloc((size_t)n * HD);
+    int8_t  *q_lo  = (int8_t  *)dav2_arena_alloc((size_t)n * HD);
+    int32_t *s_hi  = (int32_t *)dav2_arena_alloc((size_t)n * n * sizeof(int32_t));
+    int32_t *s_lo  = (int32_t *)dav2_arena_alloc((size_t)n * n * sizeof(int32_t));
+    int16_t *p16   = (int16_t *)dav2_arena_alloc((size_t)n * Kp * sizeof(int16_t));
+    int8_t  *vt_hi = (int8_t  *)dav2_arena_alloc((size_t)HD * Kp);
+    int8_t  *vt_lo = (int8_t  *)dav2_arena_alloc((size_t)HD * Kp);
+    int32_t *c_hi  = (int32_t *)dav2_arena_alloc((size_t)HD * n * sizeof(int32_t));
+    int32_t *c_lo  = (int32_t *)dav2_arena_alloc((size_t)HD * n * sizeof(int32_t));
+    int64_t *pinv  = (int64_t *)dav2_arena_alloc((size_t)n * sizeof(int64_t));
+    int32_t *psum  = (int32_t *)dav2_arena_alloc((size_t)n * sizeof(int32_t));
+    if (dav2_arena_failed) { dav2_arena_release(mark); return; }
 
-    /* extract and rescale q, k for this head */
+    /* q and k of this head into on-chip scratch, with their ranges. */
+    int16_t *q = dav2_scratch;
+    int16_t *k = q + (size_t)n * HD;
     int32_t qmax = 0, kmax = 0;
-    for (int t = 0; t < n_tokens; t++) {
+    for (int t = 0; t < n; t++) {
         const int16_t *row = qkv->v + (size_t)t * qkv->c;
+        const int16_t *qr = row + head * HD;
+        const int16_t *kr = row + ED + head * HD;
+        int16_t *qd = q + (size_t)t * HD, *kd = k + (size_t)t * HD;
         for (int d = 0; d < HD; d++) {
-            int32_t vq = row[head * HD + d];
-            int32_t vk = row[ED + head * HD + d];
-            q[t * HD + d] = (int16_t)vq;
-            k[t * HD + d] = (int16_t)vk;
+            int32_t vq = qr[d], vk = kr[d];
+            qd[d] = (int16_t)vq;
+            kd[d] = (int16_t)vk;
             if (vq < 0) vq = -vq;
             if (vk < 0) vk = -vk;
             if (vq > qmax) qmax = vq;
@@ -71,39 +133,73 @@ static void attention_head(const dav2_tensor_t *qkv, int head, int n_tokens,
     int q_sh = 0, k_sh = 0;
     while ((qmax >> q_sh) > DAV2_QK_QMAX) q_sh++;
     while ((kmax >> k_sh) > DAV2_QK_QMAX) k_sh++;
-    if (q_sh || k_sh) {
-        for (int i = 0; i < n_tokens * HD; i++) {
-            q[i] = (int16_t)(q[i] >> q_sh);
-            k[i] = (int16_t)(k[i] >> k_sh);
+
+    /* Shifted k as the int16 operand; shifted q split into two int8 halves.
+     * |q| <= 2047 after the shift, so q >> 4 is within int8. */
+    for (int t = 0; t < n; t++) {
+        const int16_t *qr = q + (size_t)t * HD, *kr = k + (size_t)t * HD;
+        int16_t  *kd = k16 + (size_t)t * HD;
+        uint32_t *qh = (uint32_t *)(q_hi + (size_t)t * HD);
+        uint32_t *ql = (uint32_t *)(q_lo + (size_t)t * HD);
+        for (int d = 0; d < HD; d += 4) {
+            uint32_t wh = 0, wl = 0;
+            for (int j = 0; j < 4; j++) {
+                int32_t vq = qr[d + j] >> q_sh;
+                wh |= ((uint32_t)(vq >> 4) & 0xffu) << (8 * j);
+                wl |= ((uint32_t)vq & 0xfu)         << (8 * j);
+                kd[d + j] = (int16_t)(kr[d + j] >> k_sh);
+            }
+            qh[d >> 2] = wh;
+            ql[d >> 2] = wl;
         }
     }
 
-    /* real score = acc * score_scale */
+    /* S = k . q_hi, k . q_lo  ->  s[t][m] (W rows are t, A rows are m) */
+    gemm_i32(k16, HD, q_hi, HD, s_hi, n, HD, n);
+    gemm_i32(k16, HD, q_lo, HD, s_lo, n, HD, n);
+
+    /* v^T, split, padded with zero columns up to Kp. Four tokens at a time so
+     * that each store is a whole word. */
+    for (int m0 = 0; m0 < Kp; m0 += 4) {
+        const int16_t *vr[4];
+        for (int j = 0; j < 4; j++)
+            vr[j] = (m0 + j < n) ? qkv->v + (size_t)(m0 + j) * qkv->c + 2 * ED + head * HD
+                                 : (const int16_t *)0;
+        for (int d = 0; d < HD; d++) {
+            uint32_t wh = 0, wl = 0;
+            for (int j = 0; j < 4; j++) {
+                int32_t v = vr[j] ? vr[j][d] : 0;
+                wh |= ((uint32_t)(v >> 6) & 0xffu) << (8 * j);
+                wl |= ((uint32_t)v & 0x3fu)        << (8 * j);
+            }
+            *(uint32_t *)(vt_hi + (size_t)d * Kp + m0) = wh;
+            *(uint32_t *)(vt_lo + (size_t)d * Kp + m0) = wl;
+        }
+    }
+
+    /* Softmax per query token, in fixed point: p = 2^(-(smax - s) * scale *
+     * log2e) in Q15. kf is typically far below 1 (score_scale is ~1e-5), so
+     * it must be carried as a (mult, shift) pair rather than a plain Q16
+     * integer -- rounding it into a Q16 constant collapses it to 0 or 1 and
+     * flattens the whole distribution. */
     float score_scale = qkv->scale * qkv->scale
                       * (float)(1 << q_sh) * (float)(1 << k_sh);
+    float kf = score_scale * 1.4426950408889634f;   /* -> exponent base 2 */
+    int32_t kmult; int kshift;
+    dav2_make_multiplier(kf, &kmult, &kshift);
 
-    for (int t = 0; t < n_tokens; t++) {
-        const int16_t *qr = q + (size_t)t * HD;
+    int32_t *scores = (int32_t *)dav2_scratch;   /* q/k are no longer needed */
+    for (int t = 0; t < n; t++) {
+        const int32_t *sh = s_hi + (size_t)t * n, *sl = s_lo + (size_t)t * n;
         int32_t smax = -2147483647 - 1;
-        for (int m = 0; m < n_tokens; m++) {
-            const int16_t *kr = k + (size_t)m * HD;
-            int32_t s = 0;
-            for (int d = 0; d < HD; d++)
-                s += (int32_t)qr[d] * (int32_t)kr[d];
-            scores[m] = s;
-            if (s > smax) smax = s;
+        for (int m = 0; m < n; m++) {
+            int32_t sc = sh[m] * 16 + sl[m];
+            scores[m] = sc;
+            if (sc > smax) smax = sc;
         }
-
-        /* softmax in fixed point: p = 2^(-(smax - s) * scale * log2e) in Q15.
-         * kf is typically far below 1 (score_scale is ~1e-5), so it must be
-         * carried as a (mult, shift) pair rather than a plain Q16 integer --
-         * rounding it into a Q16 constant collapses it to 0 or 1 and flattens
-         * the whole distribution. */
-        float kf = score_scale * 1.4426950408889634f;   /* -> exponent base 2 */
-        int32_t kmult; int kshift;
-        dav2_make_multiplier(kf, &kmult, &kshift);
         int32_t sum = 0;
-        for (int m = 0; m < n_tokens; m++) {
+        int16_t *pr = p16 + (size_t)t * Kp;
+        for (int m = 0; m < n; m++) {
             int64_t d = (int64_t)(smax - scores[m]);
             /* t_q16 = d * kf * 2^16 */
             int64_t t_q16;
@@ -129,27 +225,44 @@ static void attention_head(const dav2_tensor_t *qkv, int head, int n_tokens,
                 int32_t corr = (u * 5623) >> 16;
                 p = (lin - corr) >> ip;
             }
-            probs[m] = p;
+            if (p > 32767) p = 32767;        /* the argmax: 2^15 -> int16 */
+            pr[m] = (int16_t)p;
             sum += p;
         }
-        if (sum == 0) { sum = 1; probs[0] = 1; }
+        for (int m = n; m < Kp; m++) pr[m] = 0;
+        if (sum == 0) { sum = 1; pr[0] = 1; }
+        psum[t] = sum;
+        pinv[t] = ((int64_t)1 << 40) / sum;
+    }
 
-        /* ctx = sum_m p_m * v_m; |sum p| == 32768 bounds this well inside
-         * int32 even with 14-bit v. */
-        int16_t *orow = ctx->v + (size_t)t * ED + head * HD;
-        for (int d = 0; d < HD; d++) {
-            int64_t a = 0;
-            for (int m = 0; m < n_tokens; m++) {
-                int32_t v = qkv->v[(size_t)m * qkv->c + 2 * ED + head * HD + d];
-                a += (int64_t)probs[m] * (int32_t)v;
-            }
-            /* normalise by sum and keep the v scale */
-            int32_t r = (int32_t)(a / sum);
+    /* C = P . v^T_hi, P . v^T_lo  ->  c[d][t] */
+    gemm_i32(p16, Kp, vt_hi, Kp, c_hi, n, Kp, HD);
+    gemm_i32(p16, Kp, vt_lo, Kp, c_lo, n, Kp, HD);
+
+    /* ctx[t][d] = (64 c_hi + c_lo) / sum_t, kept at the v scale, and exactly
+     * the truncated quotient -- but without a 64-bit division per element
+     * (5248 per head, hundreds of cycles each on this core). One reciprocal
+     * per token, floor(2^40 / sum), multiplies in; it underestimates by less
+     * than one unit of the quotient (|c| <= 8191 sum, so the error is under
+     * 8191 sum / 2^40 < 1), so a single compare against the remainder
+     * corrects it. Assembled in scratch as [t][d], then copied out in rows. */
+    int16_t *cbuf = dav2_scratch + 2 * n;     /* past the score row */
+    for (int d = 0; d < HD; d++) {
+        const int32_t *ch = c_hi + (size_t)d * n, *cl = c_lo + (size_t)d * n;
+        for (int t = 0; t < n; t++) {
+            int64_t a  = (int64_t)ch[t] * 64 + (int64_t)cl[t];
+            int64_t aa = a < 0 ? -a : a;
+            int64_t q  = (aa * pinv[t]) >> 40;
+            if (aa - q * psum[t] >= psum[t]) q++;
+            int32_t r = (int32_t)(a < 0 ? -q : q);
             if (r >  DAV2_ACT_QMAX) r =  DAV2_ACT_QMAX;
             if (r < -DAV2_ACT_QMAX) r = -DAV2_ACT_QMAX;
-            orow[d] = (int16_t)r;
+            cbuf[(size_t)t * HD + d] = (int16_t)r;
         }
     }
+    for (int t = 0; t < n; t++)
+        dav2_copy16(ctx->v + (size_t)t * ED + head * HD, cbuf + (size_t)t * HD, (size_t)HD);
+
     dav2_arena_release(mark);
 }
 
@@ -200,8 +313,12 @@ static void run_block(dav2_tensor_t *x, int i, int n_tokens)
 
     dav2_tensor_t ctx = dav2_tensor_new(n_tokens, ED);
     ctx.scale = qkv.scale;              /* context inherits the v scale */
-    for (int h = 0; h < DAV2_N_HEADS; h++)
-        attention_head(&qkv, h, n_tokens, &ctx);
+    {
+        uint64_t t0 = dav2_cycles();
+        for (int h = 0; h < DAV2_N_HEADS; h++)
+            attention_head(&qkv, h, n_tokens, &ctx);
+        dav2_prof_add(DAV2_PROF_ATTENTION, dav2_cycles() - t0);
+    }
 
     BDUMP("ctx", &ctx);
     dav2_tensor_t attn = dav2_tensor_new(n_tokens, ED);
@@ -210,7 +327,7 @@ static void run_block(dav2_tensor_t *x, int i, int n_tokens)
 
     dav2_tensor_t sum1 = dav2_tensor_new(n_tokens, ED);
     dav2_add(x, &attn, &sum1);
-    memcpy(x->v, sum1.v, (size_t)n_tokens * ED * sizeof(int16_t));
+    dav2_copy16(x->v, sum1.v, (size_t)n_tokens * ED);
     x->scale = sum1.scale;
     dav2_arena_release(mark);
 
@@ -231,7 +348,7 @@ static void run_block(dav2_tensor_t *x, int i, int n_tokens)
     BDUMP("fc2", &h2);
     dav2_tensor_t sum2 = dav2_tensor_new(n_tokens, ED);
     dav2_add(x, &h2, &sum2);
-    memcpy(x->v, sum2.v, (size_t)n_tokens * ED * sizeof(int16_t));
+    dav2_copy16(x->v, sum2.v, (size_t)n_tokens * ED);
     x->scale = sum2.scale;
     dav2_arena_release(mark);
 }
@@ -251,7 +368,7 @@ static dav2_tensor_t res_conv_unit(const dav2_tensor_t *x, int h, int w,
     size_t mark = dav2_arena_mark();
 
     dav2_tensor_t t = dav2_tensor_new(h * w, x->c);
-    memcpy(t.v, x->v, (size_t)h * w * x->c * sizeof(int16_t));
+    dav2_copy16(t.v, x->v, (size_t)h * w * x->c);
     t.scale = x->scale;
     dav2_relu(&t);
 
@@ -276,7 +393,7 @@ static dav2_tensor_t fusion(int idx, const dav2_tensor_t *a,
     size_t mark = dav2_arena_mark();
 
     dav2_tensor_t cur = dav2_tensor_new(h * w, DAV2_FEATURES);
-    memcpy(cur.v, a->v, (size_t)h * w * DAV2_FEATURES * sizeof(int16_t));
+    dav2_copy16(cur.v, a->v, (size_t)h * w * DAV2_FEATURES);
     cur.scale = a->scale;
 
     if (b) {
@@ -293,11 +410,38 @@ static dav2_tensor_t fusion(int idx, const dav2_tensor_t *a,
     dav2_qw_t oc;
     sprintf(nm, "%sout", prefix); dav2_qw(&oc, nm, DAV2_FEATURES);
     dav2_tensor_t o = dav2_conv2d(&up, oh, ow, &oc, 1, 1, 0, 0, 0);
-    memcpy(out.v, o.v, (size_t)oh * ow * DAV2_FEATURES * sizeof(int16_t));
+    dav2_copy16(out.v, o.v, (size_t)oh * ow * DAV2_FEATURES);
     out.scale = o.scale;
 
     dav2_arena_release(mark);
     return out;
+}
+
+/* -------------------------------------------------------------- profile */
+
+/* One line per bucket, as a share of the whole frame. "other" is whatever
+ * ran between the instrumented operators: patch extraction, memcpy, the
+ * final float conversion, the progress prints themselves. */
+void dav2_prof_report(uint64_t frame_cycles)
+{
+    uint64_t sum = 0;
+    for (int b = 0; b < DAV2_PROF_OTHER; b++)
+        sum += dav2_prof_get(b);
+    dav2_prof_add(DAV2_PROF_OTHER, frame_cycles > sum ? frame_cycles - sum : 0);
+
+    printf("profile: %u kcycles per frame\n", (unsigned)(frame_cycles / 1000u));
+    for (int b = 0; b < DAV2_PROF_N; b++) {
+        uint64_t c = dav2_prof_get(b);
+        unsigned permille = frame_cycles ? (unsigned)(c * 1000u / frame_cycles) : 0;
+        /* libsys's printf knows neither '-' nor '.*', so pad by hand */
+        char name[24];
+        int len = (int)strlen(dav2_prof_name[b]);
+        memcpy(name, dav2_prof_name[b], (size_t)len);
+        while (len < 20) name[len++] = ' ';
+        name[len] = 0;
+        printf("  %s %9u kcycles  %3u.%u %%\n", name,
+               (unsigned)(c / 1000u), permille / 10u, permille % 10u);
+    }
 }
 
 /* ------------------------------------------------------------------ main */
@@ -311,6 +455,9 @@ void dav2_infer(const dav2_cfg_t *cfg, float *depth_out)
 
     if (dav2_blob_check())
         return;
+
+    dav2_prof_reset();
+    const uint64_t t_frame = dav2_cycles();
 
     /* ---- patch embedding ---------------------------------------------- */
     dav2_progress("patch embedding");
@@ -379,8 +526,7 @@ void dav2_infer(const dav2_cfg_t *cfg, float *depth_out)
             size_t mark = dav2_arena_mark();
             dav2_tensor_t nrm = dav2_tensor_new(n_tokens, ED);
             dav2_layernorm(&x, nw, nbf, &nrm);
-            memcpy(feats[j].v, nrm.v + ED,
-                   (size_t)n_patch * ED * sizeof(int16_t));
+            dav2_copy16(feats[j].v, nrm.v + ED, (size_t)n_patch * ED);
             feats[j].scale = nrm.scale;
 #ifdef DAV2_TRACE
             { char fn[64]; sprintf(fn, "/tmp/dav2_feat%d.bin", j);
@@ -467,4 +613,5 @@ void dav2_infer(const dav2_cfg_t *cfg, float *depth_out)
         depth_out[i] = (float)c3.v[i] * c3.scale;
 
     dav2_progress("done");
+    dav2_prof_report(dav2_cycles() - t_frame);
 }

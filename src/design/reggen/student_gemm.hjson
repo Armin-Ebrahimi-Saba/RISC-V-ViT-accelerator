@@ -7,8 +7,10 @@
 //
 //   C[m][t] = sum_{k=0}^{K-1} A[t][k] * W[m][k]
 //
-//   A : N_ROWS x K  int16   at A_ADDR, row-major, contiguous (stride K*2 bytes)
-//   W : M      x K  int8    at W_ADDR, row-major, contiguous (stride K   bytes)
+//   A : N_ROWS x K  int16   at A_ADDR, row-major, rows A_STRIDE bytes apart
+//                           (0 = contiguous, i.e. K*2)
+//   W : M      x K  int8    at W_ADDR, row-major, rows W_STRIDE bytes apart
+//                           (0 = contiguous, i.e. K)
 //   C : M x N_ROWS  int32   at C_ADDR, one contiguous run of N_ROWS words per
 //                           m, consecutive m separated by C_STRIDE bytes
 //
@@ -18,7 +20,12 @@
 // Constraints (software must check CAPS and fall back to the C kernel):
 //   K   multiple of 4, 4 <= K <= CAPS.KMAX
 //   N   1 <= N_ROWS <= CAPS.NROWS
-//   all three addresses 4-byte aligned
+//   all three addresses 4-byte aligned, both strides multiples of 4
+//
+// A stride larger than the row lets a job read a column slice of a wider
+// matrix: software uses it to split a reduction longer than KMAX into chunks
+// (partial sums are added on the CPU), and it is what an attention head's
+// Q x K^T needs, since q and k are 64-wide slices of 2304-byte qkv rows.
 
 {
   name: "student_gemm"
@@ -240,6 +247,34 @@
       swaccess: ro
       hwaccess: hwo
       hwext: "true"
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+      {
+      name: a_stride
+      desc: "Bytes between consecutive rows of A. 0 means contiguous (K*2). Multiple of 4."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: w_stride
+      desc: "Bytes between consecutive rows of W. 0 means contiguous (K). Multiple of 4."
+      swaccess: rw
+      hwaccess: hro
       fields:
       [
         {

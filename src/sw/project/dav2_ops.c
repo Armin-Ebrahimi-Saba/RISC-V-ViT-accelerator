@@ -24,11 +24,77 @@
  * result is bit-identical whichever ran.
  */
 
+/* The build flow compiles every file with -Os. That is right for the boot
+ * code and wrong for these loops, which are where the CPU spends every cycle
+ * it does not spend waiting for the accelerator. -O2 here only; program
+ * memory (224 kB) has room. */
+#pragma GCC optimize ("O2")
+
 #include "dav2.h"
 #include "dav2_accel.h"
 #include "dav2_mathf.h"
 
 #include <string.h>
+
+/* ------------------------------------------------------------- profiler */
+
+const char *const dav2_prof_name[DAV2_PROF_N] = {
+    "gemm (accelerator)", "gemm (cpu)", "requantise", "attention",
+    "layernorm", "gelu", "add/relu", "im2col", "interpolate", "other",
+};
+static uint64_t prof_acc[DAV2_PROF_N];
+void     dav2_prof_reset(void)                 { memset(prof_acc, 0, sizeof prof_acc); }
+void     dav2_prof_add(int b, uint64_t c)      { prof_acc[b] += c; }
+uint64_t dav2_prof_get(int b)                  { return prof_acc[b]; }
+#define PROF_START()      uint64_t prof_t0 = dav2_cycles()
+#define PROF_STOP(b)      dav2_prof_add((b), dav2_cycles() - prof_t0)
+/* ------------------------------------------------------ copies, scratch */
+
+/* libsys's memcpy copies one byte per iteration, and on this SoC the CPU has
+ * no data cache of its own: every byte is a full bus transaction to the DDR3
+ * block cache. The engine copies tens of megabytes per frame (im2col alone
+ * gathers 36 MB), so a word-wise copy is a 4x win on all of it. Both ends
+ * are int16 tensors from a 16-byte aligned arena, so the word path is the
+ * common case; the byte tail handles odd element counts. */
+void dav2_copy16(int16_t *dst, const int16_t *src, size_t n)
+{
+    if ((((uintptr_t)dst | (uintptr_t)src) & 3u) == 0) {
+        uint32_t *d = (uint32_t *)dst;
+        const uint32_t *q = (const uint32_t *)src;
+        size_t w = n >> 1;
+        for (; w >= 4; w -= 4) {
+            uint32_t a = q[0], b = q[1], c = q[2], e = q[3];
+            d[0] = a; d[1] = b; d[2] = c; d[3] = e;
+            d += 4; q += 4;
+        }
+        for (; w; w--) *d++ = *q++;
+        if (n & 1) *(int16_t *)d = *(const int16_t *)q;
+        return;
+    }
+    for (; n; n--) *dst++ = *src++;
+}
+
+void dav2_zero16(int16_t *dst, size_t n)
+{
+    if (((uintptr_t)dst & 3u) == 0) {
+        uint32_t *d = (uint32_t *)dst;
+        for (size_t w = n >> 1; w; w--) *d++ = 0;
+        if (n & 1) *(int16_t *)d = 0;
+        return;
+    }
+    for (; n; n--) *dst++ = 0;
+}
+
+/* On-chip scratch memory. The program's own RAM is block RAM with single-
+ * cycle access; the activation arena is DDR3 behind a 16 kB direct-mapped
+ * cache. Anything reused many times inside an operator -- a tile of
+ * activations, the q/k/v of one attention head -- is copied here first.
+ * Users never overlap in time, so one buffer serves them all. */
+int16_t dav2_scratch[DAV2_SCRATCH_ELEMS] __attribute__((aligned(16)));
+
+#define PROF_LAP(b)       do { uint64_t prof_t1 = dav2_cycles(); \
+                               dav2_prof_add((b), prof_t1 - prof_t0); \
+                               prof_t0 = prof_t1; } while (0)
 
 /* Build with -DDAV2_TRACE to print the dynamic range of every intermediate
  * tensor. Invaluable when a quantised network goes wrong, because the failure
@@ -179,11 +245,12 @@ void dav2_quantize_f32(const float *src, int n, int c, dav2_tensor_t *out)
 
 /* ------------------------------------------------------------------- GEMM */
 
-/* Activation rows are staged in this buffer so the inner loop reads them from
- * fast BRAM while the weight row streams sequentially from DDR3. Sequential
- * weight access matters: the DDR3 last-level cache is direct-mapped. */
-#define TILE_A_ELEMS 8192                       /* 16 KB of BRAM */
-static int16_t tile_a[TILE_A_ELEMS];
+/* Activation rows are staged in the on-chip scratch so the inner loop reads
+ * them from fast BRAM while the weight row streams sequentially from DDR3.
+ * Sequential weight access matters: the DDR3 last-level cache is
+ * direct-mapped. */
+#define TILE_A_ELEMS DAV2_SCRATCH_ELEMS
+#define tile_a       dav2_scratch
 
 /* Software reference kernel. acc is in [m][n] order -- see dav2_qgemm(). */
 void dav2_qgemm_cpu(const int16_t *av, const int8_t *w, int32_t *acc,
@@ -198,7 +265,7 @@ void dav2_qgemm_cpu(const int16_t *av, const int8_t *w, int32_t *acc,
 
         const int16_t *arows;
         if ((size_t)nt * K <= TILE_A_ELEMS) {
-            memcpy(tile_a, av + (size_t)n0 * K, (size_t)nt * K * sizeof(int16_t));
+            dav2_copy16(tile_a, av + (size_t)n0 * K, (size_t)nt * K);
             arows = tile_a;
         } else {
             arows = av + (size_t)n0 * K;
@@ -257,8 +324,13 @@ void dav2_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, dav2_tensor_t *out)
         return;
     }
 
-    if (!dav2_accel_qgemm(a, wt, acc))
+    PROF_START();
+    if (dav2_accel_qgemm(a, wt, acc)) {
+        PROF_LAP(DAV2_PROF_GEMM_ACCEL);
+    } else {
         dav2_qgemm_cpu(a->v, wt->w, acc, N, K, M);
+        PROF_LAP(DAV2_PROF_GEMM_CPU);
+    }
 
     /* Exact output range, including bias, so nothing clips. The min/max scan
      * is O(N*M) against the O(N*M*K) product, so it stays in software even
@@ -287,29 +359,39 @@ void dav2_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, dav2_tensor_t *out)
         biasq[m] = wt->b ? iround(wt->b[m] * inv_out) : 0;
     }
 
-    /* Row-major over the output, not column-major.
-     *
-     * The obvious loop (m outer, writing out->v[n*M + m]) strides the store by
-     * M*2 = 768 bytes, so nearly every store misses the 16 kB direct-mapped
-     * DDR3 cache and forces a dirty-line write-back (a "dirty" line is one
-     * holding data not yet copied to DRAM; "direct-mapped" means each address
-     * can live in exactly one cache slot, so two addresses 16 kB apart fight
-     * for it). Iterating n outer / m inner makes the stores sequential and
-     * strides the *reads* instead; a read miss brings in a clean line, so it
-     * costs a fill but never a write-back. Bit-identical result, better
-     * locality.
-     *
-     * (An earlier version of this comment claimed the m-outer loop hung the
-     * CPU. It did hang here, but the cause was a bus defect since fixed --
-     * the DDR3 request mux took a_ready from the wrong module -- not the loop
-     * order. Kept row-major for locality alone.) */
-    for (int n = 0; n < N; n++) {
-        int16_t *orow = out->v + (size_t)n * M;
-        for (int m = 0; m < M; m++)
-            orow[m] = sat_act(apply_multiplier(acc[(size_t)m * N + n],
-                                               mult[m], shift[m]) + biasq[m]);
+    /* acc is [m][n]; out is [n][m]. Either loop order strides one side by
+     * hundreds of bytes and misses the 16 kB direct-mapped DDR3 cache on
+     * every access (a "miss" fetches a 32-byte line from DRAM; a "direct-
+     * mapped" cache has exactly one slot per address, so strided accesses
+     * evict each other). So: read acc in chunks of RQ_MB rows -- sequential,
+     * one pass -- into on-chip scratch, and write the output RQ_MB elements
+     * (32 bytes, one cache line) at a time per row. Both sides now touch
+     * each line exactly once. Bit-identical to the plain loop. */
+    enum { RQ_MB = 16 };
+    int32_t *tile = (int32_t *)dav2_scratch;          /* RQ_MB x N int32 */
+    const int max_n = (int)(DAV2_SCRATCH_ELEMS / 2 / RQ_MB);
+    for (int m0 = 0; m0 < M; m0 += RQ_MB) {
+        int mb = M - m0;
+        if (mb > RQ_MB) mb = RQ_MB;
+        for (int n0 = 0; n0 < N; n0 += max_n) {
+            int nb = N - n0;
+            if (nb > max_n) nb = max_n;
+            for (int j = 0; j < mb; j++)
+                dav2_copy16((int16_t *)(tile + (size_t)j * nb),
+                            (const int16_t *)(acc + (size_t)(m0 + j) * N + n0),
+                            (size_t)nb * 2);
+            for (int n = 0; n < nb; n++) {
+                int16_t *orow = out->v + (size_t)(n0 + n) * M + m0;
+                for (int j = 0; j < mb; j++) {
+                    int m = m0 + j;
+                    orow[j] = sat_act(apply_multiplier(tile[(size_t)j * nb + n],
+                                                       mult[m], shift[m]) + biasq[m]);
+                }
+            }
+        }
     }
 
+    PROF_STOP(DAV2_PROF_REQUANT);
     out->n = N;
     out->c = M;
     out->scale = out_scale;
@@ -324,34 +406,76 @@ void dav2_layernorm(const dav2_tensor_t *in, const float *g, const float *b,
 {
     const int N = in->n, C = in->c;
     const size_t mark = dav2_arena_mark();
-    float *tmp = (float *)dav2_arena_alloc((size_t)N * C * sizeof(float));
+    PROF_START();
+
+    /* The core has no FPU: every float operation is a library call of
+     * 50-150 cycles. The statistics are per row (N = 82 of them) and stay
+     * in float; the per-element work (N*C = 31k) is fixed point:
+     *
+     *   y = (x - mean) * (s * inv_std) * g[c] + b[c]
+     *
+     * with x - mean in Q16, s*inv_std as a (mult, shift) pair per row, g in
+     * Q15 and b in Q16. y comes out in Q16 -- resolution 1.5e-5 against an
+     * output step of ~1e-3 after quantisation to 14 bits -- and is then
+     * requantised to the tensor's common scale exactly as before. */
+    int32_t *y16 = (int32_t *)dav2_arena_alloc((size_t)N * C * sizeof(int32_t));
+    int32_t *gq  = (int32_t *)dav2_scratch;               /* g[c] in Q15 */
+    int32_t *bq  = gq + C;                                /* b[c] in Q16 */
+    for (int c = 0; c < C; c++) {
+        gq[c] = iround(g[c] * 32768.0f);
+        bq[c] = iround(b[c] * 65536.0f);
+    }
 
     const float s = in->scale;
+    int32_t amax = 0;
     for (int n = 0; n < N; n++) {
         const int16_t *row = in->v + (size_t)n * C;
         int32_t sum = 0;
-        for (int c = 0; c < C; c++)
-            sum += row[c];
-        /* mean/variance in the integer domain, then converted once per row */
-        float mean_q = (float)sum / (float)C;
         int64_t sq = 0;
         for (int c = 0; c < C; c++) {
             int32_t d = (int32_t)row[c];
+            sum += d;
             sq += (int64_t)d * (int64_t)d;
         }
-        /* sq <= 384 * 8191^2 = 2.6e10, so sq/C fits comfortably in int32 */
+        /* mean/variance in the integer domain, then converted once per row.
+         * sq <= 384 * 8191^2 = 2.6e10, so sq/C fits comfortably in int32 */
+        float mean_q = (float)sum / (float)C;
         float mean_sq = (float)(int32_t)(sq / C)
                       + (float)(int32_t)(sq % C) / (float)C;
         float var_q = mean_sq - mean_q * mean_q;
         if (var_q < 0.0f) var_q = 0.0f;
         /* variance in real units = var_q * s^2; eps matches PyTorch's 1e-6 */
         float inv_std = 1.0f / dav2_sqrtf(var_q * s * s + 1e-6f);
-        float *orow = tmp + (size_t)n * C;
-        for (int c = 0; c < C; c++)
-            orow[c] = ((float)row[c] - mean_q) * s * inv_std * g[c] + b[c];
+
+        int32_t mean16 = iround(mean_q * 65536.0f);       /* |x| <= 8191: fits */
+        int32_t am; int ash;
+        dav2_make_multiplier(s * inv_std, &am, &ash);
+
+        int32_t *orow = y16 + (size_t)n * C;
+        for (int c = 0; c < C; c++) {
+            int32_t d16 = ((int32_t)row[c] << 16) - mean16;
+            int32_t z16 = apply_multiplier(d16, am, ash);   /* (x-mean)/std, Q16 */
+            int64_t pg  = (int64_t)z16 * (int64_t)gq[c];
+            int32_t y   = (int32_t)((pg + (1 << 14)) >> 15) + bq[c];
+            orow[c] = y;
+            int32_t a = y < 0 ? -y : y;
+            if (a > amax) amax = a;
+        }
     }
 
-    dav2_quantize_f32(tmp, N, C, out);
+    /* common output scale, then requantise -- same as dav2_quantize_f32 */
+    float out_scale = (amax > 0) ? (float)amax * (1.0f / 65536.0f)
+                                  * (1.0f / (float)DAV2_ACT_QMAX) : 1.0f;
+    int32_t om; int osh;
+    dav2_make_multiplier((1.0f / 65536.0f) / out_scale, &om, &osh);
+    const int total = N * C;
+    for (int i = 0; i < total; i++)
+        out->v[i] = sat_act(apply_multiplier(y16[i], om, osh));
+    out->scale = out_scale;
+    out->n = N;
+    out->c = C;
+
+    PROF_STOP(DAV2_PROF_LAYERNORM);
     trace_tensor("layernorm", out);
     dav2_arena_release(mark);
 }
@@ -361,6 +485,7 @@ void dav2_layernorm(const dav2_tensor_t *in, const float *g, const float *b,
 void dav2_add(const dav2_tensor_t *a, const dav2_tensor_t *b, dav2_tensor_t *out)
 {
     const int total = a->n * a->c;
+    PROF_START();
     /* Upper bound on the sum's magnitude; at most one bit of range is lost. */
     int32_t amax_a = 0, amax_b = 0;
     for (int i = 0; i < total; i++) {
@@ -385,14 +510,17 @@ void dav2_add(const dav2_tensor_t *a, const dav2_tensor_t *b, dav2_tensor_t *out
     out->n = a->n;
     out->c = a->c;
     out->scale = out_scale;
+    PROF_STOP(DAV2_PROF_ADD_RELU);
     trace_tensor("add", out);
 }
 
 void dav2_relu(dav2_tensor_t *t)
 {
     const int total = t->n * t->c;
+    PROF_START();
     for (int i = 0; i < total; i++)
         if (t->v[i] < 0) t->v[i] = 0;
+    PROF_STOP(DAV2_PROF_ADD_RELU);
 }
 
 /* GELU is an elementwise map on a 14-bit input, so a 257-entry table with
@@ -403,6 +531,7 @@ void dav2_gelu(dav2_tensor_t *t)
 {
     float lut_f[257];
     const float s = t->scale;
+    PROF_START();
     float amax = 0.0f;
     for (int i = 0; i < 257; i++) {
         float x = (float)(i * 64 - 8192) * s;
@@ -426,6 +555,7 @@ void dav2_gelu(dav2_tensor_t *t)
         t->v[i] = (int16_t)(lo + (((hi - lo) * frac) >> 6));
     }
     t->scale = out_scale;
+    PROF_STOP(DAV2_PROF_GELU);
     trace_tensor("gelu", t);
 }
 
@@ -436,6 +566,7 @@ void dav2_interpolate(const dav2_tensor_t *in, int h, int w,
 {
     const int C = in->c;
     const size_t mark = dav2_arena_mark();
+    PROF_START();
     int *y0a = (int *)dav2_arena_alloc((size_t)oh * sizeof(int));
     int *y1a = (int *)dav2_arena_alloc((size_t)oh * sizeof(int));
     int *wya = (int *)dav2_arena_alloc((size_t)oh * sizeof(int));
@@ -485,6 +616,7 @@ void dav2_interpolate(const dav2_tensor_t *in, int h, int w,
     out->n = oh * ow;
     out->c = C;
     out->scale = in->scale;
+    PROF_STOP(DAV2_PROF_INTERP);
     dav2_arena_release(mark);
 }
 
@@ -498,6 +630,7 @@ void dav2_im2col(const dav2_tensor_t *in, int h, int w,
     const int ow = (w + 2 * pad - kw) / stride + 1;
     const int K = kh * kw * C;
     int16_t *dst = cols->v;
+    PROF_START();
 
     for (int oy = 0; oy < oh; oy++) {
         for (int ox = 0; ox < ow; ox++) {
@@ -506,10 +639,9 @@ void dav2_im2col(const dav2_tensor_t *in, int h, int w,
                 for (int kx = 0; kx < kw; kx++) {
                     int ix = ox * stride + kx - pad;
                     if (iy < 0 || iy >= h || ix < 0 || ix >= w) {
-                        memset(dst, 0, (size_t)C * sizeof(int16_t));
+                        dav2_zero16(dst, (size_t)C);
                     } else {
-                        memcpy(dst, in->v + ((size_t)iy * w + ix) * C,
-                               (size_t)C * sizeof(int16_t));
+                        dav2_copy16(dst, in->v + ((size_t)iy * w + ix) * C, (size_t)C);
                     }
                     dst += C;
                 }
@@ -519,6 +651,7 @@ void dav2_im2col(const dav2_tensor_t *in, int h, int w,
     cols->n = oh * ow;
     cols->c = K;
     cols->scale = in->scale;
+    PROF_STOP(DAV2_PROF_IM2COL);
 }
 
 dav2_tensor_t dav2_conv2d(const dav2_tensor_t *in, int h, int w,
@@ -555,17 +688,19 @@ dav2_tensor_t dav2_conv_transpose(const dav2_tensor_t *in, int h, int w,
     dav2_tensor_t flat = dav2_tensor_new(h * w, wt->m);
     dav2_qgemm(in, wt, &flat);
 
+    PROF_START();
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
             const int16_t *src = flat.v + ((size_t)y * w + x) * wt->m;
             for (int ky = 0; ky < stride; ky++) {
                 int16_t *dst = out.v + ((size_t)(y * stride + ky) * ow
                                         + (size_t)x * stride) * cout;
-                memcpy(dst, src + (size_t)ky * stride * cout,
-                       (size_t)stride * cout * sizeof(int16_t));
+                dav2_copy16(dst, src + (size_t)ky * stride * cout,
+                            (size_t)stride * cout);
             }
         }
     }
+    PROF_STOP(DAV2_PROF_INTERP);
     out.scale = flat.scale;
     dav2_arena_release(mark);
 

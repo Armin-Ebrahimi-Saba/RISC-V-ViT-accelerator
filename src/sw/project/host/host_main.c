@@ -16,6 +16,7 @@
 #include "../dav2.h"
 
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -23,6 +24,16 @@ void dav2_progress(const char *stage)
 {
     printf("  [%s]\n", stage);
     fflush(stdout);
+}
+
+/* Nanoseconds; the profile is printed as "kcycles" but on the host they are
+ * microseconds. Only the shares matter here -- and they differ from the
+ * board's, which has no FPU and a far smaller cache. */
+uint64_t dav2_cycles(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
 int main(int argc, char **argv)

@@ -30,7 +30,9 @@
 // direct-mapped DDR3 last-level cache wants.
 //
 // The bus is the limiting resource: one 32-bit TL-UL beat feeds 4*NROWS MACs,
-// so NROWS = 16 needs roughly 0.3 beats/cycle to stay compute-bound. To get
+// so NROWS = 64 (the board setting, see student.sv) needs under 0.1
+// beats/cycle to stay compute-bound -- and the weight matrix is streamed once
+// per tile, so a bigger tile also means fewer passes over it. To get
 // there the read side keeps up to OUTSTANDING requests in flight and
 // reassembles the responses in order via a small reorder buffer indexed by
 // a_source, so it does not pay the full memory latency per beat.
@@ -141,6 +143,7 @@ module student_gemm #(
   // Configuration snapshot, taken when a job starts so software may reprogram
   // the registers for the next tile while this one runs.
   logic [31:0]    w_addr_q, c_stride_q;
+  logic [31:0]    w_stride_q;                // bytes between W rows, never 0 here
   logic [KCW-1:0] k_len_q;
   logic [15:0]    m_len_q;
   logic [NRW-1:0] n_rows_q;
@@ -179,8 +182,16 @@ module student_gemm #(
   end
 
   // Read stream ------------------------------------------------------------
+  //
+  // Both streams (A tile, then W) are rows of rd_row_beats_q beats each; rows
+  // start rd_stride_q bytes apart. With the stride equal to the row length
+  // this is one contiguous run, which is the common case.
   logic [31:0]  rd_addr_q;
-  logic [31:0]  rd_left_q;      // beats not yet requested
+  logic [31:0]  rd_left_q;      // beats not yet requested, all rows
+  logic [31:0]  rd_row_base_q;  // first address of the current row
+  logic [31:0]  rd_row_beats_q; // beats per row
+  logic [31:0]  rd_row_left_q;  // beats left in the current row
+  logic [31:0]  rd_stride_q;    // bytes from one row start to the next
   logic         rd_can_issue;
 
   logic [31:0]  rb_data_q [OUTSTANDING];
@@ -203,10 +214,17 @@ module student_gemm #(
 
   logic sel_wr, sel_rd, issue_wr, issue_rd;
 
-  // Lost-response recovery. With MAX_INFLIGHT=1 at most one read is in flight,
-  // so a single saved address and slot suffice to re-issue it.
-  logic [31:0]   retry_addr_q;
-  logic [SW-1:0] retry_slot_q;
+  // Lost-response recovery. Every issued read remembers its address in its
+  // reorder slot; when the head slot stays empty for RETRY_CYCLES after the
+  // bus has gone silent, that one request is issued again. This works for
+  // any MAX_INFLIGHT: with several in flight the later responses keep
+  // arriving, the head stays empty, issue stops once the slots are full, and
+  // the ensuing silence trips the timer.
+  logic [31:0]   rb_addr_q [OUTSTANDING];
+  logic [31:0]   retry_addr;
+  logic [SW-1:0] retry_slot;
+  assign retry_addr = rb_addr_q[rb_rd_q];
+  assign retry_slot = rb_rd_q;
   logic [31:0]   retry_cnt_q;
   logic          retry_pending_q;
   logic          sel_retry, issue_retry, retry_expired;
@@ -273,10 +291,10 @@ module student_gemm #(
         a_param:   3'h0,
         a_size:    top_pkg::TL_SZW'(2),   // 2^2 = 4 bytes
         a_source:  sel_wr    ? top_pkg::TL_AIW'({1'b1, wr_src_q})
-                 : sel_retry ? top_pkg::TL_AIW'({1'b0, retry_slot_q})
+                 : sel_retry ? top_pkg::TL_AIW'({1'b0, retry_slot})
                              : top_pkg::TL_AIW'({1'b0, rb_wr_q}),
         a_address: sel_wr    ? wr_addr
-                 : sel_retry ? retry_addr_q
+                 : sel_retry ? retry_addr
                              : rd_addr_q,
         a_mask:    4'hf,
         a_data:    sel_wr ? wr_data : 32'd0,
@@ -306,6 +324,7 @@ module student_gemm #(
     end
     always_ff @(posedge clk_i) begin
       if (rsp_rd && (rsp_slot == SW'(s))) rb_data_q[s] <= tl_host_i.d_data;
+      if (issue_rd && (rb_wr_q == SW'(s))) rb_addr_q[s] <= rd_addr_q;
     end
   end
 
@@ -387,30 +406,33 @@ module student_gemm #(
   logic signed [31:0] acc_q [NROWS];
   logic              acc_clr;
 
+  // Only the valid bits are reset. The data registers (weight byte, A
+  // operand, accumulator) deliberately have no asynchronous reset: DSP48E1
+  // internal registers have synchronous reset only, and Vivado will not pull
+  // a register with an async reset into the DSP -- 64 x 32 accumulators
+  // worth of methodology warnings (DPIR-1) and a longer path. The
+  // accumulators are cleared synchronously at job start and after every
+  // drain, so they never hold anything a result depends on before then.
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      v_s1    <= 1'b0;
-      v_s2    <= 1'b0;
-      ksel_s1 <= 1'b0;
-      w_s1    <= '0;
-      w_s2    <= '0;
+      v_s1 <= 1'b0;
+      v_s2 <= 1'b0;
     end else begin
-      v_s1    <= adv;
-      ksel_s1 <= kcnt_q[0];
-      w_s1    <= wbyte;
-      v_s2    <= v_s1;
-      w_s2    <= w_s1;
+      v_s1 <= adv;
+      v_s2 <= v_s1;
     end
+  end
+  always_ff @(posedge clk_i) begin
+    ksel_s1 <= kcnt_q[0];
+    w_s1    <= wbyte;
+    w_s2    <= w_s1;
   end
 
   for (genvar r = 0; r < int'(NROWS); r++) begin : gen_pe
     always_ff @(posedge clk_i) begin
       a_s2[r] <= ksel_s1 ? $signed(a_q[r][31:16]) : $signed(a_q[r][15:0]);
-    end
-    always_ff @(posedge clk_i or negedge rst_ni) begin
-      if (!rst_ni)      acc_q[r] <= '0;
-      else if (acc_clr) acc_q[r] <= '0;
-      else if (v_s2)    acc_q[r] <= acc_q[r] + (a_s2[r] * w_s2);
+      if (acc_clr)   acc_q[r] <= '0;
+      else if (v_s2) acc_q[r] <= acc_q[r] + (a_s2[r] * w_s2);
     end
   end
 
@@ -446,8 +468,10 @@ module student_gemm #(
     endcase
   end
 
-  // Clear the accumulators for the next weight row while the drain finishes.
-  assign acc_clr = (state_q == ST_DRAIN) & (t_q == n_rows_q);
+  // Clear the accumulators at job start and for the next weight row while
+  // the drain finishes. (Job start matters: they have no reset.)
+  assign acc_clr = ((state_q == ST_DRAIN) & (t_q == n_rows_q))
+                 | ((state_q == ST_IDLE) & start_strobe);
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
@@ -463,10 +487,13 @@ module student_gemm #(
       n_rows_q    <= '0;
       rd_addr_q   <= '0;
       rd_left_q   <= '0;
+      rd_row_base_q  <= '0;
+      rd_row_beats_q <= '0;
+      rd_row_left_q  <= '0;
+      rd_stride_q    <= '0;
+      w_stride_q  <= '0;
       rb_wr_q     <= '0;
       rb_rd_q     <= '0;
-      retry_addr_q    <= '0;
-      retry_slot_q    <= '0;
       retry_cnt_q     <= '0;
       retry_pending_q <= 1'b0;
       retry_n_q       <= '0;
@@ -487,9 +514,17 @@ module student_gemm #(
 
       // Bus bookkeeping --------------------------------------------------
       if (issue_rd) begin
-        rd_addr_q <= rd_addr_q + 32'd4;
         rd_left_q <= rd_left_q - 32'd1;
         rb_wr_q   <= rb_wr_q + 1'b1;
+        if (rd_row_left_q == 32'd1) begin
+          // last beat of this row: jump to the start of the next one
+          rd_addr_q      <= rd_row_base_q + rd_stride_q;
+          rd_row_base_q  <= rd_row_base_q + rd_stride_q;
+          rd_row_left_q  <= rd_row_beats_q;
+        end else begin
+          rd_addr_q      <= rd_addr_q + 32'd4;
+          rd_row_left_q  <= rd_row_left_q - 32'd1;
+        end
       end
       if (issue_wr) begin
         wr_src_q <= wr_src_q + 1'b1;
@@ -501,11 +536,6 @@ module student_gemm #(
       // Lost-response recovery ------------------------------------------
       // Remember the read in flight, and watch for its answer. Any response
       // or any issue restarts the clock; only genuine silence trips it.
-      if (issue_rd) begin
-        retry_addr_q <= rd_addr_q;
-        retry_slot_q <= rb_wr_q;
-      end
-
       if (issue_retry) begin
         retry_pending_q <= 1'b0;
         retry_cnt_q     <= '0;
@@ -543,9 +573,18 @@ module student_gemm #(
             n_rows_q   <= NRW'(reg2hw.n_rows.q);
             c_ptr_q    <= reg2hw.c_addr.q;
 
-            // A tile: n_rows * (k/2) beats, starting at a_addr.
-            rd_addr_q  <= reg2hw.a_addr.q;
-            rd_left_q  <= 32'(reg2hw.n_rows.q) * 32'(reg2hw.k_len.q >> 1);
+            // A stride of 0 means "contiguous": one row length apart.
+            w_stride_q <= (reg2hw.w_stride.q != 32'd0) ? reg2hw.w_stride.q
+                                                       : 32'(reg2hw.k_len.q);
+
+            // A tile: n_rows rows of k/2 beats, starting at a_addr.
+            rd_addr_q      <= reg2hw.a_addr.q;
+            rd_row_base_q  <= reg2hw.a_addr.q;
+            rd_row_beats_q <= 32'(reg2hw.k_len.q >> 1);
+            rd_row_left_q  <= 32'(reg2hw.k_len.q >> 1);
+            rd_stride_q    <= (reg2hw.a_stride.q != 32'd0) ? reg2hw.a_stride.q
+                                                           : 32'(reg2hw.k_len.q) * 32'd2;
+            rd_left_q      <= 32'(reg2hw.n_rows.q) * 32'(reg2hw.k_len.q >> 1);
 
             a_ld_word_q <= '0;
             a_ld_row_q  <= '0;
@@ -571,10 +610,14 @@ module student_gemm #(
             end
           end
           if (a_load_done) begin
-            // Reprogram the read engine for the weight stream: M*K bytes,
-            // contiguous, read exactly once for the whole tile.
-            rd_addr_q <= w_addr_q;
-            rd_left_q <= 32'(m_len_q) * 32'(k_len_q >> 2);
+            // Reprogram the read engine for the weight stream: M rows of
+            // K/4 beats, read exactly once for the whole tile.
+            rd_addr_q      <= w_addr_q;
+            rd_row_base_q  <= w_addr_q;
+            rd_row_beats_q <= 32'(k_len_q >> 2);
+            rd_row_left_q  <= 32'(k_len_q >> 2);
+            rd_stride_q    <= w_stride_q;
+            rd_left_q      <= 32'(m_len_q) * 32'(k_len_q >> 2);
           end
         end
 

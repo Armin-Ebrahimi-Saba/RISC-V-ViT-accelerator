@@ -26,8 +26,12 @@
 
 module student_gemm_ddrpath_tb;
 
-  localparam int unsigned NROWS = 16;
+  localparam int unsigned NROWS = 64;   // the board setting (student.sv)
   localparam int unsigned KMAX  = 2048;
+  // Reads in flight. 1 is the board setting; the tb takes it as a plusarg so
+  // a deeper pipeline can be tried against the cache without editing RTL:
+  //   flow student_gemm_ddrpath_tb.sim_rtl_xsim  (plusarg +inflight=8)
+  localparam int unsigned MAX_INFLIGHT_P = `ifdef INFLIGHT `INFLIGHT `else 8 `endif;
 
   localparam logic [31:0] A_BASE = 32'h8000_0000;
   localparam logic [31:0] W_BASE = 32'h8002_0000;
@@ -44,6 +48,7 @@ module student_gemm_ddrpath_tb;
   localparam logic [31:0] R_N_ROWS   = 32'h20;
   localparam logic [31:0] R_CAPS     = 32'h24;
   localparam logic [31:0] R_CYCLES   = 32'h28;
+  localparam logic [31:0] R_DBG4     = 32'h38;   // {retries, responses}
 
   logic clk, rst_n;
 
@@ -64,7 +69,7 @@ module student_gemm_ddrpath_tb;
       .NROWS       (NROWS),
       .KMAX        (KMAX),
       .OUTSTANDING (8),
-      .MAX_INFLIGHT(1)      // matches student.sv on the board
+      .MAX_INFLIGHT(MAX_INFLIGHT_P)
   ) dut (
       .clk_i    (clk),
       .rst_ni   (rst_n),
@@ -365,6 +370,12 @@ module student_gemm_ddrpath_tb;
     end
 
     bus.get_word(R_CYCLES, cyc);
+    begin
+      logic [31:0] d4;
+      bus.get_word(R_DBG4, d4);
+      if (d4[31:16] != 0)
+        $display("  %0d lost-response retries in the last tile", d4[31:16]);
+    end
 
     mismatches = 0;
     for (int m = 0; m < mdim; m++) begin
@@ -412,6 +423,7 @@ module student_gemm_ddrpath_tb;
     run_gemm(20, 64,  6);    // two tiles, second partial
     run_gemm(17, 128, 4);    // final tile of a single row
     run_gemm(16, 384, 12);   // a shape the model issues
+    run_gemm(82, 384, 12);   // 82 tokens: one full 64-row tile plus 18
 
     // Patch embedding. On hardware this shape loses exactly one accumulator
     // word of 31104, deterministically, and the lost word is always a tile's

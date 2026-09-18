@@ -23,7 +23,7 @@
 
 module student_gemm_tb;
 
-  localparam int unsigned NROWS       = 16;
+  localparam int unsigned NROWS       = 64;   // the board setting (student.sv)
   localparam int unsigned KMAX        = 2048;
   localparam int unsigned OUTSTANDING = 8;
 
@@ -44,6 +44,8 @@ module student_gemm_tb;
   localparam logic [31:0] R_N_ROWS   = 32'h20;
   localparam logic [31:0] R_CAPS     = 32'h24;
   localparam logic [31:0] R_CYCLES   = 32'h28;
+  localparam logic [31:0] R_A_STRIDE = 32'h3c;
+  localparam logic [31:0] R_W_STRIDE = 32'h40;
 
   logic clk;
   logic rst_n;
@@ -157,16 +159,21 @@ module student_gemm_tb;
 
   // One accelerator job, i.e. one tile of nt activation rows.
   task automatic run_job(input logic [31:0] a_addr,
+                         input logic [31:0] w_addr,
                          input logic [31:0] c_addr,
                          input int          c_stride,
                          input int          kdim,
                          input int          mdim,
-                         input int          nt);
+                         input int          nt,
+                         input int          a_stride,
+                         input int          w_stride);
     logic [31:0] st;
     int guard;
 
     bus.put_word(R_A_ADDR,   a_addr);
-    bus.put_word(R_W_ADDR,   W_BASE);
+    bus.put_word(R_W_ADDR,   w_addr);
+    bus.put_word(R_A_STRIDE, a_stride);
+    bus.put_word(R_W_STRIDE, w_stride);
     bus.put_word(R_C_ADDR,   c_addr);
     bus.put_word(R_C_STRIDE, c_stride);
     bus.put_word(R_K_LEN,    kdim);
@@ -191,21 +198,37 @@ module student_gemm_tb;
   endtask
 
   // Full GEMM, tiled the way dav2_accel_qgemm() tiles it.
-  task automatic run_gemm(input int ndim, input int kdim, input int mdim);
+  //
+  // kfull > kdim stores A and W with rows kfull long and multiplies only the
+  // kdim columns starting at koff: the strided mode software uses to split a
+  // long reduction, and to read one attention head out of a qkv tensor.
+  // A stride of 0 is sent whenever the rows are contiguous, so the default
+  // path is exercised too.
+  task automatic run_gemm(input int ndim, input int kdim, input int mdim,
+                          input int kfull = 0, input int koff = 0);
     int nt;
     int expected;
     int got;
     int mismatches;
+    int a_stride, w_stride;
     logic [31:0] cyc;
 
-    $display("--- GEMM N=%0d K=%0d M=%0d", ndim, kdim, mdim);
+    if (kfull == 0) kfull = kdim;
+    a_stride = (kfull == kdim) ? 0 : kfull * 2;
+    w_stride = (kfull == kdim) ? 0 : kfull;
+
+    if (kfull == kdim)
+      $display("--- GEMM N=%0d K=%0d M=%0d", ndim, kdim, mdim);
+    else
+      $display("--- GEMM N=%0d K=%0d M=%0d  (columns %0d..%0d of %0d-wide rows)",
+               ndim, kdim, mdim, koff, koff + kdim - 1, kfull);
 
     for (int n = 0; n < ndim; n++)
-      for (int k = 0; k < kdim; k++)
-        poke_a(n, k, kdim, 16'($signed($urandom % 16383) - 8191));
+      for (int k = 0; k < kfull; k++)
+        poke_a(n, k, kfull, 16'($signed($urandom % 16383) - 8191));
     for (int m = 0; m < mdim; m++)
-      for (int k = 0; k < kdim; k++)
-        poke_w(m, k, kdim, 8'($signed($urandom % 255) - 127));
+      for (int k = 0; k < kfull; k++)
+        poke_w(m, k, kfull, 8'($signed($urandom % 255) - 127));
 
     // Poison the output region so a job that writes nothing is not mistaken
     // for a job that writes the right thing.
@@ -215,9 +238,10 @@ module student_gemm_tb;
     for (int n0 = 0; n0 < ndim; n0 += NROWS) begin
       nt = ndim - n0;
       if (nt > int'(NROWS)) nt = NROWS;
-      run_job(A_BASE + 32'(n0 * kdim * 2),
+      run_job(A_BASE + 32'(n0 * kfull * 2 + koff * 2),
+              W_BASE + 32'(koff),
               C_BASE + 32'(n0 * 4),
-              ndim * 4, kdim, mdim, nt);
+              ndim * 4, kdim, mdim, nt, a_stride, w_stride);
     end
 
     bus.get_word(R_CYCLES, cyc);
@@ -226,8 +250,8 @@ module student_gemm_tb;
     for (int m = 0; m < mdim; m++) begin
       for (int n = 0; n < ndim; n++) begin
         expected = 0;
-        for (int k = 0; k < kdim; k++)
-          expected += int'(peek_a(n, k, kdim)) * int'(peek_w(m, k, kdim));
+        for (int k = koff; k < koff + kdim; k++)
+          expected += int'(peek_a(n, k, kfull)) * int'(peek_w(m, k, kfull));
         got = int'(memory.mem[mem_word(C_BASE) + m * ndim + n]);
         checks++;
         if (got !== expected) begin
@@ -283,6 +307,18 @@ module student_gemm_tb;
     // (m=233, n=31). K=588 is unique to this shape, and N=81 leaves a final
     // tile of a single row.
     run_gemm(81, 588, 384);
+
+    // NROWS = 64 shapes: one exact tile, and the encoder's 82 tokens as a
+    // full tile plus a partial one of 18.
+    run_gemm(64, 128, 8);
+    run_gemm(82, 384, 12);
+
+    // Strided rows. First a reduction split in two halves (rows 192 wide,
+    // columns 96..191); then the attention shape: a 64-wide head out of
+    // 576-wide rows, unaligned to the tile.
+    run_gemm(70, 96, 8,  192, 96);
+    run_gemm(66, 64, 20, 576, 64);
+    run_gemm(66, 64, 20, 576, 0);
 
     if (x_errors) begin
       $display("X on the host A channel in %0d cycles", x_errors);

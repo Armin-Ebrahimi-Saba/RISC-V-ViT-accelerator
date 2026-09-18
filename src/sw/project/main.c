@@ -57,6 +57,13 @@ void dav2_selftest_report(void);
  * touch it. Layout: size*size*3 int16 (HWC), then one float32 scale. */
 #define IMAGE_ADDR  0x81E00000u
 
+/* Where the result goes: out_size*out_size float32, row-major. Also in the
+ * gap, above the image (95 kB) and the simulation start token (0x81F00000).
+ * The host reads it back over the JTAG system bus in ~0.2 s. Printing it as
+ * hex text through the console took ~30 s per frame -- a third of the
+ * inference time -- which is why the hex dump is gone. */
+#define RESULT_ADDR 0x81F10000u
+
 /* Handshake flag, polled by main() and written over JTAG by the host loader.
  * Must live in BRAM -- see the comment at its use below. */
 volatile uint32_t dav2_go;
@@ -79,6 +86,8 @@ static uint64_t cycles64(void)
     } while (hi != hi2);
     return ((uint64_t)hi << 32) | lo;
 }
+
+uint64_t dav2_cycles(void) { return cycles64(); }
 
 void dav2_progress(const char *stage)
 {
@@ -318,11 +327,7 @@ int main(void)
 #endif
 
     const int out_size = DAV2_PATCH_GRID * DAV2_PATCH;
-    float *depth = (float *)dav2_arena_alloc((size_t)out_size * out_size * sizeof(float));
-    if (!depth) {
-        printf("FATAL: arena too small for the output image\n");
-        return 1;
-    }
+    float *depth = (float *)RESULT_ADDR;
 
     dav2_cfg_t cfg = { DAV2_INPUT_SIZE, DAV2_PATCH_GRID, DAV2_N_TOKENS };
 
@@ -369,17 +374,10 @@ int main(void)
 
         print_ascii_depth(depth, out_size, 63);
 
-        /* Emit the raw depth map so the host can compare it bit-for-bit
-         * against the host build of the same engine. */
-        printf("DAV2_RESULT_BEGIN %d\n", out_size * out_size);
-        {
-            const uint8_t *raw = (const uint8_t *)depth;
-            for (int i = 0; i < out_size * out_size * 4; i++) {
-                printf("%02x", raw[i]);
-                if ((i & 31) == 31)
-                    putchar('\n');
-            }
-        }
-        printf("\nDAV2_RESULT_END\n");
+        /* Tell the host where the depth map is; it fetches the bytes itself
+         * (see dav2_run_fpga.py) and compares them bit-for-bit against the
+         * host build of the same engine. */
+        printf("DAV2_RESULT %d 0x%08x\n", out_size * out_size, (unsigned)RESULT_ADDR);
+        printf("DAV2_RESULT_END\n");
     }
 }

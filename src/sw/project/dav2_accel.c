@@ -52,6 +52,8 @@
 #define GEMM_DBG2     STUDENT_GEMM_DBG2(0)
 #define GEMM_DBG3     STUDENT_GEMM_DBG3(0)
 #define GEMM_DBG4     STUDENT_GEMM_DBG4(0)
+#define GEMM_A_STRIDE STUDENT_GEMM_A_STRIDE(0)
+#define GEMM_W_STRIDE STUDENT_GEMM_W_STRIDE(0)
 
 #define STATUS_BUSY 0x1u
 #define STATUS_DONE 0x2u
@@ -111,25 +113,20 @@ void dav2_accel_report(void)
     printf("GEMM accelerator: %u rows/pass, K<=%u\n", accel_nrows, accel_kmax);
 }
 
-int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc)
+/* One accelerator pass over all N rows: acc[m][n] = sum_k A[n][k] W[m][k]
+ * for K columns, with A rows a_stride bytes apart and W rows w_stride bytes
+ * apart (both in elements of their own type when 0). K must already satisfy
+ * the block's contract. Returns 0 if the block failed and disabled itself. */
+static int accel_run(const int16_t *av, uint32_t a_stride,
+                     const int8_t *w, uint32_t w_stride,
+                     int32_t *acc, int N, int K, int M)
 {
-    if (!dav2_accel_init())
-        return 0;
-
-    const int N = a->n, K = a->c, M = wt->m;
-
-    /* Shape and alignment contract of student_gemm.hjson. Anything outside it
-     * is handed back to the software kernel rather than approximated. */
-    if (K < 4 || (K & 3) != 0 || (unsigned)K > accel_kmax)
-        return 0;
-    if (N < 1 || M < 1)
-        return 0;
-    if ((((uintptr_t)a->v) | ((uintptr_t)wt->w) | ((uintptr_t)acc)) & 3u)
-        return 0;
-
     const int nrows = (int)accel_nrows;
+    const size_t a_row = a_stride ? a_stride / 2 : (size_t)K;   /* int16 elements */
 
-    REG32(GEMM_W_ADDR)   = (uint32_t)(uintptr_t)wt->w;
+    REG32(GEMM_W_ADDR)   = (uint32_t)(uintptr_t)w;
+    REG32(GEMM_A_STRIDE) = a_stride;
+    REG32(GEMM_W_STRIDE) = w_stride;
     REG32(GEMM_C_STRIDE) = (uint32_t)N * 4u;
     REG32(GEMM_K_LEN)    = (uint32_t)K;
     REG32(GEMM_M_LEN)    = (uint32_t)M;
@@ -139,7 +136,7 @@ int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc)
         if (nt > nrows)
             nt = nrows;
 
-        REG32(GEMM_A_ADDR) = (uint32_t)(uintptr_t)(a->v + (size_t)n0 * K);
+        REG32(GEMM_A_ADDR) = (uint32_t)(uintptr_t)(av + (size_t)n0 * a_row);
         REG32(GEMM_C_ADDR) = (uint32_t)(uintptr_t)(acc + n0);
         REG32(GEMM_N_ROWS) = (uint32_t)nt;
         REG32(GEMM_CTRL)   = 1u;
@@ -163,8 +160,8 @@ int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc)
                     printf("GEMM accelerator: TIMEOUT status=0x%08lx "
                            "N=%d K=%d M=%d nt=%d a=%08lx w=%08lx c=%08lx\n",
                            (unsigned long)REG32(GEMM_STATUS), N, K, M, nt,
-                           (unsigned long)(uintptr_t)(a->v + (size_t)n0 * K),
-                           (unsigned long)(uintptr_t)wt->w,
+                           (unsigned long)(uintptr_t)(av + (size_t)n0 * a_row),
+                           (unsigned long)(uintptr_t)w,
                            (unsigned long)(uintptr_t)(acc + n0));
                     printf("  dbg0=%08lx state=%lu rb_cnt=%lu wr_out=%lu "
                            "rd_left=%lu cycles=%lu\n",
@@ -245,14 +242,16 @@ int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc)
             {
                 uint32_t d2 = REG32(GEMM_DBG2);
                 uint32_t issued = d2 >> 16, acked = d2 & 0xffffu;
-                uint32_t owed = (uint32_t)nt * (uint32_t)M;
-                /* Print the last tile of every job unconditionally so a
-                 * counter that is wired wrong cannot pass by staying zero. */
-                if (issued != owed || acked != issued || n0 + nt >= N)
-                    printf("  %s job %lu: nt=%d M=%d owed=%lu "
+                /* The hardware counters are 16 bits wide and a 64-row tile
+                 * with M = 1536 owes 98304 writes, so compare modulo 2^16. */
+                uint32_t owed = ((uint32_t)nt * (uint32_t)M) & 0xffffu;
+                /* (This used to print the last tile of every job as well,
+                 * as a check that the counters were wired. They are; the
+                 * console link is slow enough that the lines cost more than
+                 * a second per frame, so now only a shortfall speaks.) */
+                if (issued != owed || acked != issued)
+                    printf("  WRITE SHORTFALL job %lu: nt=%d M=%d owed=%lu "
                            "issued=%lu acked=%lu\n",
-                           (issued != owed || acked != issued)
-                               ? "WRITE SHORTFALL" : "writes ok, last tile",
                            (unsigned long)accel_jobs, nt, M,
                            (unsigned long)owed, (unsigned long)issued,
                            (unsigned long)acked);
@@ -263,10 +262,73 @@ int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc)
     return 1;
 }
 
+int dav2_accel_gemm_raw(const int16_t *a, uint32_t a_stride,
+                        const int8_t *w, uint32_t w_stride,
+                        int32_t *acc, int N, int K, int M)
+{
+    if (!dav2_accel_init())
+        return 0;
+    if (K < 4 || (K & 3) != 0 || (unsigned)K > accel_kmax || N < 1 || M < 1)
+        return 0;
+    if ((((uintptr_t)a) | ((uintptr_t)w) | ((uintptr_t)acc) | a_stride | w_stride) & 3u)
+        return 0;
+    return accel_run(a, a_stride, w, w_stride, acc, N, K, M);
+}
+
+int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc)
+{
+    if (!dav2_accel_init())
+        return 0;
+
+    const int N = a->n, K = a->c, M = wt->m;
+
+    /* Shape and alignment contract of student_gemm.hjson. Anything outside it
+     * is handed back to the software kernel rather than approximated. */
+    if (K < 4 || (K & 3) != 0)
+        return 0;
+    if (N < 1 || M < 1)
+        return 0;
+    if ((((uintptr_t)a->v) | ((uintptr_t)wt->w) | ((uintptr_t)acc)) & 3u)
+        return 0;
+
+    if ((unsigned)K <= accel_kmax)
+        return accel_run(a->v, 0, wt->w, 0, acc, N, K, M);
+
+    /* K longer than the A-tile RAM: the 3x3 convolutions on the 384-channel
+     * level have K = 9*384 = 3456 against KMAX = 2048. The row strides let a
+     * job read a column slice of A and W, so the reduction is done in chunks
+     * of at most KMAX columns and the partial sums are added here. The
+     * shapes that need this are small (N <= 81), so the adds are cheap; the
+     * alternative was the whole GEMM on the CPU, 5 s per frame. */
+    const size_t mark = dav2_arena_mark();
+    int32_t *part = (int32_t *)dav2_arena_alloc((size_t)N * M * sizeof(int32_t));
+    if (!part) {
+        dav2_arena_release(mark);
+        return 0;
+    }
+    const int kc_max = (int)(accel_kmax & ~3u);
+    int ok = 1;
+    for (int k0 = 0; k0 < K && ok; k0 += kc_max) {
+        int kc = K - k0;
+        if (kc > kc_max) kc = kc_max;
+        int32_t *dst = k0 ? part : acc;
+        ok = accel_run(a->v + k0, (uint32_t)K * 2u,
+                       wt->w + k0, (uint32_t)K,
+                       dst, N, kc, M);
+        if (ok && k0) {
+            const size_t total = (size_t)N * M;
+            for (size_t i = 0; i < total; i++)
+                acc[i] += part[i];
+        }
+    }
+    dav2_arena_release(mark);
+    return ok;
+}
+
 /* Small fixed test case run once at start-up. Kept in .bss so it works before
  * the DDR3 arena exists, and deliberately sized so that N straddles a tile
- * boundary (20 = 16 + 4 for the default 16-row array). */
-#define CHK_N 20
+ * boundary (70 = 64 + 6 for the board's 64-row array). */
+#define CHK_N 70
 #define CHK_K 64
 #define CHK_M 6
 
@@ -421,6 +483,15 @@ int  dav2_accel_check(void)   { return 0; }
 int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc)
 {
     (void)a; (void)wt; (void)acc;
+    return 0;
+}
+
+int dav2_accel_gemm_raw(const int16_t *a, uint32_t a_stride,
+                        const int8_t *w, uint32_t w_stride,
+                        int32_t *acc, int N, int K, int M)
+{
+    (void)a; (void)a_stride; (void)w; (void)w_stride; (void)acc;
+    (void)N; (void)K; (void)M;
     return 0;
 }
 

@@ -159,7 +159,41 @@ void dav2_infer(const dav2_cfg_t *cfg, float *depth_out);
  * build passes a malloc'd array. */
 void dav2_set_image(const int16_t *hwc, float scale);
 
+/* On-chip scratch buffer and word-wise copies -- see dav2_ops.c. 40 kB:
+ * enough for one attention head's q, k and transposed v (3 x 82 x 64 int16)
+ * plus its score row, with room for a 16-row requantisation tile. */
+#define DAV2_SCRATCH_ELEMS 20480
+extern int16_t dav2_scratch[DAV2_SCRATCH_ELEMS];
+void dav2_copy16(int16_t *dst, const int16_t *src, size_t n);
+void dav2_zero16(int16_t *dst, size_t n);
+
 /* Progress hook, implemented by the caller (prints to stdout on the SoC). */
 void dav2_progress(const char *stage);
+
+/* Free-running cycle (or time) counter, implemented by the caller: mcycle on
+ * the SoC, a wall clock on the host. Only differences are used. */
+uint64_t dav2_cycles(void);
+
+/* Where the time goes. Every operator adds its own cycles to one bucket, so
+ * after a frame the split between the accelerated matmuls and the CPU work
+ * around them can be read off directly instead of estimated. */
+enum {
+    DAV2_PROF_GEMM_ACCEL,   /* accelerator running, CPU waiting            */
+    DAV2_PROF_GEMM_CPU,     /* software matmul (only when no accelerator)  */
+    DAV2_PROF_REQUANT,      /* int32 accumulators -> int16 activations     */
+    DAV2_PROF_ATTENTION,    /* QK^T, softmax, PV per head (CPU)            */
+    DAV2_PROF_LAYERNORM,
+    DAV2_PROF_GELU,
+    DAV2_PROF_ADD_RELU,     /* residual adds, relu                         */
+    DAV2_PROF_IM2COL,       /* conv patch gather                           */
+    DAV2_PROF_INTERP,       /* bilinear resize / transpose conv            */
+    DAV2_PROF_OTHER,        /* everything not above (copies, glue)         */
+    DAV2_PROF_N
+};
+extern const char *const dav2_prof_name[DAV2_PROF_N];
+void     dav2_prof_reset(void);
+void     dav2_prof_add(int bucket, uint64_t cycles);
+uint64_t dav2_prof_get(int bucket);
+void     dav2_prof_report(uint64_t frame_cycles);   /* prints the table */
 
 #endif /* DAV2_H */

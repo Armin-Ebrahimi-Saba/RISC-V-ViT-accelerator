@@ -12,6 +12,8 @@
  * so clarity beats speed.
  */
 
+#pragma GCC optimize ("O2")
+
 #include "dav2_mathf.h"
 
 #include <stdint.h>

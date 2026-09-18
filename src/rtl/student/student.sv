@@ -121,7 +121,13 @@ module student (
   // cycle regardless of d_ready, so a master with more than one request in
   // flight can miss one. One at a time is the safe setting against that
   // memory. See the parameter comment in student_gemm.sv.
+  // NROWS(64): 64 activation rows per tile, 64 multipliers. The weight
+  // matrix is streamed from DDR3 once per tile, so with 82 tokens this is
+  // two passes instead of six; on the 15876-row convolutions of the DPT
+  // head, 249 instead of 993. Costs 64 block RAMs and 64 DSPs of the
+  // chip's 365 and 740.
   student_gemm #(
+    .NROWS       (64),
     .MAX_INFLIGHT(1)
   ) gemm_i (
     .clk_i,

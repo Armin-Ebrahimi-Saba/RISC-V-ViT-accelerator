@@ -33,6 +33,14 @@ void dav2_accel_report(void);
  * must run the software kernel instead. */
 int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc);
 
+/* The same product on raw pointers with explicit row strides (bytes; 0 =
+ * contiguous), for operands that are slices of larger tensors -- attention
+ * reads q, k and v out of the qkv tensor this way. K must be a multiple of 4
+ * and at most CAPS.KMAX; all pointers 4-byte aligned. Same return contract. */
+int dav2_accel_gemm_raw(const int16_t *a, uint32_t a_stride,
+                        const int8_t *w, uint32_t w_stride,
+                        int32_t *acc, int N, int K, int M);
+
 /* Software reference for the same product and the same acc layout. Exposed so
  * dav2_accel_check() can compare the two. */
 int dav2_accel_bigcheck(int N, int K, int M);

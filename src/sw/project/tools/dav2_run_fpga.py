@@ -42,6 +42,7 @@ Two traps this script avoids, both learned the hard way:
 import argparse
 import subprocess
 import random
+import re
 import struct
 import sys
 import time
@@ -61,6 +62,8 @@ GO_MAGIC = 0xD00DFEED
 GO_FRAME   = 0xF00DF00D   # host -> device: a new image is at IMAGE_ADDR
 GO_DONE    = 0xD0DEC0DE   # device -> host: result printed, ready for the next
 IMAGE_ADDR = 0x81E00000   # where each input image goes; see main.c
+# The result's address is not hard-coded here: the program prints it in its
+# "DAV2_RESULT <count> <addr>" line, so main.c owns that number.
 
 
 def read_hostio(ocd):
@@ -335,7 +338,31 @@ def run_frame(ocd, go, img_bytes, tmpdir, timeout, buf):
     # Everything up to and including this result is consumed; anything the
     # device printed after it (the next GO_DONE banner, say) is carried over.
     head, _, tail = text.partition("DAV2_RESULT_END")
-    return head + "DAV2_RESULT_END", tail
+    return fetch_result(ocd, head, tmpdir), tail
+
+
+def fetch_result(ocd, text, tmpdir):
+    """Read the depth map the program left in DDR3.
+
+    The program prints "DAV2_RESULT <count> <addr>" and nothing else; the
+    63 kB of floats come back over the JTAG system bus with dump_image in
+    about 0.2 s. The earlier design printed them as hex through the console
+    and took ~30 s per frame for it. Sysbus reads go through the same DDR3
+    cache the CPU wrote, so what comes back is what the program computed.
+    """
+    m = re.search(r"DAV2_RESULT (\d+) (0x[0-9a-fA-F]+)", text)
+    if not m:
+        print("no depth map announced in program output")
+        return None
+    count, addr = int(m.group(1)), int(m.group(2), 16)
+    f = Path(tmpdir) / "result.bin"
+    t0 = time.time()
+    ocd.cmd(f"dump_image {{{f}}} 0x{addr:08x} {count * 4}")
+    raw = f.read_bytes()
+    print(f"  result read in {time.time() - t0:.2f} s", flush=True)
+    if len(raw) != count * 4:
+        print(f"warning: expected {count*4} bytes, got {len(raw)}")
+    return raw[:count * 4]
 
 
 def probe_stall(ocd):
@@ -410,20 +437,11 @@ def probe_stall(ocd):
             print("  step%d <%s>" % (i, exc), flush=True)
 
 
-def parse_result(text, out_path):
-    """Extract the hex-encoded float depth map printed by the program."""
-    try:
-        body = text.split("DAV2_RESULT_BEGIN", 1)[1]
-        header, body = body.split("\n", 1)
-        body = body.split("DAV2_RESULT_END", 1)[0]
-    except IndexError:
-        print("no depth map found in program output")
+def save_result(raw, out_path):
+    """Write the float depth map as a .npy."""
+    if raw is None:
         return
-    count = int(header.strip())
-    hexdata = "".join(body.split())
-    raw = bytes.fromhex(hexdata)
-    if len(raw) != count * 4:
-        print(f"warning: expected {count*4} bytes, got {len(raw)}")
+    count = len(raw) // 4
     side = int(round(count ** 0.5))
     vals = struct.unpack("<%df" % count, raw[:count * 4])
 
@@ -513,7 +531,7 @@ def main():
                 out = Path(args.out)
                 if len(frames) > 1:
                     out = out.with_name(f"{out.stem}_{name}{out.suffix}")
-                parse_result(result, str(out))
+                save_result(result, str(out))
                 # keep the .dav2img next to the result so the host oracle can
                 # be run on exactly the bytes the board saw
                 out.with_suffix(".dav2img").write_bytes(img)
