@@ -216,8 +216,37 @@ On this core, with these numbers, the rules are:
 
 ---
 
-## 5. What is left, in order of expected gain
+## 5. Round two — implemented, verified in simulation, not yet on the board
 
+The board was unavailable for this round. Everything below is verified
+**bit-exact on the host build** (the software parts) and **in the module
+testbench** (the RTL), and the bitstream is built; the frame time on the
+board has not been measured yet. The boot self-tests guard each new
+hardware path: if one fails on the board it disables itself and the frame
+falls back to the round-one code, still correct.
+
+| Item | Was | Change | Where |
+|---|---|---|---|
+| LayerNorm | 128 Mc | one arithmetic pass that stores the Q16 value (a load and a store are cheaper than recomputing), unrolled; records its output range | `dav2_ops.c` |
+| residual adds | 92 Mc | no range scan: every producer records `amax_q`, the largest \|value\| it wrote (new field of `dav2_tensor_t`); the add uses it | `dav2.h`, `dav2_ops.c` |
+| requant per-row work | ~70 Mc | `make_multiplier` from the float's bits (no `frexpf`, no soft-float); the accelerator reports its output range in `RQ_AMAX` | `dav2_ops.c`, RTL |
+| attention CPU side | 114 Mc | softmax exponent and normalisation in 32×32→64 halves instead of 64-bit library arithmetic; gathers unrolled | `dav2_engine.c` |
+| GELU, ReLU | 51 Mc + | unrolled; record their output range | `dav2_ops.c` |
+| im2col | 67 Mc | **gather mode** (`CTRL.gather`): the accelerator reads the convolution patches straight from the NHWC image and writes zeros for the padding, so no patch matrix is ever built; K longer than the tile is split by kernel position | RTL, `dav2_accel.c` |
+
+Verification of the new RTL: `student_gemm_tb` runs four convolutions
+through gather mode against an im2col reference in the testbench (3×3 with
+padding, stride 2, a 384-channel one split into 5 + 4 kernel positions, and
+a non-square image across two tiles) and checks `RQ_AMAX` on saturated and
+unsaturated outputs. At boot the program compares gather mode with
+im2col + the CPU kernel on a 5×4×8 image covering every border case.
+
+Build: LUT 15.2 %, BRAM 36.9 %, DSP 10.8 %, WNS +0.395 ns, WHS +0.015 ns.
+
+Expected on the board: roughly 14.2 → 9–10 s. To be replaced with the
+measurement.
+
+## 6. What is left, in order of expected gain
 | Item | Now | Estimate | How |
 |---|---|---|---|
 | LayerNorm per element | 128 Mcycles | −80 | one pass storing the Q16 value instead of two computing it (memory is cheap, instructions are not); or a third accelerator job |

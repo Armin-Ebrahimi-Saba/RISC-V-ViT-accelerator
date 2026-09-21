@@ -44,11 +44,22 @@ typedef struct {
 int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc,
                      dav2_accel_stats_t *st);
 
+/* Convolution with the A matrix gathered in hardware from the NHWC int16
+ * image img (h x w x C): acc[m][n], n = output pixel, as dav2_accel_qgemm
+ * would produce for the im2col matrix. wt rows are k*k*C long, kernel
+ * position major (ky, kx, c). C must be a multiple of 4. Statistics as for
+ * dav2_accel_qgemm (none when K is split). 0 = declined, use im2col. */
+int dav2_accel_conv(const int16_t *img, int h, int w, int C, int k, int stride,
+                    int pad, const int8_t *wt, int M, int32_t *acc,
+                    dav2_accel_stats_t *st);
+
 /* Requantisation job: out[n][m] = sat14((acc[m][n]*mult + 2^(sh-1)) >> sh + bias)
  * with params[3m] = mult, [3m+1] = shift, [3m+2] = bias. M must be even.
- * Returns 1 when done in hardware, 0 when the caller must do it. */
+ * *amax_out receives the largest |out| written (the block tracks it), or -1
+ * if it is not available. Returns 1 when done in hardware, 0 when the
+ * caller must do it. */
 int dav2_accel_requant(const int32_t *acc, int N, int M, const int32_t *params,
-                       int16_t *out);
+                       int16_t *out, int32_t *amax_out);
 
 /* The same product on raw pointers with explicit row strides (bytes; 0 =
  * contiguous), for operands that are slices of larger tensors -- attention

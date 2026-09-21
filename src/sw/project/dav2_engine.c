@@ -65,6 +65,20 @@ static void gemm_i32(const int16_t *a, int a_stride, const int8_t *w, int w_stri
     }
 }
 
+/* floor(a * b / 2^s) for a, b < 2^32 and 1 <= s <= 63, as two 32x32->64
+ * halves and 32-bit shifts: mulhu + mul instead of a 64-bit library shift.
+ * Saturates to 0xffffffff when the true quotient does not fit 32 bits. */
+static inline uint32_t mul_shr_floor(uint32_t a, uint32_t b, int s)
+{
+    uint32_t hi = (uint32_t)(((uint64_t)a * (uint64_t)b) >> 32);   /* mulhu */
+    uint32_t lo = a * b;                                            /* mul   */
+    if (s >= 32)
+        return hi >> (s - 32);
+    if (hi >> s)
+        return 0xffffffffu;
+    return (hi << (32 - s)) | (lo >> s);
+}
+
 /* One attention head, on the GEMM accelerator.
  *
  * Both products of attention are matrix multiplications, but neither has an
@@ -120,6 +134,7 @@ static void attention_head(const dav2_tensor_t *qkv, int head, int n_tokens,
         const int16_t *qr = row + head * HD;
         const int16_t *kr = row + ED + head * HD;
         int16_t *qd = q + (size_t)t * HD, *kd = k + (size_t)t * HD;
+        #pragma GCC unroll 8
         for (int d = 0; d < HD; d++) {
             int32_t vq = qr[d], vk = kr[d];
             qd[d] = (int16_t)vq;
@@ -141,8 +156,10 @@ static void attention_head(const dav2_tensor_t *qkv, int head, int n_tokens,
         int16_t  *kd = k16 + (size_t)t * HD;
         uint32_t *qh = (uint32_t *)(q_hi + (size_t)t * HD);
         uint32_t *ql = (uint32_t *)(q_lo + (size_t)t * HD);
+        #pragma GCC unroll 4
         for (int d = 0; d < HD; d += 4) {
             uint32_t wh = 0, wl = 0;
+            #pragma GCC unroll 4
             for (int j = 0; j < 4; j++) {
                 int32_t vq = qr[d + j] >> q_sh;
                 wh |= ((uint32_t)(vq >> 4) & 0xffu) << (8 * j);
@@ -165,8 +182,10 @@ static void attention_head(const dav2_tensor_t *qkv, int head, int n_tokens,
         for (int j = 0; j < 4; j++)
             vr[j] = (m0 + j < n) ? qkv->v + (size_t)(m0 + j) * qkv->c + 2 * ED + head * HD
                                  : (const int16_t *)0;
+        #pragma GCC unroll 4
         for (int d = 0; d < HD; d++) {
             uint32_t wh = 0, wl = 0;
+            #pragma GCC unroll 4
             for (int j = 0; j < 4; j++) {
                 int32_t v = vr[j] ? vr[j][d] : 0;
                 wh |= ((uint32_t)(v >> 6) & 0xffu) << (8 * j);
@@ -200,17 +219,21 @@ static void attention_head(const dav2_tensor_t *qkv, int head, int n_tokens,
         int32_t sum = 0;
         int16_t *pr = p16 + (size_t)t * Kp;
         for (int m = 0; m < n; m++) {
-            int64_t d = (int64_t)(smax - scores[m]);
-            /* t_q16 = d * kf * 2^16 */
-            int64_t t_q16;
-            if (kshift >= 16) {
-                t_q16 = (d * (int64_t)kmult) >> (kshift - 16);
+            uint32_t d = (uint32_t)(smax - scores[m]);      /* >= 0 */
+            /* t_q16 = d * kf * 2^16, saturated: anything at or above 16.0
+             * underflows Q15 anyway. All 32-bit: d < 2^30 and kmult < 2^31. */
+            uint32_t t_q16;
+            if (kshift > 16) {
+                t_q16 = mul_shr_floor(d, (uint32_t)kmult, kshift - 16);
+            } else if (kshift == 16) {
+                uint32_t hi = (uint32_t)(((uint64_t)d * (uint64_t)kmult) >> 32);
+                t_q16 = hi ? 0xffffffffu : d * (uint32_t)kmult;
             } else {
                 /* kf >= 2^15: any nonzero gap underflows Q15 immediately */
-                t_q16 = (d == 0) ? 0 : ((int64_t)16 << 16);
+                t_q16 = (d == 0) ? 0 : (16u << 16);
             }
             int32_t p;
-            if (t_q16 >= (int64_t)16 << 16) {
+            if (t_q16 >= (16u << 16)) {
                 p = 0;                       /* underflows Q15 */
             } else {
                 int32_t ip = (int32_t)(t_q16 >> 16);
@@ -250,10 +273,21 @@ static void attention_head(const dav2_tensor_t *qkv, int head, int n_tokens,
     for (int d = 0; d < HD; d++) {
         const int32_t *ch = c_hi + (size_t)d * n, *cl = c_lo + (size_t)d * n;
         for (int t = 0; t < n; t++) {
-            int64_t a  = (int64_t)ch[t] * 64 + (int64_t)cl[t];
-            int64_t aa = a < 0 ? -a : a;
-            int64_t q  = (aa * pinv[t]) >> 40;
-            if (aa - q * psum[t] >= psum[t]) q++;
+            int64_t  a  = (int64_t)ch[t] * 64 + (int64_t)cl[t];
+            uint64_t aa = (uint64_t)(a < 0 ? -a : a);              /* < 2^35 */
+            /* aa * pinv >> 40 with 32-bit multiplies: aa = ah*2^32 + al,
+             * H = ah*pinv + mulhu(al, pinv) < 2^29, and the low word of
+             * al*pinv cannot carry into bit 40, so the quotient is H >> 8. */
+            int64_t q;
+            if (__builtin_expect(pinv[t] >> 32, 0)) {
+                q = (int64_t)(aa / (uint64_t)psum[t]);   /* sum < 256: cannot happen */
+            } else {
+                uint32_t al = (uint32_t)aa, ah = (uint32_t)(aa >> 32);
+                uint32_t pv = (uint32_t)pinv[t];
+                uint32_t H  = ah * pv + (uint32_t)(((uint64_t)al * (uint64_t)pv) >> 32);
+                q = (int64_t)(H >> 8);
+                if (aa - (uint64_t)q * (uint64_t)psum[t] >= (uint64_t)psum[t]) q++;
+            }
             int32_t r = (int32_t)(a < 0 ? -q : q);
             if (r >  DAV2_ACT_QMAX) r =  DAV2_ACT_QMAX;
             if (r < -DAV2_ACT_QMAX) r = -DAV2_ACT_QMAX;
@@ -472,6 +506,7 @@ void dav2_infer(const dav2_cfg_t *cfg, float *depth_out)
     image.n = cfg->size * cfg->size;
     image.c = 3;
     image.scale = g_image_scale;
+    image.amax_q = -1;
 
     dav2_qw_t pe_w;
     dav2_qw(&pe_w, "patch_embed", DAV2_PATCH * DAV2_PATCH * 3);

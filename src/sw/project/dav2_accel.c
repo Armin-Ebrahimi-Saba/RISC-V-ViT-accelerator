@@ -58,6 +58,13 @@
 #define GEMM_P_ADDR   STUDENT_GEMM_P_ADDR(0)
 #define CTRL_START    0x1u
 #define CTRL_REQUANT  0x2u
+#define CTRL_GATHER   0x4u
+#define GEMM_RQ_AMAX  STUDENT_GEMM_RQ_AMAX(0)
+#define GEMM_G_ADDR   STUDENT_GEMM_G_ADDR(0)
+#define GEMM_G_GEOM   STUDENT_GEMM_G_GEOM(0)
+#define GEMM_G_CHAN   STUDENT_GEMM_G_CHAN(0)
+#define GEMM_G_CONV   STUDENT_GEMM_G_CONV(0)
+#define GEMM_G_START  STUDENT_GEMM_G_START(0)
 
 #define STATUS_BUSY 0x1u
 #define STATUS_DONE 0x2u
@@ -78,6 +85,7 @@ static uint32_t accel_mcycle(void)
 #define ACCEL_TIMEOUT_CYCLES 2000000000u
 
 static int      accel_probed;
+static int      accel_gather_ok = 1;   /* cleared if the gather self-test fails */
 static int      accel_ok;
 static unsigned accel_nrows;
 static unsigned accel_kmax;
@@ -306,8 +314,9 @@ static int accel_wait_simple(const char *what)
 }
 
 int dav2_accel_requant(const int32_t *acc, int N, int M, const int32_t *params,
-                       int16_t *out)
+                       int16_t *out, int32_t *amax_out)
 {
+    if (amax_out) *amax_out = -1;
     if (!dav2_accel_init())
         return 0;
     /* Contract: M even (pairs of int16 per word), everything word aligned,
@@ -319,6 +328,7 @@ int dav2_accel_requant(const int32_t *acc, int N, int M, const int32_t *params,
     const int nc_max = (int)accel_nrows;
     const int mc_max = (int)(accel_kmax / 2u) & ~1;
 
+    int32_t amax = 0;
     REG32(GEMM_A_STRIDE) = (uint32_t)N * 4u;
     REG32(GEMM_C_STRIDE) = (uint32_t)M * 2u;
     REG32(GEMM_S_ADDR)   = 0u;
@@ -340,8 +350,102 @@ int dav2_accel_requant(const int32_t *acc, int N, int M, const int32_t *params,
             accel_jobs++;
             accel_beats += (unsigned long)mc * 3u + (unsigned long)mc * nc
                          + (unsigned long)mc * nc / 2u;
+            {
+                int32_t a = (int32_t)REG32(GEMM_RQ_AMAX);
+                if (a > amax) amax = a;
+            }
         }
     }
+    if (amax_out) *amax_out = amax;
+    return 1;
+}
+
+/* Convolution GEMM with the A tile gathered by the block from the NHWC image
+ * (CTRL.gather): acc[m][n] for the oh*ow output pixels n, no im2col matrix
+ * in memory. Kernel positions are split into jobs of at most KMAX/C
+ * positions; partial sums over position chunks are added here, as for any
+ * long reduction. Statistics come out only when one chunk covers the whole
+ * kernel. Returns 0 (caller falls back to im2col) outside the contract. */
+int dav2_accel_conv(const int16_t *img, int h, int w, int C, int k, int stride,
+                    int pad, const int8_t *wt, int M, int32_t *acc,
+                    dav2_accel_stats_t *st)
+{
+    if (st) { st->v = 0; st->tiles = 0; }
+    if (!dav2_accel_init() || !accel_gather_ok)
+        return 0;
+    const int oh = (h + 2 * pad - k) / stride + 1;
+    const int ow = (w + 2 * pad - k) / stride + 1;
+    const int N = oh * ow, K = k * k * C;
+    /* register field widths and the tile contract */
+    if ((C & 3) || C < 4 || k < 1 || k > 15 || stride < 1 || stride > 15 || pad > 15)
+        return 0;
+    if (h > 65535 || w > 65535 || ow > 65535 || M < 1)
+        return 0;
+    if ((((uintptr_t)img) | ((uintptr_t)wt) | ((uintptr_t)acc)) & 3u)
+        return 0;
+    int pc_max = (int)(accel_kmax / (unsigned)C);
+    if (pc_max < 1) return 0;
+    if (pc_max > k * k) pc_max = k * k;
+    if (pc_max > 255) pc_max = 255;
+
+    const int nrows = (int)accel_nrows;
+    const int tiles = (N + nrows - 1) / nrows;
+    const int single = (pc_max == k * k);
+    int32_t *stats = 0, *part = 0;
+    const size_t mark = dav2_arena_mark();
+    if (single && st) {
+        stats = (int32_t *)dav2_arena_alloc((size_t)tiles * M * 2 * sizeof(int32_t));
+        if (stats) { st->v = stats; st->tiles = tiles; }
+    }
+    if (!single) {
+        part = (int32_t *)dav2_arena_alloc((size_t)N * M * sizeof(int32_t));
+        if (!part) { dav2_arena_release(mark); return 0; }
+    }
+
+    REG32(GEMM_G_ADDR)   = (uint32_t)(uintptr_t)img;
+    REG32(GEMM_G_GEOM)   = ((uint32_t)h << 16) | (uint32_t)w;
+    REG32(GEMM_G_CHAN)   = ((uint32_t)ow << 16) | (uint32_t)C;
+    REG32(GEMM_W_STRIDE) = (uint32_t)K;
+    REG32(GEMM_A_STRIDE) = 0u;
+    REG32(GEMM_C_STRIDE) = (uint32_t)N * 4u;
+    REG32(GEMM_M_LEN)    = (uint32_t)M;
+
+    for (int p0 = 0; p0 < k * k; p0 += pc_max) {
+        int pc = k * k - p0;
+        if (pc > pc_max) pc = pc_max;
+        int32_t *dst = p0 ? part : acc;
+        REG32(GEMM_G_CONV)  = (uint32_t)k | ((uint32_t)stride << 4) | ((uint32_t)pad << 8)
+                            | ((uint32_t)(p0 / k) << 12) | ((uint32_t)(p0 % k) << 16)
+                            | ((uint32_t)pc << 20);
+        REG32(GEMM_W_ADDR)  = (uint32_t)(uintptr_t)(wt + (size_t)p0 * C);
+        REG32(GEMM_K_LEN)   = (uint32_t)(pc * C);
+        for (int n0 = 0, t = 0; n0 < N; n0 += nrows, t++) {
+            int nt = N - n0;
+            if (nt > nrows) nt = nrows;
+            REG32(GEMM_G_START) = ((uint32_t)(n0 / ow) << 16) | (uint32_t)(n0 % ow);
+            REG32(GEMM_C_ADDR)  = (uint32_t)(uintptr_t)(dst + n0);
+            REG32(GEMM_N_ROWS)  = (uint32_t)nt;
+            REG32(GEMM_S_ADDR)  = stats ? (uint32_t)(uintptr_t)(stats + (size_t)t * M * 2) : 0u;
+            REG32(GEMM_CTRL)    = CTRL_START | CTRL_GATHER;
+            if (!accel_wait_simple("gather")) {
+                dav2_arena_release(mark);
+                if (st) { st->v = 0; st->tiles = 0; }
+                return 0;
+            }
+            accel_cycles += REG32(GEMM_CYCLES);
+            accel_jobs++;
+            accel_beats += (unsigned long)M * (pc * C / 4) + (unsigned long)nt * (pc * C / 2)
+                         + (unsigned long)nt * M;
+            accel_retries += REG32(GEMM_DBG4) >> 16;
+        }
+        if (p0) {
+            const size_t total = (size_t)N * M;
+            for (size_t i = 0; i < total; i++)
+                acc[i] += part[i];
+        }
+    }
+    /* stats (if any) must outlive this call: keep them, drop only part */
+    if (!stats) dav2_arena_release(mark);
     return 1;
 }
 
@@ -477,7 +581,7 @@ int dav2_accel_bigcheck(int N, int K, int M)
         w[i] = (int8_t)((int32_t)(chk_rand(&seed) % 255u) - 127);
     for (int i = 0; i < N * M; i++) { hw[i] = 0; sw[i] = 0; }
 
-    dav2_tensor_t at = { a, 1.0f, N, K };
+    dav2_tensor_t at = { a, 1.0f, N, K, -1 };
     dav2_qw_t     wt = { w, 0, 0, M, K };
 
     dav2_qgemm_cpu(a, w, sw, N, K, M);
@@ -525,6 +629,57 @@ int dav2_accel_bigcheck(int N, int K, int M)
     return bad;
 }
 
+/* Gather mode against im2col + the software kernel, on a 5x4x8 image with a
+ * 3x3 kernel, padding 1: every border case (all four edges and corners) and
+ * a non-square image. All in BRAM, so it runs before DDR3 exists -- and in
+ * the whole-SoC simulation, which has no DDR3. A failure disables gather
+ * mode only; convolutions then build im2col in software as before. */
+static int accel_check_gather(void)
+{
+    enum { H = 5, W = 4, C = 8, KS = 3, M = 4, N = H * W, K = KS * KS * C };
+    int16_t *img  = chk_a;                  /* H*W*C = 160  */
+    int16_t *cols = chk_a + 256;            /* N*K  = 1440 <= 4480 - 256 */
+    uint32_t seed = 0x2468aceu;
+    for (int i = 0; i < H * W * C; i++)
+        img[i] = (int16_t)((int32_t)(chk_rand(&seed) % 16383u) - 8191);
+    for (int i = 0; i < M * K; i++)
+        chk_w[i] = (int8_t)((int32_t)(chk_rand(&seed) % 255u) - 127);
+
+    int16_t *dst = cols;                    /* im2col, pad 1, stride 1 */
+    for (int oy = 0; oy < H; oy++)
+        for (int ox = 0; ox < W; ox++)
+            for (int ky = 0; ky < KS; ky++)
+                for (int kx = 0; kx < KS; kx++) {
+                    int iy = oy + ky - 1, ix = ox + kx - 1;
+                    for (int c = 0; c < C; c++)
+                        *dst++ = (iy < 0 || iy >= H || ix < 0 || ix >= W)
+                               ? 0 : img[(iy * W + ix) * C + c];
+                }
+    dav2_qgemm_cpu(cols, chk_w, chk_sw, N, K, M);
+
+    if (!dav2_accel_conv(img, H, W, C, KS, 1, 1, chk_w, M, chk_hw, 0)) {
+        printf("GEMM accelerator: gather self-test could not run\n");
+        accel_gather_ok = 0;
+        return 0;
+    }
+    int bad = 0;
+    for (int i = 0; i < M * N; i++)
+        if (chk_hw[i] != chk_sw[i]) {
+            if (bad < 4)
+                printf("  gather mismatch at %d: hw %d != sw %d\n",
+                       i, (int)chk_hw[i], (int)chk_sw[i]);
+            bad++;
+        }
+    if (bad) {
+        printf("GEMM accelerator: GATHER SELF-TEST FAILED (%d/%d), gather disabled\n",
+               bad, M * N);
+        accel_gather_ok = 0;
+    } else {
+        printf("GEMM accelerator: gather self-test ok (%dx%dx%d, 3x3 pad 1)\n", H, W, C);
+    }
+    return 0;      /* the plain GEMM path is still good */
+}
+
 int dav2_accel_check(void)
 {
     if (!dav2_accel_init())
@@ -536,7 +691,7 @@ int dav2_accel_check(void)
     for (int i = 0; i < CHK_M * CHK_K; i++)
         chk_w[i] = (int8_t)((int32_t)(chk_rand(&seed) % 255u) - 127);
 
-    dav2_tensor_t a = { chk_a, 1.0f, CHK_N, CHK_K };
+    dav2_tensor_t a = { chk_a, 1.0f, CHK_N, CHK_K, -1 };
     dav2_qw_t     w = { chk_w, 0, 0, CHK_M, CHK_K };
 
     dav2_qgemm_cpu(chk_a, chk_w, chk_sw, CHK_N, CHK_K, CHK_M);
@@ -564,6 +719,8 @@ int dav2_accel_check(void)
         printf("GEMM accelerator: self-test ok (%dx%dx%d)\n",
                CHK_N, CHK_K, CHK_M);
     }
+    if (!bad)
+        bad = accel_check_gather();
     return bad;
 }
 
@@ -583,9 +740,20 @@ int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc,
 }
 
 int dav2_accel_requant(const int32_t *acc, int N, int M, const int32_t *params,
-                       int16_t *out)
+                       int16_t *out, int32_t *amax_out)
 {
     (void)acc; (void)N; (void)M; (void)params; (void)out;
+    if (amax_out) *amax_out = -1;
+    return 0;
+}
+
+int dav2_accel_conv(const int16_t *img, int h, int w, int C, int k, int stride,
+                    int pad, const int8_t *wt, int M, int32_t *acc,
+                    dav2_accel_stats_t *st)
+{
+    (void)img; (void)h; (void)w; (void)C; (void)k; (void)stride; (void)pad;
+    (void)wt; (void)M; (void)acc;
+    if (st) { st->v = 0; st->tiles = 0; }
     return 0;
 }
 

@@ -68,11 +68,18 @@ typedef struct {
     int            m, k;
 } dav2_qw_t;
 
-/* An activation tensor: n rows of c int16 channels, real = v * scale. */
+/* An activation tensor: n rows of c int16 channels, real = v * scale.
+ *
+ * amax_q is the largest |v| in the tensor when the producer knows it exactly
+ * (every operator that streams its output past once does, and the
+ * accelerator reports it for requantised results), or -1 when it does not.
+ * Consumers that need the range -- the residual add -- use it instead of a
+ * scan; a scan and a known amax_q give identical results. */
 typedef struct {
     int16_t *v;
     float    scale;
     int      n, c;
+    int32_t  amax_q;
 } dav2_tensor_t;
 
 /* ------------------------------------------------------------- blob access */

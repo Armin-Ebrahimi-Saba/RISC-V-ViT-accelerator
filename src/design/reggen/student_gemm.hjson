@@ -30,6 +30,10 @@
 //   CTRL.requant : a separate job type that turns an int32 accumulator matrix
 //                  into int16 activations with per-row multiplier, shift and
 //                  bias (see the ctrl register), transposing [m][n] -> [n][m].
+//   CTRL.gather  : the A tile of a GEMM job is gathered straight from an
+//                  NHWC image, one kernel position at a time with zeros
+//                  outside the image -- the im2col a convolution needs,
+//                  without software ever building the patch matrix.
 //
 // A stride larger than the row lets a job read a column slice of a wider
 // matrix: software uses it to split a reduction longer than KMAX into chunks
@@ -74,6 +78,11 @@
           bits: 0
           name: "start"
           desc: "1 - start a job"
+        }
+        {
+          bits: 2
+          name: "gather"
+          desc: "GEMM job only: 1 - the A tile is gathered from an NHWC int16 image as im2col would lay it out (G_ADDR, G_GEOM, G_CHAN, G_CONV, G_START), instead of read from A_ADDR. K_LEN must equal kpos_count * C. C must be even."
         }
         {
           bits: 1
@@ -315,6 +324,91 @@
     {
       name: p_addr
       desc: "Requantisation job: byte address of the parameter table, three words {mult, shift, bias} per row m. 4-byte aligned."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+      {
+      name: rq_amax
+      desc: "Requantisation job: largest |out| written by the job just finished (0..8191)."
+      swaccess: ro
+      hwaccess: hwo
+      hwext: "true"
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: g_addr
+      desc: "Gather: byte address of the input image, int16 NHWC (pixel-major, C channels per pixel). 4-byte aligned."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: g_geom
+      desc: "Gather: input image height (bits 31:16) and width (bits 15:0) in pixels."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: g_chan
+      desc: "Gather: output width in pixels (bits 31:16) and channels C (bits 15:0, even)."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: g_conv
+      desc: "Gather: kernel size k (bits 3:0), stride (7:4), padding (11:8), first kernel row ky (15:12), first kernel column kx (19:16), number of kernel positions in this job (27:20). Positions advance kx then ky, row-major."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: g_start
+      desc: "Gather: output pixel where the tile's first row lies: oy (bits 31:16), ox (bits 15:0). Rows advance ox, wrapping to the next oy at the output width."
       swaccess: rw
       hwaccess: hro
       fields:

@@ -98,11 +98,14 @@ work.
   (`dav2_image.from_file` accepts anything PIL opens; feed it a frame). A
   camera on the board itself is an RTL project — see the options recorded in
   `DEBUGGING.md` § 11.
-- **Performance beyond 14.2 s.** The profile is flat now: LayerNorm,
-  attention's CPU side, the residual adds, im2col and GELU are each 7–18 %.
-  `PERFORMANCE.md` §5 lists the next steps with estimates; together they
-  reach roughly 6–7 s. The per-row soft-float work in requantisation
-  (`make_multiplier` and the range in float) is the cheapest to remove.
+- **Round two of the speed-up is not measured on the board.** LayerNorm,
+  the adds, attention's arithmetic, `make_multiplier` and the accelerator's
+  gather mode and `RQ_AMAX` register were done while the board was away:
+  bit-exact on the host, passing in `student_gemm_tb`, bitstream built.
+  First thing with the board: `flow rvlab_fpga_top.program`, run the demo,
+  check the boot line `gather self-test ok`, compare the output with
+  `build/dav2/host_depth.bin`, and put the measured frame time into
+  `PERFORMANCE.md` §5.
 - **Requant job constraints.** M must be even and a chunk is at most 64
   columns × 1024 rows (the driver chunks). All shapes in this model comply;
   `dav2_qgemm` falls back to the CPU path for odd M.

@@ -34,6 +34,16 @@
 //     range; without this it had to re-read the whole result matrix to find
 //     it.
 //
+//   * Gather mode (CTRL.gather). A convolution is a GEMM whose A matrix is
+//     the "im2col" patch matrix: for every output pixel, the k x k input
+//     pixels under the kernel laid end to end, zeros where the kernel hangs
+//     over the image edge. Software used to build that matrix in DDR3 (36 MB
+//     of copies per frame). In gather mode the A-load walks the output
+//     pixels and kernel positions itself, reads each in-bounds run of C
+//     channels straight from the NHWC image, and writes zeros into the tile
+//     RAM for the out-of-bounds ones -- so the tile RAM ends up holding
+//     exactly the patch matrix rows, and nothing was copied.
+//
 //   * Requantisation job (CTRL.requant). A second mode that turns the int32
 //     result acc[m][n] into int16 activations out[n][m], applying a
 //     per-row multiplier/shift/bias — the same arithmetic the C code uses,
@@ -147,13 +157,14 @@ module student_gemm #(
   assign hw2reg.caps.d   = {8'd0, 16'(KMAX), 8'(NROWS)};   // CAPS: what this instance supports
   assign hw2reg.cycles.d = cycles_q;                       // CYCLES register readback
 
-  logic start_strobe, start_requant;
+  logic start_strobe, start_requant, start_gather;
   // One-cycle pulse the instant the CPU writes CTRL.start=1: the signal that
   // kicks the FSM out of ST_IDLE.
   assign start_strobe  = reg2hw.ctrl.start.qe & reg2hw.ctrl.start.q;
   // Which job to run: 1 = requantisation, 0 = a plain GEMM tile. Only
   // meaningful the same cycle as start_strobe, so it is latched below.
   assign start_requant = reg2hw.ctrl.requant.q;   // sampled with start
+  assign start_gather  = reg2hw.ctrl.gather.q;    // GEMM job: A tile via the gather walkers
 
   // Configuration snapshot, taken when a job starts so software may reprogram
   // the registers for the next tile while this one runs.
@@ -166,6 +177,17 @@ module student_gemm #(
   logic [15:0]    m_len_q;                   // number of W rows (GEMM) / chunk rows (requant)
   logic [NRW-1:0] n_rows_q;                  // number of A-tile rows actually in use (<= NROWS)
   logic           stats_en_q;                // s_addr_q != 0, GEMM jobs
+  logic           gather_q;                  // A tile comes from the gather walkers
+  // Gather parameters (snapshot at start) and the walker signals the read
+  // engine and the A-load writer use; the walkers themselves are further down.
+  logic [31:0]    g_addr_q;
+  logic [15:0]    g_h_q, g_w_q, g_ow_q, g_c_q;
+  logic [3:0]     g_k_q, g_stride_q, g_pad_q, g_ky0_q, g_kx0_q;
+  logic [7:0]     g_kpos_q;
+  logic [15:0]    g_cwords;                  // beats per kernel position
+  logic           gw_inb;                    // writer: current position in bounds
+  logic           gi_handover;               // issuer: a run is ready for the read engine
+  logic [31:0]    gi_addr_q;                 // its address
 
   // ------------------------------------------------------------- control FSM
 
@@ -414,11 +436,18 @@ module student_gemm #(
   // A-tile RAM write side: shared between loading a GEMM's A tile
   // (ST_LOAD_A, rows in order) and loading a requant chunk transposed
   // (RQ_LOAD_ACC, row = n instead of the arrival order m).
-  assign a_wr_data = rd_data;
+  // The word being written into the tile during LOAD_A: a bus beat, or a
+  // zero when the gather walker is over an out-of-bounds kernel position.
+  logic        ld_valid;
+  logic [31:0] ld_data;
+  assign ld_valid = gather_q ? (gw_inb ? rd_valid : 1'b1) : rd_valid;
+  assign ld_data  = (gather_q & ~gw_inb) ? 32'd0 : rd_data;
+
+  assign a_wr_data = ld_data;
   always_comb begin
     a_we      = '0;
     a_wr_addr = a_ld_word_q;
-    if ((state_q == ST_LOAD_A) && rd_valid) a_we[a_ld_row_q[RW-1:0]] = 1'b1;
+    if ((state_q == ST_LOAD_A) && ld_valid) a_we[a_ld_row_q[RW-1:0]] = 1'b1;
     if (state_q == RQ_LOAD_ACC) begin
       a_wr_addr = rq_m_q;
       if (rd_valid) a_we[rq_n_q[RW-1:0]] = 1'b1;
@@ -451,7 +480,9 @@ module student_gemm #(
   // ST_MAC only needs a new word once the current one is exhausted.
   always_comb begin
     rd_pop = 1'b0;
-    if (state_q == ST_LOAD_A || state_q == RQ_LOAD_P || state_q == RQ_LOAD_ACC) begin
+    if (state_q == ST_LOAD_A) begin
+      rd_pop = rd_valid & (gather_q ? gw_inb : 1'b1);
+    end else if (state_q == RQ_LOAD_P || state_q == RQ_LOAD_ACC) begin
       rd_pop = rd_valid;
     end else if (state_q == ST_MAC) begin
       // Refill an empty buffer, or replace the buffer as its last byte is
@@ -543,7 +574,7 @@ module student_gemm #(
   assign pipe_idle = ~v_s1 & ~v_s2;
 
   logic a_load_done;  // the A tile's last word (last row, last word) has just arrived
-  assign a_load_done = rd_valid & (a_ld_row_q == (n_rows_q - 1'b1))
+  assign a_load_done = ld_valid & (a_ld_row_q == (n_rows_q - 1'b1))
                                 & (a_ld_word_q == (k_words - 1'b1));
 
   // Next-state logic: each state advances only on its own completion signal,
@@ -591,6 +622,9 @@ module student_gemm #(
       rd_stride_q    <= '0;
       w_stride_q  <= '0;
       s_addr_q    <= '0;
+      gather_q    <= 1'b0;
+      g_addr_q <= '0; g_h_q <= '0; g_w_q <= '0; g_ow_q <= '0; g_c_q <= '0;
+      g_k_q <= '0; g_stride_q <= '0; g_pad_q <= '0; g_ky0_q <= '0; g_kx0_q <= '0; g_kpos_q <= '0;
       a_addr_q    <= '0;
       a_stride_q  <= '0;
       stats_en_q  <= 1'b0;
@@ -696,6 +730,18 @@ module student_gemm #(
             a_addr_q   <= reg2hw.a_addr.q;
             a_stride_q <= reg2hw.a_stride.q;
             stats_en_q <= (reg2hw.s_addr.q != 32'd0) & ~start_requant;
+            gather_q   <= start_gather & ~start_requant;
+            g_addr_q   <= reg2hw.g_addr.q;
+            g_h_q      <= reg2hw.g_geom.q[31:16];
+            g_w_q      <= reg2hw.g_geom.q[15:0];
+            g_ow_q     <= reg2hw.g_chan.q[31:16];
+            g_c_q      <= reg2hw.g_chan.q[15:0];
+            g_k_q      <= reg2hw.g_conv.q[3:0];
+            g_stride_q <= reg2hw.g_conv.q[7:4];
+            g_pad_q    <= reg2hw.g_conv.q[11:8];
+            g_ky0_q    <= reg2hw.g_conv.q[15:12];
+            g_kx0_q    <= reg2hw.g_conv.q[19:16];
+            g_kpos_q   <= reg2hw.g_conv.q[27:20];
             rq_m_q     <= '0;
             rq_n_q     <= '0;
             rq_p_cnt_q <= '0;
@@ -708,7 +754,10 @@ module student_gemm #(
             rd_row_left_q  <= 32'(reg2hw.k_len.q >> 1);
             rd_stride_q    <= (reg2hw.a_stride.q != 32'd0) ? reg2hw.a_stride.q
                                                            : 32'(reg2hw.k_len.q) * 32'd2;
-            rd_left_q      <= 32'(reg2hw.n_rows.q) * 32'(reg2hw.k_len.q >> 1);
+            // In gather mode nothing is issued until the walker hands over
+            // the first run.
+            rd_left_q      <= (start_gather & ~start_requant) ? 32'd0
+                            : 32'(reg2hw.n_rows.q) * 32'(reg2hw.k_len.q >> 1);
 
             if (start_requant) begin
               // Parameter table first: 3 words per row m, contiguous.
@@ -737,13 +786,22 @@ module student_gemm #(
         ST_LOAD_A: begin
           // Walk a_ld_row_q/a_ld_word_q over the tile as words arrive; once
           // the last one lands, reprogram the read engine for the W stream.
-          if (rd_valid) begin
+          if (ld_valid) begin
             if (a_ld_word_q == (k_words - 1'b1)) begin
               a_ld_word_q <= '0;
               a_ld_row_q  <= a_ld_row_q + 1'b1;
             end else begin
               a_ld_word_q <= a_ld_word_q + 1'b1;
             end
+          end
+          if (gather_q && gi_handover) begin
+            // next in-bounds run of the gather: C/2 beats, contiguous
+            rd_addr_q      <= gi_addr_q;
+            rd_row_base_q  <= gi_addr_q;
+            rd_row_beats_q <= 32'(g_cwords);
+            rd_row_left_q  <= 32'(g_cwords);
+            rd_stride_q    <= 32'(g_cwords) * 32'd4;
+            rd_left_q      <= 32'(g_cwords);
           end
           if (a_load_done) begin
             // Reprogram the read engine for the weight stream: M rows of
@@ -871,6 +929,165 @@ module student_gemm #(
     end
   end
 
+  // ------------------------------------------------------------------ gather
+  //
+  // Two walkers step through the same sequence of (tile row t, kernel row ky,
+  // kernel column kx): the ISSUER on the bus side, which skips out-of-bounds
+  // positions and hands each in-bounds one to the read engine as a run of
+  // C/2 beats; and the WRITER on the RAM side, which consumes the beats in
+  // order and inserts C/2 zero words for the out-of-bounds positions. Both
+  // derive "in bounds" from the same registers, so they agree.
+  //
+  //   iy = oy*stride + ky - pad,  ix = ox*stride + kx - pad
+  //   in bounds  <=>  0 <= iy < h  and  0 <= ix < w
+  //   address    =    G_ADDR + ((iy*w + ix) * C) * 2
+  //
+  // Products oy*stride and ox*stride are kept incrementally.
+
+  assign g_cwords = g_c_q >> 1;
+
+  // ---- issuer
+  typedef enum logic [1:0] { GI_IDLE, GI_SCAN, GI_CALC, GI_LOAD } gi_e;
+  gi_e gi_q;
+  logic [NRW-1:0] gi_t_q;
+  logic [15:0]    gi_oy_q, gi_ox_q, gi_oys_q, gi_oxs_q;   // pixel, and pixel*stride
+  logic [3:0]     gi_ky_q, gi_kx_q;
+  logic [7:0]     gi_pos_q;
+  logic signed [17:0] gi_iy, gi_ix;
+  logic           gi_inb;
+  logic [31:0]    gi_pix_q;
+  logic           gi_step, gi_last_pos, gi_last_row;
+
+  assign gi_iy  = $signed({2'b0, gi_oys_q}) + $signed({14'b0, gi_ky_q}) - $signed({14'b0, g_pad_q});
+  assign gi_ix  = $signed({2'b0, gi_oxs_q}) + $signed({14'b0, gi_kx_q}) - $signed({14'b0, g_pad_q});
+  assign gi_inb = (gi_iy >= 0) & (gi_iy < $signed({2'b0, g_h_q}))
+                & (gi_ix >= 0) & (gi_ix < $signed({2'b0, g_w_q}));
+
+  assign gi_last_pos = (gi_pos_q == g_kpos_q - 1'b1);
+  assign gi_last_row = (gi_t_q == n_rows_q - 1'b1);
+  // Hand the computed run to the read engine once the previous run has been
+  // fully issued (the main always_ff loads rd_addr_q/rd_left_q on this).
+  assign gi_handover = (gi_q == GI_LOAD) & (rd_left_q == 32'd0) & (state_q == ST_LOAD_A);
+  // Advance one kernel position: after skipping an out-of-bounds one, or
+  // after handing an in-bounds one over.
+  assign gi_step = ((gi_q == GI_SCAN) & ~gi_inb) | gi_handover;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      gi_q <= GI_IDLE;
+      gi_t_q <= '0; gi_oy_q <= '0; gi_ox_q <= '0; gi_oys_q <= '0; gi_oxs_q <= '0;
+      gi_ky_q <= '0; gi_kx_q <= '0; gi_pos_q <= '0;
+    end else if (state_q == ST_IDLE && start_strobe && start_gather && !start_requant) begin
+      gi_q     <= GI_SCAN;
+      gi_t_q   <= '0;
+      gi_oy_q  <= reg2hw.g_start.q[31:16];
+      gi_ox_q  <= reg2hw.g_start.q[15:0];
+      gi_oys_q <= reg2hw.g_start.q[31:16] * 16'(reg2hw.g_conv.q[7:4]);
+      gi_oxs_q <= reg2hw.g_start.q[15:0]  * 16'(reg2hw.g_conv.q[7:4]);
+      gi_ky_q  <= reg2hw.g_conv.q[15:12];
+      gi_kx_q  <= reg2hw.g_conv.q[19:16];
+      gi_pos_q <= '0;
+    end else begin
+      if (gi_q == GI_SCAN && gi_inb) gi_q <= GI_CALC;
+      if (gi_q == GI_CALC)           gi_q <= GI_LOAD;
+      if (gi_step) begin
+        gi_q <= GI_SCAN;
+        if (gi_last_pos) begin
+          gi_pos_q <= '0;
+          gi_ky_q  <= g_ky0_q;
+          gi_kx_q  <= g_kx0_q;
+          if (gi_last_row) begin
+            gi_q <= GI_IDLE;
+          end else begin
+            gi_t_q <= gi_t_q + 1'b1;
+            if (gi_ox_q == g_ow_q - 1'b1) begin
+              gi_ox_q  <= '0;
+              gi_oxs_q <= '0;
+              gi_oy_q  <= gi_oy_q + 1'b1;
+              gi_oys_q <= gi_oys_q + 16'(g_stride_q);
+            end else begin
+              gi_ox_q  <= gi_ox_q + 1'b1;
+              gi_oxs_q <= gi_oxs_q + 16'(g_stride_q);
+            end
+          end
+        end else begin
+          gi_pos_q <= gi_pos_q + 1'b1;
+          if (gi_kx_q == g_k_q - 1'b1) begin
+            gi_kx_q <= '0;
+            gi_ky_q <= gi_ky_q + 1'b1;
+          end else begin
+            gi_kx_q <= gi_kx_q + 1'b1;
+          end
+        end
+      end
+    end
+  end
+
+  // Address arithmetic for the run, without reset: written in SCAN/CALC
+  // before it is read in LOAD, and a register with an asynchronous reset
+  // cannot be folded into the DSP48 that does the multiply (DPIR-1).
+  always_ff @(posedge clk_i) begin
+    if (gi_q == GI_SCAN) gi_pix_q  <= 32'(gi_iy) * 32'(g_w_q) + 32'(gi_ix);
+    if (gi_q == GI_CALC) gi_addr_q <= g_addr_q + gi_pix_q * 32'(g_c_q) * 32'd2;
+  end
+
+  // ---- writer
+  logic [NRW-1:0] gw_t_q;
+  logic [15:0]    gw_oys_q, gw_oxs_q, gw_ox_q;
+  logic [3:0]     gw_ky_q, gw_kx_q;
+  logic [7:0]     gw_pos_q;
+  logic [15:0]    gw_cw_q;                 // word within the position
+  logic signed [17:0] gw_iy, gw_ix;
+
+  assign gw_iy  = $signed({2'b0, gw_oys_q}) + $signed({14'b0, gw_ky_q}) - $signed({14'b0, g_pad_q});
+  assign gw_ix  = $signed({2'b0, gw_oxs_q}) + $signed({14'b0, gw_kx_q}) - $signed({14'b0, g_pad_q});
+  assign gw_inb = (gw_iy >= 0) & (gw_iy < $signed({2'b0, g_h_q}))
+                & (gw_ix >= 0) & (gw_ix < $signed({2'b0, g_w_q}));
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      gw_t_q <= '0; gw_oys_q <= '0; gw_oxs_q <= '0; gw_ox_q <= '0;
+      gw_ky_q <= '0; gw_kx_q <= '0; gw_pos_q <= '0; gw_cw_q <= '0;
+    end else if (state_q == ST_IDLE && start_strobe && start_gather && !start_requant) begin
+      gw_t_q   <= '0;
+      gw_ox_q  <= reg2hw.g_start.q[15:0];
+      gw_oys_q <= reg2hw.g_start.q[31:16] * 16'(reg2hw.g_conv.q[7:4]);
+      gw_oxs_q <= reg2hw.g_start.q[15:0]  * 16'(reg2hw.g_conv.q[7:4]);
+      gw_ky_q  <= reg2hw.g_conv.q[15:12];
+      gw_kx_q  <= reg2hw.g_conv.q[19:16];
+      gw_pos_q <= '0;
+      gw_cw_q  <= '0;
+    end else if (state_q == ST_LOAD_A && gather_q && ld_valid) begin
+      if (gw_cw_q == g_cwords - 1'b1) begin
+        gw_cw_q <= '0;
+        if (gw_pos_q == g_kpos_q - 1'b1) begin
+          gw_pos_q <= '0;
+          gw_ky_q  <= g_ky0_q;
+          gw_kx_q  <= g_kx0_q;
+          gw_t_q   <= gw_t_q + 1'b1;
+          if (gw_ox_q == g_ow_q - 1'b1) begin
+            gw_ox_q  <= '0;
+            gw_oxs_q <= '0;
+            gw_oys_q <= gw_oys_q + 16'(g_stride_q);
+          end else begin
+            gw_ox_q  <= gw_ox_q + 1'b1;
+            gw_oxs_q <= gw_oxs_q + 16'(g_stride_q);
+          end
+        end else begin
+          gw_pos_q <= gw_pos_q + 1'b1;
+          if (gw_kx_q == g_k_q - 1'b1) begin
+            gw_kx_q <= '0;
+            gw_ky_q <= gw_ky_q + 1'b1;
+          end else begin
+            gw_kx_q <= gw_kx_q + 1'b1;
+          end
+        end
+      end else begin
+        gw_cw_q <= gw_cw_q + 1'b1;
+      end
+    end
+  end
+
   // ------------------------------------------------------- requantisation
   //
   // Parameter RAM: {mult, shift, bias} per row m of the chunk, filled by
@@ -986,6 +1203,20 @@ module student_gemm #(
   always_ff @(posedge clk_i) begin
     rq_row_end1 <= rq_row_end0; rq_row_end2 <= rq_row_end1; rq_row_end3 <= rq_row_end2;
     rq_row_end4 <= rq_row_end3; rq_row_end5 <= rq_row_end4; rq_row_end6 <= rq_row_end5;
+  end
+
+  // Largest |out| of the job, for the consumer of the result (the residual
+  // add needs the range of its operands and would otherwise scan them).
+  logic [31:0] rq_amax_q;
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      rq_amax_q <= '0;
+    end else if (start_strobe && start_requant) begin
+      rq_amax_q <= '0;
+    end else if (rq_v6) begin
+      rq_amax_q <= (rq_val6 < 0) ? (32'(-rq_val6) > rq_amax_q ? 32'(-rq_val6) : rq_amax_q)
+                                 : (32'(rq_val6)  > rq_amax_q ? 32'(rq_val6)  : rq_amax_q);
+    end
   end
 
   // Pair the even element with the odd one and enqueue the word.
@@ -1110,6 +1341,7 @@ module student_gemm #(
   assign hw2reg.dbg3.d = acc_cnt_q;
   // DBG4: {retries performed (all-time), D-channel responses this job}.
   assign hw2reg.dbg4.d = {retry_n_q[15:0], rsp_cnt_q[15:0]};
+  assign hw2reg.rq_amax.d = rq_amax_q;
 
 `ifndef SYNTHESIS
   // Simulation-only stall watchdog. If the block is busy but nothing has

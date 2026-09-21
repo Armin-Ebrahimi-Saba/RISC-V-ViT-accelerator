@@ -48,6 +48,13 @@ module student_gemm_tb;
   localparam logic [31:0] R_W_STRIDE = 32'h40;
   localparam logic [31:0] R_S_ADDR   = 32'h44;
   localparam logic [31:0] R_P_ADDR   = 32'h48;
+  localparam logic [31:0] R_RQ_AMAX  = 32'h4c;
+  localparam logic [31:0] R_G_ADDR   = 32'h50;
+  localparam logic [31:0] R_G_GEOM   = 32'h54;
+  localparam logic [31:0] R_G_CHAN   = 32'h58;
+  localparam logic [31:0] R_G_CONV   = 32'h5c;
+  localparam logic [31:0] R_G_START  = 32'h60;
+  localparam logic [31:0] I_BASE     = 32'h8012_0000;   // gather: input image
   localparam logic [31:0] S_BASE     = 32'h800C_0000;   // per-row {max,min}
   localparam logic [31:0] P_BASE     = 32'h800D_0000;   // requant params
   localparam logic [31:0] O_BASE     = 32'h800E_0000;   // requant output
@@ -308,7 +315,107 @@ module student_gemm_tb;
   // Requantisation job(s) over the acc matrix left in C_BASE by run_gemm:
   // out[n][m] = sat14((acc[m][n] * mult[m] + 2^(sh[m]-1)) >> sh[m] + bias[m]),
   // chunked as the driver chunks it (<= NROWS columns, <= KWORDS rows).
-  task automatic run_requant(input int ndim, input int mdim);
+  // Convolution through gather mode: an h x w x C int16 image (NHWC) at
+  // I_BASE, a k x k conv with the given stride and padding, M output channels
+  // with weights W[m][pos*C + c] (pos = ky*k + kx). The reference builds the
+  // im2col matrix in the testbench and multiplies. Kernel positions are split
+  // into jobs of kchunk positions each (K per job = kchunk*C), partial sums
+  // added here as the driver does.
+  task automatic run_conv(input int h, input int w, input int C, input int k,
+                          input int stride, input int pad, input int mdim,
+                          input int kchunk);
+    int oh = (h + 2*pad - k) / stride + 1;
+    int ow = (w + 2*pad - k) / stride + 1;
+    int ndim = oh * ow;
+    int kfull = k * k * C;
+    int mismatches = 0;
+    logic [31:0] st;
+    int guard;
+    $display("--- CONV %0dx%0dx%0d k=%0d s=%0d p=%0d -> %0dx%0d, M=%0d, K=%0d in chunks of %0d positions",
+             h, w, C, k, stride, pad, oh, ow, mdim, kfull, kchunk);
+
+    // image and weights
+    for (int i = 0; i < h*w*C/2; i++)
+      memory.mem[mem_word(I_BASE) + i] = {16'($signed($urandom % 16383) - 8191),
+                                          16'($signed($urandom % 16383) - 8191)};
+    for (int m = 0; m < mdim; m++)
+      for (int kk = 0; kk < kfull; kk++)
+        poke_w(m, kk, kfull, 8'($signed($urandom % 255) - 127));
+    for (int i = 0; i < mdim * ndim; i++)
+      memory.mem[mem_word(C_BASE) + i] = 32'hdead_beef;
+
+    // accumulate over position chunks: first chunk to C_BASE, later ones
+    // to O_BASE and added into C_BASE by the tb (int32 words)
+    for (int p0 = 0; p0 < k*k; p0 += kchunk) begin
+      int pc = (k*k - p0 > kchunk) ? kchunk : k*k - p0;
+      logic [31:0] cbase = (p0 == 0) ? C_BASE : O_BASE;
+      for (int n0 = 0; n0 < ndim; n0 += NROWS) begin
+        int nt = (ndim - n0 > int'(NROWS)) ? NROWS : ndim - n0;
+        bus.put_word(R_G_ADDR,   I_BASE);
+        bus.put_word(R_G_GEOM,   {16'(h), 16'(w)});
+        bus.put_word(R_G_CHAN,   {16'(ow), 16'(C)});
+        bus.put_word(R_G_CONV,   {4'd0, 8'(pc), 4'((p0 % k)), 4'((p0 / k)), 4'(pad), 4'(stride), 4'(k)});
+        bus.put_word(R_G_START,  {16'(n0 / ow), 16'(n0 % ow)});
+        bus.put_word(R_W_ADDR,   W_BASE + 32'(p0 * C));
+        bus.put_word(R_W_STRIDE, kfull);
+        bus.put_word(R_A_STRIDE, 0);
+        bus.put_word(R_S_ADDR,   0);
+        bus.put_word(R_C_ADDR,   cbase + 32'(n0 * 4));
+        bus.put_word(R_C_STRIDE, ndim * 4);
+        bus.put_word(R_K_LEN,    pc * C);
+        bus.put_word(R_M_LEN,    mdim);
+        bus.put_word(R_N_ROWS,   nt);
+        bus.put_word(R_CTRL,     32'h5);      // start | gather
+        guard = 0;
+        forever begin
+          bus.get_word(R_STATUS, st);
+          if (!(st & 32'h1)) break;
+          if (++guard > 400000) begin
+            $display("FAIL: gather job did not finish (status=0x%08x)", st);
+            errors++;
+            return;
+          end
+        end
+      end
+      if (p0 != 0)
+        for (int i = 0; i < mdim * ndim; i++)
+          memory.mem[mem_word(C_BASE) + i] = memory.mem[mem_word(C_BASE) + i]
+                                            + memory.mem[mem_word(O_BASE) + i];
+    end
+
+    // reference
+    for (int m = 0; m < mdim; m++) begin
+      for (int n = 0; n < ndim; n++) begin
+        int oy = n / ow, ox = n % ow;
+        int expected = 0;
+        for (int ky = 0; ky < k; ky++)
+          for (int kx = 0; kx < k; kx++) begin
+            int iy = oy*stride + ky - pad, ix = ox*stride + kx - pad;
+            if (iy < 0 || iy >= h || ix < 0 || ix >= w) continue;
+            for (int c = 0; c < C; c++) begin
+              int e = (iy*w + ix)*C + c;
+              logic [31:0] wd = memory.mem[mem_word(I_BASE) + (e >> 1)];
+              int a = e[0] ? int'($signed(wd[31:16])) : int'($signed(wd[15:0]));
+              expected += a * int'(peek_w(m, (ky*k + kx)*C + c, kfull));
+            end
+          end
+        checks++;
+        if (int'(memory.mem[mem_word(C_BASE) + m*ndim + n]) !== expected) begin
+          if (mismatches < 5)
+            $display("  FAIL m=%0d n=%0d: got %0d expected %0d", m, n,
+                     int'(memory.mem[mem_word(C_BASE) + m*ndim + n]), expected);
+          mismatches++;
+        end
+      end
+    end
+    if (mismatches) begin
+      $display("  %0d/%0d words wrong", mismatches, mdim * ndim);
+      errors += mismatches;
+    end else
+      $display("  ok, %0d words", mdim * ndim);
+  endtask
+
+  task automatic run_requant(input int ndim, input int mdim, input int sh_min = 33);
     int mismatches = 0;
     logic [31:0] st;
     int guard;
@@ -317,7 +424,7 @@ module student_gemm_tb;
     // parameter table: mult in [2^30, 2^31), shift 33..44, small bias
     for (int m = 0; m < mdim; m++) begin
       memory.mem[mem_word(P_BASE) + 3*m]     = 32'h4000_0000 + ($urandom % 32'h3fff_ffff);
-      memory.mem[mem_word(P_BASE) + 3*m + 1] = 33 + ($urandom % 12);
+      memory.mem[mem_word(P_BASE) + 3*m + 1] = sh_min + ($urandom % 12);
       memory.mem[mem_word(P_BASE) + 3*m + 2] = 32'($signed($urandom % 2001) - 1000);
     end
     for (int i = 0; i < ndim * mdim / 2; i++)
@@ -372,6 +479,26 @@ module student_gemm_tb;
       errors += mismatches;
     end else begin
       $display("  ok, %0d outputs", ndim * mdim);
+    end
+
+    // rq_amax holds the last job's largest |out|; check it when the whole
+    // matrix was one job.
+    if (ndim <= int'(NROWS) && mdim <= 1024) begin
+      logic [31:0] got;
+      int emax = 0;
+      for (int i = 0; i < ndim * mdim; i++) begin
+        logic [31:0] w = memory.mem[mem_word(O_BASE) + (i >> 1)];
+        int v = i[0] ? int'($signed(w[31:16])) : int'($signed(w[15:0]));
+        if (v < 0) v = -v;
+        if (v > emax) emax = v;
+      end
+      bus.get_word(R_RQ_AMAX, got);
+      checks++;
+      if (int'(got) !== emax) begin
+        $display("  FAIL rq_amax: got %0d expected %0d", got, emax);
+        errors++;
+      end else
+        $display("  rq_amax ok (%0d)", emax);
     end
   endtask
 
@@ -428,8 +555,15 @@ module student_gemm_tb;
     stats_addr = S_BASE;
     run_gemm(82, 128, 12);   run_requant(82, 12);     // two tiles
     run_gemm(20, 64, 30);    run_requant(20, 30);     // one partial tile
+    run_requant(20, 30, 46);                          // small outputs: rq_amax < 8191
     run_gemm(70, 96, 1100);  run_requant(70, 1100);   // M over one param chunk
     stats_addr = 0;
+
+    // Convolutions through gather mode.
+    run_conv(9, 9, 64, 3, 1, 1, 12, 9);        // 3x3 pad 1: N=81, K=576
+    run_conv(9, 9, 32, 3, 2, 1, 8, 9);         // stride 2: N=25
+    run_conv(9, 9, 384, 3, 2, 1, 6, 5);        // K=3456 split 5+4 positions
+    run_conv(10, 7, 16, 3, 1, 1, 4, 9);        // non-square, N=70 -> two tiles
 
     if (x_errors) begin
       $display("X on the host A channel in %0d cycles", x_errors);
