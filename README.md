@@ -60,8 +60,10 @@ How it works
 ![Accelerator architecture](img/accelerator.svg)
 
 The complete computation of one frame — who does what, in what order, on
-which memory, and what runs concurrently — is drawn step by step in
-`docs/DATAFLOW.md` §3 (`img/flow.png` is the same figure as a picture).
+which memory, and what runs concurrently (`docs/DATAFLOW.md` §3 walks
+through it):
+
+![The complete computation of one frame as a numbered flow](img/flow.svg)
 
 **Software** (`src/sw/project/`) — ~2000 lines of C, freestanding. Weights are
 int8 with a per-output-channel scale, activations int16 at 14 bits, and each
