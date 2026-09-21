@@ -116,7 +116,7 @@ cache (same line index, different tags). The first write misses, is brought
 in, and lands in the cache RAM. The second write misses the same line the
 very next cycle and must evict the first — writing its contents back to DDR3.
 
-![Cycle diagram of the cache write-back bug. In cycle N the first write lands in the data RAM. In cycle N+1 the second write to the same line misses and the cache issues the write-back using data_rdata_raw, which is the RAM&#x27;s output from before the cycle-N write landed. The forwarded signal data_rdata already had the correct value and was the fix.](../img/writeback_bug.svg)
+![Cycle diagram of the cache write-back bug. In cycle N the first write lands in the data RAM. In cycle N+1 the second write to the same line misses and the cache issues the write-back using data_rdata_raw, which is the RAM's output from before the cycle-N write landed. The forwarded signal data_rdata already had the correct value and was the fix.](../img/writeback_bug.svg)
 
 *Write A, then evict A one cycle later. The eviction reads the RAM before A's write is visible and sends the previous contents to DDR3. A's data is lost. Every lost word on the board was a tile's final write, because that is the write followed immediately by the next tile's first miss to the same line.*
 

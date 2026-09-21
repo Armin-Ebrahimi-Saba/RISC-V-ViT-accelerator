@@ -37,7 +37,7 @@ peripherals and interconnect that together make a computer. Here it is:
 
 ![SoC block diagram: four bus masters on the left feed a crossbar, which routes to four device ports on the right; the accelerator is both a device and a master](../img/soc_overview.svg)
 
-*Everything talks through one crossbar. The accelerator appears twice: as a *device* the CPU programs through registers, and as a *master* that fetches its own operands from DDR3 — the orange arrow and dashed link. That double role is why bus bugs affected it and the CPU differently.*
+*Everything talks through one crossbar. The accelerator appears twice: as a **device** the CPU programs through registers, and as a **master** that fetches its own operands from DDR3 — the orange arrow and dashed link. That double role is why bus bugs affected it and the CPU differently.*
 
 
 **Bus masters** — the things that start transactions:
@@ -120,7 +120,7 @@ result (M × N). *int8/int16/int32* are 8-, 16- and 32-bit integers; the
 network was quantised so all the arithmetic is integer, because the CPU has
 no floating-point hardware.
 
-![Accelerator dataflow: A tile of 64 rows is loaded once into on-chip memory, then weight rows stream through 64 multiply-accumulate units in parallel, and each completed weight row&#x27;s 64 results are drained to DDR3 together with their max and min](../img/accelerator_dataflow.svg)
+![Accelerator dataflow: A tile of 64 rows is loaded once into on-chip memory, then weight rows stream through 64 multiply-accumulate units in parallel, and each completed weight row's 64 results are drained to DDR3 together with their max and min](../img/accelerator_dataflow.svg)
 
 *Reuse is the whole idea: 64 rows of A are loaded once and held on-chip, then every weight row streams past all 64 at once. Each int8 weight is multiplied against 64 activations the cycle it arrives, so the weight — the dominant memory traffic — crosses the bus once per tile: twice for the encoder's 82 tokens.*
 
