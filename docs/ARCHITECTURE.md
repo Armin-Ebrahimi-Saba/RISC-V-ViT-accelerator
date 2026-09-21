@@ -141,7 +141,7 @@ design, and two of the three bugs found were violations of it.
 ## 3. Memory map
 
 <figure>
-<svg viewBox="0 0 700 300" role="img" aria-label="Memory map: BRAM at 0x0000_0000, peripherals around 0x1F00_0000, accelerator registers at 0x2001_0000, and DDR3 from 0x8000_0000 holding the weight blob, then the image-in and depth-out slots, then the activation arena. Original label: blob then the activation arena" style="max-width:100%;height:auto;font-family:system-ui,sans-serif;font-size:12px">
+<svg viewBox="0 0 700 300" role="img" aria-label="Memory map: BRAM at 0x0000_0000, peripherals around 0x1F00_0000, accelerator registers at 0x2001_0000, and DDR3 from 0x8000_0000 holding the weight blob, then the image-in and depth-out slots, then the activation arena" style="max-width:100%;height:auto;font-family:system-ui,sans-serif;font-size:12px">
 <g fill="none" stroke="currentColor" stroke-width="1.4">
 <rect x="20" y="30" width="660" height="40" rx="4"/>
 <rect x="20" y="90" width="660" height="40" rx="4"/>

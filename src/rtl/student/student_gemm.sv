@@ -1,79 +1,73 @@
 // SPDX-License-Identifier: CC0-1.0
 // SPDX-FileCopyrightText: 2026 RVLab Student Project
 //
-// int8 x int16 GEMM accelerator for the Depth-Anything V2 engine.
+// GEMM accelerator for the Depth-Anything V2 engine.
 // -------------------------------------------------------------------------
 //
-// The whole network spends >98% of its time in dav2_qgemm(), which computes
+// The network spends >98% of its time in dav2_qgemm(), a matrix multiply:
 //
-//   C[m][t] = sum_{k} A[t][k] * W[m][k]      A: int16, W: int8, C: int32
+//   C[m][t] = sum_k A[t][k] * W[m][k]      A: int16, W: int8, C: int32
 //
-// The CV32E40P is a scalar in-order core without SIMD, so it needs several
-// cycles per multiply-accumulate. This block does NROWS MACs per cycle by
-// keeping a tile of NROWS activation rows resident in block RAM and streaming
-// the (much larger) weight matrix past it exactly once.
+// The CPU (CV32E40P, a plain scalar core, no SIMD) would need several cycles
+// per multiply-accumulate. This block instead does NROWS of them per cycle:
+// it keeps NROWS rows of A resident on-chip and streams the much larger W
+// past them once.
 //
-// Dataflow
-// --------
+// One job (one NROWS-row tile of A against all of W) has three phases:
 //
-//   1. LOAD_A  A tile (NROWS x K int16) is read from memory into NROWS
-//              private block RAMs, one per row of the tile.
-//   2. MAC     The weight matrix is read as one contiguous byte stream. Each
-//              32-bit beat carries four int8 weights; each weight is
-//              broadcast to all NROWS multipliers, which each pair it with
-//              their own A element. One weight row m therefore takes K cycles
-//              and produces NROWS int32 accumulators.
-//   3. DRAIN   The NROWS accumulators of row m are written back as one
-//              contiguous run of NROWS words, then the next m starts.
+//   1. LOAD_A  Read the A tile (NROWS rows x K int16) from memory into
+//              NROWS private block RAMs, one per row.
+//   2. MAC     Stream W as a flat byte sequence. Each 32-bit beat carries
+//              four int8 weights; each weight is broadcast to all NROWS
+//              multipliers, which each pair it with their own A row. One
+//              weight row m takes K cycles and yields NROWS int32 sums.
+//   3. DRAIN   Write row m's NROWS accumulators to memory as one run, then
+//              start the next m.
 //
-// All three streams are purely sequential in memory, which is what the
-// direct-mapped DDR3 last-level cache wants.
+// A, W and C are all read/written sequentially, which suits the direct-
+// mapped DDR3 cache in front of them.
 //
-// Two additions around that core loop (both described in student_gemm.hjson):
+// Two extra features ride on that same loop:
 //
-//   * Row statistics. With S_ADDR set, the drain of weight row m also writes
-//     the {max, min} of its N_ROWS accumulators to S_ADDR + m*8. The
-//     requantisation that follows every GEMM needs exactly that per-row range
-//     to choose the output scale, and used to read the whole accumulator
-//     matrix from DDR3 to find it.
+//   * Row statistics. If S_ADDR is set, DRAIN also writes each row's
+//     {max, min} to S_ADDR + m*8. Requantisation (below) needs exactly that
+//     range; without this it had to re-read the whole result matrix to find
+//     it.
 //
-//   * Requantisation job (CTRL.requant). The accumulator matrix acc[m][n]
-//     (int32) is turned into int16 activations out[n][m] with a per-row
-//     multiplier, shift and bias -- the same arithmetic as the C code, to the
-//     bit. A chunk of up to KMAX/2 rows x NROWS columns is read into the tile
-//     RAM transposed (RAM row = n, word = m), the parameter table into a
-//     small RAM, and the result streams out two int16 per word. This was
-//     ~70 CPU cycles per element -- a third of the frame -- on a core that
-//     retires about one instruction per cycle.
+//   * Requantisation job (CTRL.requant). A second mode that turns the int32
+//     result acc[m][n] into int16 activations out[n][m], applying a
+//     per-row multiplier/shift/bias — the same arithmetic the C code uses,
+//     bit for bit. This used to cost ~70 CPU cycles per element (a third of
+//     the frame); doing it here reads a chunk of the result transposed into
+//     the tile RAM (RAM row = n, word = m, which produces n-major output for
+//     free) and streams two int16 out per cycle.
 //
-// The bus is the limiting resource: one 32-bit TL-UL beat feeds 4*NROWS MACs,
-// so NROWS = 64 (the board setting, see student.sv) needs under 0.1
-// beats/cycle to stay compute-bound -- and the weight matrix is streamed once
-// per tile, so a bigger tile also means fewer passes over it. To get
-// there the read side keeps up to OUTSTANDING requests in flight and
-// reassembles the responses in order via a small reorder buffer indexed by
-// a_source, so it does not pay the full memory latency per beat.
+// The bus, not the multiplier array, is the bottleneck: one 32-bit beat
+// feeds 4*NROWS MACs, so at NROWS=64 (the board setting, see student.sv)
+// the array is starved unless reads are pipelined. To hide DDR3 latency the
+// read side keeps up to OUTSTANDING requests in flight and reassembles
+// their responses in order with a small reorder buffer indexed by the bus
+// source ID.
 //
-// Everything the software contract needs is documented in
+// The register map and software contract are in
 // src/design/reggen/student_gemm.hjson.
 //
 // Where this fits
 // ---------------
 //
-//   src/rtl/student/student.sv          instantiates this block, gives it a
-//                                       register window and a host port
-//   src/design/reggen/student_gemm.hjson the register map (generated into
-//                                       student_gemm_reg_top / _reg_pkg)
-//   src/sw/project/dav2_accel.c         the driver: tiles a GEMM into jobs
-//                                       of NROWS rows and polls STATUS
-//   src/tb/student_gemm_tb.sv           module test against ideal memory
-//   src/tb/student_gemm_ddrpath_tb.sv   same, through the real DDR3 cache
-//   src/tb/student_gemm_droprsp_tb.sv   proves the lost-response retry works
+//   src/rtl/student/student.sv           instantiates this block: register
+//                                        window + host bus port
+//   src/design/reggen/student_gemm.hjson the register map (generates
+//                                        student_gemm_reg_top / _reg_pkg)
+//   src/sw/project/dav2_accel.c          the driver: splits a GEMM into
+//                                        NROWS-row jobs, polls STATUS
+//   src/tb/student_gemm_tb.sv            module test, ideal memory
+//   src/tb/student_gemm_ddrpath_tb.sv    same, through the real DDR3 cache
+//   src/tb/student_gemm_droprsp_tb.sv    proves the lost-response retry works
 //
-// Terms used below: a "beat" is one 32-bit transfer on the TL-UL bus; a
-// "tile" is the NROWS activation rows a job processes; "MAC" is one
-// multiply-accumulate; "requantisation" (done in software, not here) scales
-// the int32 accumulators back to int16 activations.
+// Vocabulary: a "beat" is one 32-bit TL-UL transfer; a "tile" is the NROWS
+// rows of A a job processes; "MAC" is one multiply-accumulate;
+// "requantisation" scales int32 accumulators back down to int16 activations.
 
 module student_gemm #(
   // Activation rows held in the tile == multipliers == MACs per cycle.
@@ -82,44 +76,43 @@ module student_gemm #(
   parameter int unsigned KMAX        = 2048,
   // Read requests in flight (also the write-ack credit). Power of two.
   parameter int unsigned OUTSTANDING = 8,
-  // Requests actually allowed in flight at once. student.sv sets this to 1
-  // for the DDR3-facing instance. The reason is the rvlab cache's response
-  // handshake: it pulses d_valid for a single cycle without consulting
-  // d_ready, so a response that arrives while this block is busy with
-  // another is lost. With one request in flight the response can always be
-  // taken the cycle it appears. (An earlier version of this comment blamed
-  // rvlab_ddr_prefetch; that block is now bypassed for an unrelated aliasing
-  // defect, and the cache constraint above still applies.) Against ideal
-  // BRAM the full OUTSTANDING depth works.
+  // Reads actually allowed in flight at once (<= OUTSTANDING). The rvlab
+  // DDR3 cache pulses d_valid for one cycle without checking d_ready, so a
+  // response arriving while this block is busy elsewhere is simply lost.
+  // RETRY_CYCLES below recovers from that, so student.sv now runs this at
+  // the full OUTSTANDING depth (8) instead of forcing 1 as an earlier
+  // version did. Against ideal BRAM (no such loss) it also just wants the
+  // full depth.
   parameter int unsigned MAX_INFLIGHT = OUTSTANDING,
-  // Cycles an outstanding read may go unanswered before it is re-issued. The
-  // rvlab DDR3 cache pulses d_valid for one cycle without consulting d_ready,
-  // so a response can be lost outright -- measured on hardware as
-  // accepted=444, responses=443. Zero disables recovery. Must comfortably
-  // exceed worst-case memory latency so it never fires on a slow-but-live
-  // transaction.
-  // 2048 cycles = 41 us at 50 MHz. Measured on hardware: real work costs
-  // 8.3 cycles/beat, so this leaves a ~250x margin over typical latency and
-  // still far exceeds a miss-plus-refill. The original 65536 was a guess made
-  // before latency could be measured, and cost 383 x 65536 = 25.1M cycles per
-  // tile -- 98% of the tile time -- purely idling before each re-issue.
+  // How long an outstanding read may go unanswered before it is re-issued.
+  // Exists because of the same dropped-response behaviour: measured on
+  // hardware as accepted=444, responses=443 for one job. Zero disables the
+  // recovery.
+  // Must comfortably outlast real memory latency so it never fires on a
+  // transaction that is merely slow. 2048 cycles = 41 us at 50 MHz; hardware
+  // shows 8.3 cycles/beat in normal operation, so this is a ~250x margin.
+  // (The original guess of 65536, made before latency could be measured,
+  // cost 25.1M cycles per tile -- 98% of tile time -- idling before re-issue.)
   parameter int unsigned RETRY_CYCLES = 32'd2048,
-  // DEADLOCKS -- do not enable. Blocking writes while reads are outstanding
-  // hangs in ST_DRAIN: the read engine prefetches weight beats that are only
-  // consumed in ST_MAC, so rb_cnt never falls to zero, so no write can issue,
-  // so ST_DRAIN never completes. Kept only to document the dead end.
+  // Never enable: forcing reads and writes to alternate (never both
+  // outstanding) deadlocks in ST_DRAIN. The read engine prefetches weight
+  // beats that only ST_MAC consumes, so with no read in flight rb_cnt never
+  // reaches zero, so the drain's write can never issue. Kept only so the
+  // dead end stays documented instead of being rediscovered.
   parameter bit          STRICT_SERIAL = 1'b0
 ) (
-  input logic clk_i,
-  input logic rst_ni,
+  input logic clk_i,   // system clock; everything below is synchronous to this edge
+  input logic rst_ni,  // active-low asynchronous reset
 
-  // Register interface (device)
-  input  tlul_pkg::tl_h2d_t tl_i,
-  output tlul_pkg::tl_d2h_t tl_o,
+  // Register interface (device): the CPU's writes/reads of this block's own
+  // registers (addresses, strides, K/M, CTRL, STATUS, ...) land here.
+  input  tlul_pkg::tl_h2d_t tl_i,    // CPU -> block: register requests
+  output tlul_pkg::tl_d2h_t tl_o,    // block -> CPU: register responses
 
-  // Memory interface (host)
-  input  tlul_pkg::tl_d2h_t tl_host_i,
-  output tlul_pkg::tl_h2d_t tl_host_o
+  // Memory interface (host): this block acting as a bus master, reading A
+  // and W and writing C directly, without the CPU's involvement.
+  input  tlul_pkg::tl_d2h_t tl_host_i,  // DDR3 path -> block: read data / write acks
+  output tlul_pkg::tl_h2d_t tl_host_o   // block -> DDR3 path: read/write requests
 );
   import student_gemm_reg_pkg::*;
 
@@ -134,8 +127,8 @@ module student_gemm #(
 
   // ---------------------------------------------------------------- registers
 
-  student_gemm_reg2hw_t reg2hw;
-  student_gemm_hw2reg_t hw2reg;
+  student_gemm_reg2hw_t reg2hw;  // register file -> this block: what the CPU wrote
+  student_gemm_hw2reg_t hw2reg;  // this block -> register file: what the CPU reads back
 
   student_gemm_reg_top reg_top_i (
     .clk_i,
@@ -147,44 +140,49 @@ module student_gemm #(
     .devmode_i('1)
   );
 
-  logic busy_q, done_q, err_q;
-  logic [31:0] cycles_q;
+  logic busy_q, done_q, err_q;  // STATUS bits: job running / job finished / bus error seen
+  logic [31:0] cycles_q;        // cycle counter, running while busy_q, for CYCLES
 
-  assign hw2reg.status.d = {err_q, done_q, busy_q};
-  assign hw2reg.caps.d   = {8'd0, 16'(KMAX), 8'(NROWS)};
-  assign hw2reg.cycles.d = cycles_q;
+  assign hw2reg.status.d = {err_q, done_q, busy_q};        // STATUS register readback
+  assign hw2reg.caps.d   = {8'd0, 16'(KMAX), 8'(NROWS)};   // CAPS: what this instance supports
+  assign hw2reg.cycles.d = cycles_q;                       // CYCLES register readback
 
   logic start_strobe, start_requant;
+  // One-cycle pulse the instant the CPU writes CTRL.start=1: the signal that
+  // kicks the FSM out of ST_IDLE.
   assign start_strobe  = reg2hw.ctrl.start.qe & reg2hw.ctrl.start.q;
+  // Which job to run: 1 = requantisation, 0 = a plain GEMM tile. Only
+  // meaningful the same cycle as start_strobe, so it is latched below.
   assign start_requant = reg2hw.ctrl.requant.q;   // sampled with start
 
   // Configuration snapshot, taken when a job starts so software may reprogram
   // the registers for the next tile while this one runs.
-  logic [31:0]    w_addr_q, c_stride_q;
+  logic [31:0]    w_addr_q;                  // GEMM: base address of the W matrix
+  logic [31:0]    c_stride_q;                // bytes from one output row of C to the next
   logic [31:0]    w_stride_q;                // bytes between W rows, never 0 here
   logic [31:0]    s_addr_q;                  // per-row stats stream (0 = off)
   logic [31:0]    a_addr_q, a_stride_q;      // requant job: acc chunk
-  logic [KCW-1:0] k_len_q;
-  logic [15:0]    m_len_q;
-  logic [NRW-1:0] n_rows_q;
+  logic [KCW-1:0] k_len_q;                   // GEMM: reduction length K, this job
+  logic [15:0]    m_len_q;                   // number of W rows (GEMM) / chunk rows (requant)
+  logic [NRW-1:0] n_rows_q;                  // number of A-tile rows actually in use (<= NROWS)
   logic           stats_en_q;                // s_addr_q != 0, GEMM jobs
 
   // ------------------------------------------------------------- control FSM
 
   typedef enum logic [3:0] {
-    ST_IDLE,
-    ST_LOAD_A,
-    ST_MAC,
-    ST_MAC_TAIL,
-    ST_DRAIN,
-    ST_FINISH,
+    ST_IDLE,       // waiting for CTRL.start
+    ST_LOAD_A,     // reading the A tile into on-chip RAM
+    ST_MAC,        // streaming one row of W, multiply-accumulating into acc_q
+    ST_MAC_TAIL,   // last W beat consumed; draining the MAC pipeline before DRAIN
+    ST_DRAIN,      // writing this row's NROWS accumulators (+ stats) to DDR3
+    ST_FINISH,     // job done; waiting for outstanding writes to be acked
     // requantisation job
     RQ_LOAD_P,     // parameter table -> param RAM
     RQ_LOAD_ACC,   // acc chunk -> tile RAM, transposed
     RQ_OUT         // stream int16 pairs out
   } state_e;
 
-  state_e state_q, state_d;
+  state_e state_q, state_d;  // state_q: current state (registered); state_d: next state
 
   // ---------------------------------------------------------------- bus side
   //
@@ -194,12 +192,14 @@ module student_gemm #(
   // they are rare (NROWS words per weight row) and the read stream has the
   // reorder buffer to absorb the resulting bubble.
 
-  tlul_pkg::tl_h2d_t areq_q;
-  logic              areq_valid_q;
-  logic              load_next;
-  logic              req_accepted;
+  tlul_pkg::tl_h2d_t areq_q;      // the one A-channel request currently presented on the bus
+  logic              areq_valid_q; // areq_q's a_valid bit (kept separate so areq_q itself can hold still)
+  logic              load_next;    // this cycle, replace areq_q with the next request to issue
+  logic              req_accepted; // this cycle's request was accepted (a_valid & a_ready)
 
-
+  // Drive the host (master) port from the one registered request, always
+  // ready to accept a response since every issued request already has a
+  // reserved reorder-buffer or write-credit slot waiting for it.
   always_comb begin
     tl_host_o          = areq_q;
     tl_host_o.a_valid  = areq_valid_q;
@@ -211,38 +211,44 @@ module student_gemm #(
   // Both streams (A tile, then W) are rows of rd_row_beats_q beats each; rows
   // start rd_stride_q bytes apart. With the stride equal to the row length
   // this is one contiguous run, which is the common case.
-  logic [31:0]  rd_addr_q;
+  logic [31:0]  rd_addr_q;       // address of the next read beat to issue
   logic [31:0]  rd_left_q;      // beats not yet requested, all rows
   logic [31:0]  rd_row_base_q;  // first address of the current row
   logic [31:0]  rd_row_beats_q; // beats per row
   logic [31:0]  rd_row_left_q;  // beats left in the current row
   logic [31:0]  rd_stride_q;    // bytes from one row start to the next
-  logic         rd_can_issue;
+  logic         rd_can_issue;   // room in the reorder buffer for one more read, and reads are wanted
 
-  logic [31:0]  rb_data_q [OUTSTANDING];
-  logic         rb_val_q  [OUTSTANDING];
-  logic [SW-1:0] rb_wr_q, rb_rd_q;
+  logic [31:0]  rb_data_q [OUTSTANDING]; // reorder buffer: response data, one slot per outstanding read
+  logic         rb_val_q  [OUTSTANDING]; // reorder buffer: slot holds an answered (not yet popped) beat
+  logic [SW-1:0] rb_wr_q;       // slot a newly issued read will land in (advances on issue_rd)
+  logic [SW-1:0] rb_rd_q;       // slot the consumer reads next (advances on rd_pop)
   logic [CW-1:0] rb_cnt_q;      // issued but not yet consumed
 
   logic         rd_valid;       // next beat, in order, is available
-  logic [31:0]  rd_data;
-  logic         rd_pop;
+  logic [31:0]  rd_data;        // that beat's data
+  logic         rd_pop;         // this cycle, the consumer takes rd_data and advances rb_rd_q
 
   assign rd_valid     = (rb_cnt_q != '0) & rb_val_q[rb_rd_q];
   assign rd_data      = rb_data_q[rb_rd_q];
 
   // Write stream -----------------------------------------------------------
-  logic         wr_req;
-  logic [31:0]  wr_addr, wr_data;
+  // Two producers (the GEMM drain and the requant output stage) share one
+  // write path; only one is active in any given state, so a plain mux picks
+  // between them.
+  logic         wr_req;                 // the active producer has a word ready to write
+  logic [31:0]  wr_addr, wr_data;       // that word's address and data
   logic         drain_wr_req, rq_wr_req;
   logic [31:0]  drain_wr_addr, drain_wr_data, rq_wr_addr, rq_wr_data;
   assign wr_req  = (state_q == RQ_OUT) ? rq_wr_req  : drain_wr_req;
   assign wr_addr = (state_q == RQ_OUT) ? rq_wr_addr : drain_wr_addr;
   assign wr_data = (state_q == RQ_OUT) ? rq_wr_data : drain_wr_data;
   logic [CW-1:0] wr_out_q;      // writes issued without an ack yet
-  logic [SW-1:0] wr_src_q;
+  logic [SW-1:0] wr_src_q;      // a_source to tag the next write with (cycles through OUTSTANDING slots)
 
   logic sel_wr, sel_rd, issue_wr, issue_rd;
+  // sel_wr/sel_rd: this cycle's arbitration winner (write beats read).
+  // issue_wr/issue_rd: sel_* actually turned into a bus request this cycle.
 
   // Lost-response recovery. Every issued read remembers its address in its
   // reorder slot; when the head slot stays empty for RETRY_CYCLES after the
@@ -250,14 +256,16 @@ module student_gemm #(
   // any MAX_INFLIGHT: with several in flight the later responses keep
   // arriving, the head stays empty, issue stops once the slots are full, and
   // the ensuing silence trips the timer.
-  logic [31:0]   rb_addr_q [OUTSTANDING];
-  logic [31:0]   retry_addr;
-  logic [SW-1:0] retry_slot;
+  logic [31:0]   rb_addr_q [OUTSTANDING]; // reorder buffer: the address each outstanding read was sent to
+  logic [31:0]   retry_addr;    // address to re-issue: the oldest outstanding read's
+  logic [SW-1:0] retry_slot;    // its reorder-buffer slot (same as rb_rd_q)
   assign retry_addr = rb_addr_q[rb_rd_q];
   assign retry_slot = rb_rd_q;
-  logic [31:0]   retry_cnt_q;
-  logic          retry_pending_q;
-  logic          sel_retry, issue_retry, retry_expired;
+  logic [31:0]   retry_cnt_q;      // cycles since the last sign of life (response, issue, or empty)
+  logic          retry_pending_q;  // the oldest read has been silent for RETRY_CYCLES; re-issue it
+  logic          sel_retry;        // this cycle's arbitration winner is the retry (highest priority)
+  logic          issue_retry;      // the retry actually went out on the bus this cycle
+  logic          retry_expired;    // retry_cnt_q has reached RETRY_CYCLES
   logic [31:0]   retry_n_q;   // retries performed, for diagnostics
 
   assign retry_expired = (RETRY_CYCLES != 0) & (retry_cnt_q == RETRY_CYCLES);
@@ -299,13 +307,16 @@ module student_gemm #(
   assign issue_rd = load_next & sel_rd;
 
   // Responses --------------------------------------------------------------
-  logic          rsp_rd, rsp_wr;
-  logic [SW-1:0] rsp_slot;
+  logic          rsp_rd;    // this cycle's D-channel response is read data
+  logic          rsp_wr;    // this cycle's D-channel response is a write acknowledgement
+  logic [SW-1:0] rsp_slot;  // which reorder-buffer/write-credit slot it answers (from d_source)
 
   assign rsp_rd   = tl_host_i.d_valid & (tl_host_i.d_opcode == tlul_pkg::AccessAckData);
   assign rsp_wr   = tl_host_i.d_valid & (tl_host_i.d_opcode == tlul_pkg::AccessAck);
   assign rsp_slot = tl_host_i.d_source[SW-1:0];
 
+  // Registers and issues the next A-channel request (read, write or retry),
+  // whichever arbitration picked; see load_next/sel_wr/sel_rd/sel_retry above.
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       areq_q       <= '0;
@@ -341,6 +352,8 @@ module student_gemm #(
   // consumed (rb_cnt_q gates issue), so the three writers below are mutually
   // exclusive per slot.
   for (genvar s = 0; s < int'(OUTSTANDING); s++) begin : gen_rb
+    // Per-slot valid bit: set when that slot's response arrives, cleared
+    // when a new read is issued into it or its data is consumed.
     always_ff @(posedge clk_i or negedge rst_ni) begin
       if (!rst_ni) begin
         rb_val_q[s] <= 1'b0;
@@ -352,6 +365,8 @@ module student_gemm #(
         rb_val_q[s] <= 1'b0;
       end
     end
+    // Per-slot payload: the response data, and the address it was for
+    // (needed only for a retry).
     always_ff @(posedge clk_i) begin
       if (rsp_rd && (rsp_slot == SW'(s))) rb_data_q[s] <= tl_host_i.d_data;
       if (issue_rd && (rb_wr_q == SW'(s))) rb_addr_q[s] <= rd_addr_q;
@@ -360,11 +375,13 @@ module student_gemm #(
 
   // --------------------------------------------------------------- A tile RAM
 
-  logic [AW-1:0]    a_wr_addr, a_rd_addr;
-  logic [31:0]      a_wr_data;
-  logic [NROWS-1:0] a_we;
-  logic [31:0]      a_q [NROWS];
+  logic [AW-1:0]    a_wr_addr, a_rd_addr;  // word address, shared by all NROWS row-RAMs
+  logic [31:0]      a_wr_data;             // data written to whichever row a_we selects
+  logic [NROWS-1:0] a_we;                  // one write-enable bit per row RAM
+  logic [31:0]      a_q [NROWS];           // read output of each row RAM, one cycle after a_rd_addr
 
+  // NROWS independent single-port RAMs, one per activation row of the tile,
+  // so all of them can be read together every cycle during the MAC phase.
   for (genvar r = 0; r < int'(NROWS); r++) begin : gen_arow
     logic [31:0] mem [KWORDS];
     always_ff @(posedge clk_i) begin
@@ -376,7 +393,7 @@ module student_gemm #(
   // ------------------------------------------------------------- A load phase
 
   logic [AW-1:0]  a_ld_word_q;  // word index inside the current row
-  logic [NRW-1:0] a_ld_row_q;
+  logic [NRW-1:0] a_ld_row_q;   // which tile row is currently being filled
   logic [AW-1:0] k_words;       // 32-bit words per activation row
 
   assign k_words = AW'(k_len_q >> 1);
@@ -389,8 +406,14 @@ module student_gemm #(
   assign rq_mlen = AW'(m_len_q);
   logic [1:0]     rq_p_sel_q;   // param load: which of the three words is arriving
   logic [AW-1:0]  rq_p_cnt_q;   // param load: row m being filled
-  logic           rq_p_done, rq_acc_done, rq_out_done, rq_adv;
+  logic           rq_p_done;    // the {mult,shift,bias} table has been fully loaded
+  logic           rq_acc_done;  // the acc chunk has been fully loaded, transposed, into tile RAM
+  logic           rq_out_done;  // every output word has been streamed out and acknowledged
+  logic           rq_adv;       // this cycle, the output pipeline consumes one more element
 
+  // A-tile RAM write side: shared between loading a GEMM's A tile
+  // (ST_LOAD_A, rows in order) and loading a requant chunk transposed
+  // (RQ_LOAD_ACC, row = n instead of the arrival order m).
   assign a_wr_data = rd_data;
   always_comb begin
     a_we      = '0;
@@ -404,20 +427,28 @@ module student_gemm #(
 
   // ---------------------------------------------------------------- MAC phase
 
-  logic [31:0]    wbuf_q;
-  logic           wbuf_val_q;
-  logic [1:0]     wsel_q;
-  logic [KCW-1:0] kcnt_q;
-  logic [15:0]    m_q;
+  logic [31:0]    wbuf_q;      // latest 32-bit W beat (4 packed int8 weights)
+  logic           wbuf_val_q;  // wbuf_q holds a beat not yet fully consumed
+  logic [1:0]     wsel_q;      // which of the 4 bytes in wbuf_q is next
+  logic [KCW-1:0] kcnt_q;      // reduction index k, 0..K-1, within the current W row
+  logic [15:0]    m_q;         // which W row (0..M-1) is currently being processed
 
   logic adv, wlast, klast;
+  // adv:   this cycle a weight byte is consumed and one MAC happens
+  // wlast: wsel_q is on the buffer's last (4th) byte
+  // klast: this is the last k of the current W row
 
   assign adv   = (state_q == ST_MAC) & wbuf_val_q;
   assign wlast = (wsel_q == 2'd3);
   assign klast = adv & (kcnt_q == (k_len_q - 1'b1));
 
+  // A-tile read address: the requant output stage reads row rq_m_q (one
+  // word = one output row m); the MAC phase reads word k/2 of every row.
   assign a_rd_addr = (state_q == RQ_OUT) ? rq_m_q : AW'(kcnt_q >> 1);
 
+  // When to consume the next word from the read stream (rd_pop -> rb_rd_q
+  // advances): every load phase takes one word at a time as it arrives;
+  // ST_MAC only needs a new word once the current one is exhausted.
   always_comb begin
     rd_pop = 1'b0;
     if (state_q == ST_LOAD_A || state_q == RQ_LOAD_P || state_q == RQ_LOAD_ACC) begin
@@ -429,7 +460,7 @@ module student_gemm #(
     end
   end
 
-  logic signed [7:0] wbyte;
+  logic signed [7:0] wbyte;  // the one weight byte wsel_q currently selects out of wbuf_q
   always_comb begin
     case (wsel_q)
       2'd0:    wbyte = $signed(wbuf_q[7:0]);
@@ -443,12 +474,12 @@ module student_gemm #(
   //   s0  present the A-tile read address (combinational from kcnt_q)
   //   s1  A word arrives; select the half addressed by k[0]
   //   s2  multiply-accumulate (maps onto a DSP48E1 with A/B/P registers)
-  logic              v_s1, v_s2;
-  logic              ksel_s1;
-  logic signed [7:0] w_s1, w_s2;
-  logic signed [15:0] a_s2 [NROWS];
-  logic signed [31:0] acc_q [NROWS];
-  logic              acc_clr;
+  logic              v_s1, v_s2;   // valid bit for pipeline stage s1 / s2 (adv delayed by 1 / 2 cycles)
+  logic              ksel_s1;      // s1: which 16-bit half of the A word this k selects (k[0])
+  logic signed [7:0] w_s1, w_s2;   // the weight byte, pipelined alongside to reach s1 / s2 together
+  logic signed [15:0] a_s2 [NROWS]; // s2: the A operand for each row, selected by ksel_s1
+  logic signed [31:0] acc_q [NROWS]; // the running sum for each of the NROWS rows (this is C, in progress)
+  logic              acc_clr;        // synchronously clear all NROWS accumulators this cycle
 
   // Only the valid bits are reset. The data registers (weight byte, A
   // operand, accumulator) deliberately have no asynchronous reset: DSP48E1
@@ -457,6 +488,7 @@ module student_gemm #(
   // worth of methodology warnings (DPIR-1) and a longer path. The
   // accumulators are cleared synchronously at job start and after every
   // drain, so they never hold anything a result depends on before then.
+  // Shifts the "a MAC is happening" bit down the pipeline: adv (s0) -> v_s1 -> v_s2.
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       v_s1 <= 1'b0;
@@ -466,12 +498,15 @@ module student_gemm #(
       v_s2 <= v_s1;
     end
   end
+  // Carries which A-half to use, and the weight byte itself, alongside v_s1/v_s2.
   always_ff @(posedge clk_i) begin
     ksel_s1 <= kcnt_q[0];
     w_s1    <= wbyte;
     w_s2    <= w_s1;
   end
 
+  // One multiply-accumulate lane per tile row, replicated NROWS times; each
+  // maps onto one DSP48E1 slice (A/B/P registers = a_s2, w_s2, acc_q).
   for (genvar r = 0; r < int'(NROWS); r++) begin : gen_pe
     always_ff @(posedge clk_i) begin
       a_s2[r] <= ksel_s1 ? $signed(a_q[r][31:16]) : $signed(a_q[r][15:0]);
@@ -491,8 +526,8 @@ module student_gemm #(
   logic [31:0]    c_ptr_q;      // base of the current run
   logic [31:0]    s_ptr_q;      // where this row's {max, min} go
   logic [NRW:0]   n_wr;         // words to write this drain
-  logic signed [31:0] acc_max_q, acc_min_q;
-  logic           t_is_acc;
+  logic signed [31:0] acc_max_q, acc_min_q;  // running max/min of the accumulators drained so far
+  logic           t_is_acc;     // t_q still indexes an accumulator (vs. the trailing stats words)
 
   assign n_wr     = {1'b0, n_rows_q} + (stats_en_q ? 2 : 0);
   assign t_is_acc = t_q < {1'b0, n_rows_q};
@@ -504,27 +539,29 @@ module student_gemm #(
 
   // ------------------------------------------------------------ state machine
 
-  logic pipe_idle;
+  logic pipe_idle;  // the 2-stage MAC pipeline has fully drained (safe to start DRAIN)
   assign pipe_idle = ~v_s1 & ~v_s2;
 
-  logic a_load_done;
+  logic a_load_done;  // the A tile's last word (last row, last word) has just arrived
   assign a_load_done = rd_valid & (a_ld_row_q == (n_rows_q - 1'b1))
                                 & (a_ld_word_q == (k_words - 1'b1));
 
+  // Next-state logic: each state advances only on its own completion signal,
+  // computed above (a_load_done, klast, pipe_idle, t_q==n_wr, ...).
   always_comb begin
     state_d = state_q;
     unique case (state_q)
-      ST_IDLE:     if (start_strobe)
+      ST_IDLE:     if (start_strobe)              // CPU asked for a job
                      state_d = start_requant ? RQ_LOAD_P : ST_LOAD_A;
-      ST_LOAD_A:   if (a_load_done)              state_d = ST_MAC;
-      ST_MAC:      if (klast)                    state_d = ST_MAC_TAIL;
-      ST_MAC_TAIL: if (pipe_idle)                state_d = ST_DRAIN;
-      ST_DRAIN:    if (t_q == n_wr)
-                     state_d = (m_q == (m_len_q - 1'b1)) ? ST_FINISH : ST_MAC;
-      ST_FINISH:   if (wr_out_q == '0)           state_d = ST_IDLE;
-      RQ_LOAD_P:   if (rq_p_done)                state_d = RQ_LOAD_ACC;
-      RQ_LOAD_ACC: if (rq_acc_done)              state_d = RQ_OUT;
-      RQ_OUT:      if (rq_out_done)              state_d = ST_FINISH;
+      ST_LOAD_A:   if (a_load_done)              state_d = ST_MAC;       // tile fully loaded
+      ST_MAC:      if (klast)                    state_d = ST_MAC_TAIL; // W row fully streamed
+      ST_MAC_TAIL: if (pipe_idle)                state_d = ST_DRAIN;    // pipeline flushed
+      ST_DRAIN:    if (t_q == n_wr)                                     // row's outputs all issued
+                     state_d = (m_q == (m_len_q - 1'b1)) ? ST_FINISH : ST_MAC; // last W row? else next row
+      ST_FINISH:   if (wr_out_q == '0)           state_d = ST_IDLE;     // all writes acked
+      RQ_LOAD_P:   if (rq_p_done)                state_d = RQ_LOAD_ACC; // param table loaded
+      RQ_LOAD_ACC: if (rq_acc_done)              state_d = RQ_OUT;      // acc chunk loaded
+      RQ_OUT:      if (rq_out_done)              state_d = ST_FINISH;   // every output word written
       default:                                   state_d = ST_IDLE;
     endcase
   end
@@ -635,8 +672,14 @@ module student_gemm #(
       // Datapath ---------------------------------------------------------
       if (busy_q) cycles_q <= cycles_q + 32'd1;
 
+      // Per-state datapath actions: this case implements what each state in
+      // the FSM above actually does (as opposed to when it exits).
       unique case (state_q)
         ST_IDLE: begin
+          // Latch every register the job needs (so software is free to
+          // reprogram them for the *next* job as soon as this one starts),
+          // and program the read engine to fetch the first stream: the A
+          // tile for a GEMM, or the parameter table for a requant job.
           if (start_strobe) begin
             w_addr_q   <= reg2hw.w_addr.q;
             c_stride_q <= reg2hw.c_stride.q;
@@ -692,6 +735,8 @@ module student_gemm #(
         end
 
         ST_LOAD_A: begin
+          // Walk a_ld_row_q/a_ld_word_q over the tile as words arrive; once
+          // the last one lands, reprogram the read engine for the W stream.
           if (rd_valid) begin
             if (a_ld_word_q == (k_words - 1'b1)) begin
               a_ld_word_q <= '0;
@@ -713,6 +758,9 @@ module student_gemm #(
         end
 
         ST_MAC: begin
+          // Advance the byte selector through wbuf_q, refilling it from the
+          // read stream every 4th byte; reset k and the drain index when
+          // the row's last k has been consumed.
           if (adv) begin
             kcnt_q <= kcnt_q + 1'b1;
             if (wlast) begin
@@ -734,6 +782,8 @@ module student_gemm #(
         end
 
         ST_DRAIN: begin
+          // Track max/min as accumulators go out (for the trailing stats
+          // words), and advance to the next W row once this run is done.
           if (issue_wr) begin
             t_q <= t_q + 1'b1;
             if (t_is_acc) begin
@@ -753,6 +803,9 @@ module student_gemm #(
 
         // ---- requantisation job -------------------------------------------
         RQ_LOAD_P: begin
+          // Walk rq_p_sel_q/rq_p_cnt_q over the incoming {mult,shift,bias}
+          // words; once the last row's triple has arrived, reprogram the
+          // read engine to fetch the acc chunk next.
           if (rd_valid) begin
             // words arrive mult, shift, bias for row 0, then row 1, ...
             if (rq_p_sel_q == 2'd2) begin
@@ -776,6 +829,8 @@ module student_gemm #(
         end
 
         RQ_LOAD_ACC: begin
+          // Walk rq_m_q (row, outer) / rq_n_q (column, inner) over the
+          // incoming acc words, matching the write-side transpose above.
           if (rd_valid) begin
             if (rq_n_q == n_rows_q - 1'b1) begin
               rq_n_q <= '0;
@@ -791,7 +846,8 @@ module student_gemm #(
         end
 
         RQ_OUT: begin
-          // advance one element per cycle while the output path has room
+          // Walk rq_m_q (inner) / rq_n_q (outer) over the output elements,
+          // one per cycle while the output path has room (rq_adv).
           if (rq_adv) begin
             if (rq_m_q == rq_mlen - 1'b1) begin
               rq_m_q <= '0;
@@ -803,6 +859,7 @@ module student_gemm #(
         end
 
         ST_FINISH: begin
+          // Wait for the last outstanding write to be acked, then report done.
           if (wr_out_q == '0) begin
             busy_q <= 1'b0;
             done_q <= 1'b1;
@@ -819,10 +876,12 @@ module student_gemm #(
   // Parameter RAM: {mult, shift, bias} per row m of the chunk, filled by
   // RQ_LOAD_P from the read stream. KWORDS entries, matching the tile RAM's
   // words per row, which is what bounds a chunk's M_LEN.
-  logic [31:0]    pm_mult [KWORDS];
-  logic [5:0]     pm_shift[KWORDS];
-  logic [31:0]    pm_bias [KWORDS];
+  logic [31:0]    pm_mult [KWORDS];   // per-row multiplier, indexed by output row m
+  logic [5:0]     pm_shift[KWORDS];   // per-row right-shift amount
+  logic [31:0]    pm_bias [KWORDS];   // per-row bias, added after the shift
 
+  // Demultiplex the incoming words into the three parameter RAMs, in the
+  // order they arrive: mult, shift, bias, for row 0, then row 1, ...
   always_ff @(posedge clk_i) begin
     if ((state_q == RQ_LOAD_P) && rd_valid) begin
       unique case (rq_p_sel_q)
@@ -833,8 +892,10 @@ module student_gemm #(
     end
   end
 
+  // rq_p_done: the last row's bias word has just arrived.
   assign rq_p_done   = (state_q == RQ_LOAD_P) & rd_valid
                      & (rq_p_sel_q == 2'd2) & (rq_p_cnt_q == rq_mlen - 1'b1);
+  // rq_acc_done: the acc chunk's last word (last row, last column) has just arrived.
   assign rq_acc_done = (state_q == RQ_LOAD_ACC) & rd_valid
                      & (rq_n_q == n_rows_q - 1'b1) & (rq_m_q == rq_mlen - 1'b1);
 
@@ -851,22 +912,31 @@ module student_gemm #(
   localparam int unsigned RQ_STAGES = 7;
   localparam int unsigned RQ_FIFO_D = 16;
 
-  logic               rq_v1, rq_v2, rq_v3, rq_v4, rq_v5, rq_v6;
-  logic               rq_last1, rq_last2, rq_last3, rq_last4, rq_last5, rq_last6;
-  logic               rq_odd1, rq_odd2, rq_odd3, rq_odd4, rq_odd5, rq_odd6;
-  logic [NRW-1:0]     rq_row1;
-  logic signed [31:0] rq_acc1, rq_mult1, rq_bias1, rq_bias2, rq_bias3, rq_bias4, rq_bias5;
-  logic [5:0]         rq_sh1, rq_sh2, rq_sh3, rq_sh4;
-  logic signed [63:0] rq_prod2, rq_prod3, rq_rnd4, rq_shf5;
-  logic signed [31:0] rq_val6;
+  // Naming convention: a signal suffixed N holds the value valid at pipeline
+  // stage qN (see the stage table above) — it is the same quantity shifted
+  // one register further along each cycle, so only its first appearance is
+  // commented below.
+  logic               rq_v1, rq_v2, rq_v3, rq_v4, rq_v5, rq_v6;  // "an element is live here"
+  logic               rq_last1, rq_last2, rq_last3, rq_last4, rq_last5, rq_last6;  // "this is the very last element"
+  logic               rq_odd1, rq_odd2, rq_odd3, rq_odd4, rq_odd5, rq_odd6;  // "this element is the odd (2nd) one of its output pair"
+  logic [NRW-1:0]     rq_row1;      // tile-RAM row n this element reads (q1)
+  logic signed [31:0] rq_acc1;      // the raw int32 accumulator value read for this element
+  logic signed [31:0] rq_mult1, rq_bias1, rq_bias2, rq_bias3, rq_bias4, rq_bias5;  // this row's multiplier / bias, carried alongside
+  logic [5:0]         rq_sh1, rq_sh2, rq_sh3, rq_sh4;  // this row's shift amount, carried alongside
+  logic signed [63:0] rq_prod2;     // acc * mult (q2, the DSP product)
+  logic signed [63:0] rq_prod3;     // rq_prod2 re-registered (keeps the DSP's own output register)
+  logic signed [63:0] rq_rnd4;      // rq_prod3 plus the rounding constant (q4)
+  logic signed [63:0] rq_shf5;      // rq_rnd4 shifted right by the row's shift amount (q5)
+  logic signed [31:0] rq_val6;      // final int16-ish value after bias + saturation (q6)
   logic [15:0]        rq_prev_q;          // even element, waiting for its pair
   logic [31:0]        rq_out_ptr_q;       // address of the next output word
   logic [31:0]        rq_row_ptr_q;       // start of the current output row
 
   // stage 0 -> 1
-  logic rq_last_elem;
+  logic rq_last_elem;  // the element about to enter the pipeline (q0) is the very last one
   assign rq_last_elem = (rq_n_q == n_rows_q - 1'b1) & (rq_m_q == rq_mlen - 1'b1);
 
+  // Shifts "an element is live" down the 6-cycle pipeline, one stage per cycle.
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       rq_v1 <= 1'b0; rq_v2 <= 1'b0; rq_v3 <= 1'b0;
@@ -930,10 +1000,11 @@ module student_gemm #(
 
   // Output FIFO and write issue. rq_out_ptr_q walks the output row: +4 per
   // pair, and jumps to the next row (C_STRIDE further) after the last pair.
-  logic [63:0] rq_fifo [RQ_FIFO_D];
-  logic [$clog2(RQ_FIFO_D)-1:0] rq_fifo_wr_q, rq_fifo_rd_q;
-  logic [$clog2(RQ_FIFO_D):0]   rq_fifo_cnt_q;
-  logic        rq_fifo_pop;
+  logic [63:0] rq_fifo [RQ_FIFO_D];    // queued {address, data} output words, awaiting the bus
+  logic [$clog2(RQ_FIFO_D)-1:0] rq_fifo_wr_q;  // next slot to fill
+  logic [$clog2(RQ_FIFO_D)-1:0] rq_fifo_rd_q;  // next slot to write out
+  logic [$clog2(RQ_FIFO_D):0]   rq_fifo_cnt_q; // words currently queued
+  logic        rq_fifo_pop;    // this cycle, the queued word at rq_fifo_rd_q is issued on the bus
   logic        rq_drained_q;    // every element has been enqueued
 
   assign rq_wr_req  = (rq_fifo_cnt_q != '0);
@@ -1003,8 +1074,12 @@ module student_gemm #(
   // writing back a line with data one cycle stale (fixed there). The counters
   // stay because "did the block issue every write it owed" is a question
   // worth being able to answer in one register read.
-  logic [31:0] acc_cnt_q, rsp_cnt_q;
-  logic [15:0] wr_issue_cnt_q, wr_ack_cnt_q;
+  logic [31:0] acc_cnt_q;  // A-channel requests accepted this job (reads + writes + retries)
+  logic [31:0] rsp_cnt_q;  // D-channel responses seen this job (reads + write acks)
+  logic [15:0] wr_issue_cnt_q;  // writes issued this job
+  logic [15:0] wr_ack_cnt_q;    // write acks received this job
+  // All four reset to 0 at the start of every job, so they read out as
+  // "this job's" counts rather than a running total.
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       acc_cnt_q      <= '0;
@@ -1024,21 +1099,25 @@ module student_gemm #(
     end
   end
 
+  // DBG: a live snapshot of what the FSM is doing/waiting on right now.
   assign hw2reg.dbg.d  = {rd_left_q[15:0], err_q, tl_host_i.d_valid,
                           tl_host_i.a_ready, areq_valid_q,
                           4'(wr_out_q), 4'(rb_cnt_q), 4'(state_q)};
+  // DBG2: writes {issued, acked} for the job just finished.
   // dbg2 used to expose areq_q.a_address; the write counters are worth more.
   assign hw2reg.dbg2.d = {wr_issue_cnt_q, wr_ack_cnt_q};
+  // DBG3: A-channel requests accepted this job.
   assign hw2reg.dbg3.d = acc_cnt_q;
+  // DBG4: {retries performed (all-time), D-channel responses this job}.
   assign hw2reg.dbg4.d = {retry_n_q[15:0], rsp_cnt_q[15:0]};
 
 `ifndef SYNTHESIS
   // Simulation-only stall watchdog. If the block is busy but nothing has
   // moved for a long time, dump what it is waiting on.
-  logic [OUTSTANDING-1:0] rb_val_packed;
+  logic [OUTSTANDING-1:0] rb_val_packed;  // rb_val_q as one vector, for a single %b in $display
   always_comb for (int i = 0; i < int'(OUTSTANDING); i++) rb_val_packed[i] = rb_val_q[i];
 
-  int stall_cnt;
+  int stall_cnt;  // cycles since anything last moved; dumps state once it crosses the threshold
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       stall_cnt <= 0;
@@ -1062,7 +1141,7 @@ module student_gemm #(
   // Simulation-only. The TL-UL sockets push the whole request struct through a
   // prim_fifo_sync whose DataKnown_A assertion fails on any X, but by then the
   // offending field is no longer identifiable. Catch it at the source.
-  logic x_seen_a, x_seen_d;
+  logic x_seen_a, x_seen_d;  // latch so each channel reports its first X only once
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       x_seen_a <= 1'b0;
