@@ -211,7 +211,7 @@ no floating-point hardware.
 <line x1="390" y1="100" x2="480" y2="100" marker-end="url(#ah2)"/>
 <line x1="390" y1="255" x2="480" y2="255" marker-end="url(#ah2)" stroke-dasharray="5 3"/>
 <line x1="680" y1="200" x2="730" y2="200" marker-end="url(#ah2)"/>
-<path d="M785 250 L785 385 L85 385 L85 360" marker-end="url(#ah2)"/>
+<path d="M785 250 L785 385 L180 385 L180 340 L152 340" marker-end="url(#ah2)"/>
 </g>
 <g fill="currentColor">
 <text x="85" y="65" text-anchor="middle" font-weight="600">DDR3</text>
@@ -240,8 +240,9 @@ no floating-point hardware.
 <text x="785" y="175" text-anchor="middle" font-weight="600">drain</text>
 <text x="785" y="200" text-anchor="middle" font-size="11">64 results</text>
 <text x="785" y="215" text-anchor="middle" font-size="11">per W row</text>
-<text x="785" y="235" text-anchor="middle" font-size="11">→ C column + {max,min}</text>
-<text x="435" y="375" text-anchor="middle" font-size="11">write C[m][0..63] to DDR3</text>
+<text x="785" y="230" text-anchor="middle" font-size="11">→ C column</text>
+<text x="785" y="244" text-anchor="middle" font-size="11">+ {max, min}</text>
+<text x="480" y="378" text-anchor="middle" font-size="11">write C[m][0..63] (and {max,min}) back to DDR3</text>
 </g>
 </svg>
 <figcaption>Reuse is the whole idea: 64 rows of A are loaded once and held on-chip, then every weight row streams past all 64 at once. Each int8 weight is multiplied against 64 activations the cycle it arrives, so the weight — the dominant memory traffic — crosses the bus once per tile: twice for the encoder's 82 tokens.</figcaption>

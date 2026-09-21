@@ -59,6 +59,10 @@ How it works
 
 ![Accelerator architecture](img/accelerator.svg)
 
+The complete computation of one frame — who does what, in what order, on
+which memory, and what runs concurrently — is drawn step by step in
+`docs/DATAFLOW.md` §3 (`img/flow.png` is the same figure as a picture).
+
 **Software** (`src/sw/project/`) — ~2000 lines of C, freestanding. Weights are
 int8 with a per-output-channel scale, activations int16 at 14 bits, and each
 scale is pre-baked into a gemmlowp-style `(multiplier, shift)` pair so the
@@ -102,7 +106,7 @@ Documentation
 -------------
 
     docs/ARCHITECTURE.md   the SoC, the memory map, the accelerator, the DDR3 path — with diagrams
-    docs/DATAFLOW.md       timing diagrams: the bus handshake, one inference, the write-back bug
+    docs/DATAFLOW.md       timing diagrams and the complete numbered flow of one frame (who does what, on which memory, what overlaps)
     docs/DEBUGGING.md      every defect: symptom, wrong theories, instrument, fix, verification
     docs/DDR3_FOR_BEGINNERS.md  the three memory bugs told from scratch, no DDR3 knowledge assumed
     docs/LESSONS.md        portable rules for the next project
