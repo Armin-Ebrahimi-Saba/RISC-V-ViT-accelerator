@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 240" role="img" aria-label="Data flow of the watchdog diagnosis: the CPU is wedged and cannot be halted, but the debug module reads memory over the bus directly; the watchdog register on the DDR3 port has latched the oldest unanswered request, and reading it over JTAG names the stalled address, opcode and master." style="font-family:system-ui,sans-serif;font-size:12px">
+<rect width="100%" height="100%" fill="#fff"/><defs><marker id="ah4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#222"/></marker></defs>
+<g fill="none" stroke="#222" stroke-width="1.4">
+<rect x="20" y="40" width="120" height="60" rx="6" stroke-dasharray="5 3"/>
+<rect x="20" y="140" width="120" height="60" rx="6"/>
+<rect x="260" y="90" width="120" height="60" rx="6"/>
+<rect x="480" y="90" width="150" height="60" rx="6"/>
+<rect x="660" y="90" width="80" height="60" rx="6"/>
+<line x1="140" y1="70" x2="260" y2="110" stroke-dasharray="5 3"/>
+<line x1="140" y1="170" x2="260" y2="130" marker-end="url(#ah4)" stroke="#2b8a3e" stroke-width="2"/>
+<line x1="380" y1="120" x2="480" y2="120" marker-end="url(#ah4)" stroke="#2b8a3e" stroke-width="2"/>
+<line x1="630" y1="120" x2="660" y2="120" marker-end="url(#ah4)"/>
+</g>
+<g fill="#222">
+<text x="80" y="65" text-anchor="middle" font-weight="600">CPU</text>
+<text x="80" y="83" text-anchor="middle" font-size="11">wedged; halt ignored</text>
+<text x="80" y="165" text-anchor="middle" font-weight="600">Debug module</text>
+<text x="80" y="183" text-anchor="middle" font-size="11">sysbus read, via JTAG</text>
+<text x="320" y="115" text-anchor="middle" font-weight="600">crossbar</text>
+<text x="320" y="133" text-anchor="middle" font-size="11">still routing</text>
+<text x="555" y="112" text-anchor="middle" font-weight="600">watchdog reg</text>
+<text x="555" y="128" text-anchor="middle" font-size="11">latched: addr, opcode,</text>
+<text x="555" y="142" text-anchor="middle" font-size="11">master id, stall cycles</text>
+<text x="700" y="115" text-anchor="middle" font-size="11">DDR3</text>
+<text x="700" y="130" text-anchor="middle" font-size="11">port</text>
+<text x="200" y="78" text-anchor="middle" font-size="11">no answer</text>
+<text x="380" y="220" text-anchor="middle" font-size="11" fill="#2b8a3e">a read the CPU never has to execute</text>
+</g>
+</svg>

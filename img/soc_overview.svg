@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 470" role="img" aria-label="SoC block diagram: four bus masters on the left feed a crossbar, which routes to four device ports on the right; the accelerator is both a device and a master" style="font-family:system-ui,sans-serif;font-size:12px">
+<rect width="100%" height="100%" fill="#fff"/><defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#222"/></marker></defs>
+<g fill="none" stroke="#222" stroke-width="1.4">
+<!-- masters -->
+<rect x="20" y="40" width="150" height="110" rx="6"/>
+<rect x="20" y="180" width="150" height="60" rx="6"/>
+<rect x="20" y="270" width="150" height="110" rx="6"/>
+<!-- crossbar -->
+<rect x="260" y="40" width="120" height="340" rx="6"/>
+<!-- devices -->
+<rect x="470" y="40" width="150" height="60" rx="6"/>
+<rect x="470" y="120" width="150" height="60" rx="6"/>
+<rect x="470" y="200" width="150" height="60" rx="6"/>
+<rect x="470" y="280" width="150" height="100" rx="6"/>
+<rect x="690" y="200" width="150" height="60" rx="6"/>
+<!-- master -> xbar -->
+<line x1="170" y1="70" x2="260" y2="70" marker-end="url(#ah)"/>
+<line x1="170" y1="120" x2="260" y2="120" marker-end="url(#ah)"/>
+<line x1="170" y1="210" x2="260" y2="210" marker-end="url(#ah)"/>
+<!-- xbar -> devices -->
+<line x1="380" y1="70" x2="470" y2="70" marker-end="url(#ah)"/>
+<line x1="380" y1="150" x2="470" y2="150" marker-end="url(#ah)"/>
+<line x1="380" y1="230" x2="470" y2="230" marker-end="url(#ah)"/>
+<line x1="380" y1="310" x2="470" y2="310" marker-end="url(#ah)"/>
+<!-- ddr -> chip -->
+<line x1="620" y1="230" x2="690" y2="230" marker-end="url(#ah)"/>
+<!-- accelerator as master drives the crossbar -->
+<line x1="170" y1="325" x2="260" y2="325" marker-end="url(#ah)" stroke="#d9480f" stroke-width="2"/>
+<!-- the device-side registers and the master-side engine are one block -->
+<path d="M545 380 L545 420 L95 420 L95 380" stroke="#d9480f" stroke-width="2" stroke-dasharray="6 3"/>
+</g>
+<g fill="#222">
+<text x="95" y="62" text-anchor="middle" font-weight="600">CV32E40P</text>
+<text x="95" y="80" text-anchor="middle">RISC-V CPU</text>
+<text x="95" y="103" text-anchor="middle" font-size="11">instruction port</text>
+<text x="95" y="128" text-anchor="middle" font-size="11">data port</text>
+<text x="95" y="203" text-anchor="middle" font-weight="600">Debug module</text>
+<text x="95" y="222" text-anchor="middle" font-size="11">JTAG → system bus</text>
+<text x="95" y="295" text-anchor="middle" font-weight="600">GEMM accelerator</text>
+<text x="95" y="313" text-anchor="middle" font-size="11">(as a bus master)</text>
+<text x="95" y="345" text-anchor="middle" font-size="11">reads A and W,</text>
+<text x="95" y="360" text-anchor="middle" font-size="11">writes C</text>
+<text x="320" y="200" text-anchor="middle" font-weight="600">TL-UL</text>
+<text x="320" y="218" text-anchor="middle" font-weight="600">crossbar</text>
+<text x="320" y="245" text-anchor="middle" font-size="11">4 masters</text>
+<text x="320" y="260" text-anchor="middle" font-size="11">4 devices</text>
+<text x="545" y="65" text-anchor="middle" font-weight="600">BRAM</text>
+<text x="545" y="83" text-anchor="middle" font-size="11">256 kB on-chip, program</text>
+<text x="545" y="145" text-anchor="middle" font-weight="600">Peripherals</text>
+<text x="545" y="163" text-anchor="middle" font-size="11">timer, DDR3 control regs</text>
+<text x="545" y="225" text-anchor="middle" font-weight="600">DDR3 path</text>
+<text x="545" y="243" text-anchor="middle" font-size="11">cache → controller</text>
+<text x="545" y="305" text-anchor="middle" font-weight="600">Student device</text>
+<text x="545" y="323" text-anchor="middle" font-size="11">GEMM accelerator regs</text>
+<text x="545" y="341" text-anchor="middle" font-size="11">DMA regs</text>
+<text x="545" y="365" text-anchor="middle" font-size="11">(as a bus device)</text>
+<text x="765" y="225" text-anchor="middle" font-weight="600">DDR3 chip</text>
+<text x="765" y="243" text-anchor="middle" font-size="11">512 MB, off-chip</text>
+<text x="320" y="440" text-anchor="middle" font-size="11" fill="#d9480f">dashed: the same block — programmed as a device, fetching as a master</text>
+</g>
+</svg>

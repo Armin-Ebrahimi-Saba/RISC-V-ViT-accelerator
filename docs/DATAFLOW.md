@@ -21,45 +21,10 @@ Neither may assume the other. In particular, once `valid` is up the sender
 must keep the data stable until the transfer happens — it may not withdraw or
 change it.
 
-<figure>
-<svg viewBox="0 0 760 300" role="img" aria-label="Timing diagram of a TL-UL request and response. The request handshakes in cycle 3 when a_valid and a_ready are both high; the response handshakes in cycle 6 when d_valid and d_ready are both high. In cycle 5, d_valid is high but d_ready is low, and a compliant device holds the response." style="max-width:100%;height:auto;font-family:ui-monospace,monospace;font-size:12px">
-<g stroke="currentColor" stroke-width="1" opacity="0.25">
-<line x1="140" y1="30" x2="140" y2="280"/><line x1="220" y1="30" x2="220" y2="280"/>
-<line x1="300" y1="30" x2="300" y2="280"/><line x1="380" y1="30" x2="380" y2="280"/>
-<line x1="460" y1="30" x2="460" y2="280"/><line x1="540" y1="30" x2="540" y2="280"/>
-<line x1="620" y1="30" x2="620" y2="280"/><line x1="700" y1="30" x2="700" y2="280"/>
-</g>
-<g fill="currentColor" font-size="11">
-<text x="180" y="24" text-anchor="middle">1</text><text x="260" y="24" text-anchor="middle">2</text>
-<text x="340" y="24" text-anchor="middle">3</text><text x="420" y="24" text-anchor="middle">4</text>
-<text x="500" y="24" text-anchor="middle">5</text><text x="580" y="24" text-anchor="middle">6</text>
-<text x="660" y="24" text-anchor="middle">7</text>
-</g>
-<g fill="none" stroke="currentColor" stroke-width="2">
-<!-- a_valid: high 2..3 -->
-<polyline points="140,80 220,80 220,50 380,50 380,80 700,80"/>
-<!-- a_ready: high 3 -->
-<polyline points="140,125 300,125 300,95 380,95 380,125 700,125"/>
-<!-- d_valid: high 5..6 -->
-<polyline points="140,185 460,185 460,155 620,155 620,185 700,185"/>
-<!-- d_ready: low 5, high 6 -->
-<polyline points="140,230 540,230 540,200 620,200 620,230 700,230"/>
-</g>
-<!-- highlight handshake cycles -->
-<g fill="#2b8a3e" opacity="0.18"><rect x="300" y="40" width="80" height="95"/><rect x="540" y="145" width="80" height="95"/></g>
-<g fill="#d9480f" opacity="0.18"><rect x="460" y="145" width="80" height="95"/></g>
-<g fill="currentColor">
-<text x="20" y="70">a_valid</text>
-<text x="20" y="115">a_ready</text>
-<text x="20" y="175">d_valid</text>
-<text x="20" y="220">d_ready</text>
-<text x="340" y="150" text-anchor="middle" font-size="11" fill="#2b8a3e">request taken</text>
-<text x="580" y="255" text-anchor="middle" font-size="11" fill="#2b8a3e">response taken</text>
-<text x="500" y="270" text-anchor="middle" font-size="11" fill="#d9480f">must hold</text>
-</g>
-</svg>
-<figcaption>Cycle 3: the request transfers. Cycle 5: the device offers a response but the receiver is not ready, so the device must keep offering it. Cycle 6: it transfers. The platform cache did not hold — it dropped the response after cycle 5 — and that single omission is the "d_ready defect" the accelerator's retry timer exists to survive.</figcaption>
-</figure>
+![Timing diagram of a TL-UL request and response. The request handshakes in cycle 3 when a_valid and a_ready are both high; the response handshakes in cycle 6 when d_valid and d_ready are both high. In cycle 5, d_valid is high but d_ready is low, and a compliant device holds the response.](../img/tlul_handshake.svg)
+
+*Cycle 3: the request transfers. Cycle 5: the device offers a response but the receiver is not ready, so the device must keep offering it. Cycle 6: it transfers. The platform cache did not hold — it dropped the response after cycle 5 — and that single omission is the "d_ready defect" the accelerator's retry timer exists to survive.*
+
 
 What each of the three fixed bugs did to this picture:
 
@@ -78,66 +43,10 @@ What each of the three fixed bugs did to this picture:
 
 Wall-clock view of a single frame on the board. Total 94 s; 50 MHz clock.
 
-<figure>
-<svg viewBox="0 0 860 330" role="img" aria-label="Gantt-style timeline of one inference: weight load over JTAG about 66 seconds, patch embedding under a second, twelve transformer blocks about 0.7 seconds each, DPT head about five seconds. Within each block, GEMMs and requantisation run on the accelerator and the element-wise work on the CPU." style="max-width:100%;height:auto;font-family:system-ui,sans-serif;font-size:12px">
-<g fill="none" stroke="currentColor" stroke-width="1.2">
-<line x1="60" y1="70" x2="840" y2="70"/>
-<line x1="60" y1="66" x2="60" y2="74"/><line x1="703" y1="66" x2="703" y2="74"/>
-<line x1="708" y1="66" x2="708" y2="74"/><line x1="793" y1="66" x2="793" y2="74"/>
-<line x1="840" y1="66" x2="840" y2="74"/>
-</g>
-<g fill="currentColor" font-size="11">
-<text x="60" y="58" text-anchor="middle">0 s</text>
-<text x="703" y="58" text-anchor="middle">66 s</text>
-<text x="793" y="58" text-anchor="middle">75 s</text>
-<text x="840" y="58" text-anchor="middle">80 s</text>
-</g>
-<!-- phase bars -->
-<rect x="60" y="85" width="643" height="26" rx="3" fill="currentColor" opacity="0.15"/>
-<rect x="703" y="85" width="5" height="26" rx="3" fill="#d9480f"/>
-<rect x="708" y="85" width="85" height="26" rx="3" fill="#1c7ed6" opacity="0.6"/>
-<rect x="793" y="85" width="47" height="26" rx="3" fill="#2b8a3e" opacity="0.6"/>
-<g fill="currentColor" font-size="11">
-<text x="380" y="102" text-anchor="middle">weight load, JTAG, 0.37 MB/s — once per session</text>
-<text x="750" y="102" text-anchor="middle" fill="#fff">12 blocks</text>
-<text x="816" y="102" text-anchor="middle" fill="#fff" font-size="10">head</text>
-<text x="705" y="130" text-anchor="middle" fill="#d9480f">patch embed</text>
-</g>
-<!-- zoom into one block -->
-<g fill="none" stroke="currentColor" stroke-width="1" stroke-dasharray="3 3">
-<line x1="708" y1="111" x2="60" y2="170"/><line x1="715" y1="111" x2="840" y2="170"/>
-</g>
-<g fill="currentColor" font-size="11"><text x="450" y="160" text-anchor="middle">one block, ≈0.7 s (was ≈5 s)</text></g>
-<g fill="none" stroke="currentColor" stroke-width="1.2"><line x1="60" y1="185" x2="840" y2="185"/></g>
-<!-- block internals: attention then MLP; each has GEMMs (accel) and CPU work -->
-<rect x="60" y="195" width="60" height="22" rx="3" fill="currentColor" opacity="0.2"/>
-<rect x="120" y="195" width="110" height="22" rx="3" fill="#1c7ed6" opacity="0.7"/>
-<rect x="230" y="195" width="140" height="22" rx="3" fill="currentColor" opacity="0.2"/>
-<rect x="370" y="195" width="60" height="22" rx="3" fill="#1c7ed6" opacity="0.7"/>
-<rect x="430" y="195" width="60" height="22" rx="3" fill="currentColor" opacity="0.2"/>
-<rect x="490" y="195" width="130" height="22" rx="3" fill="#1c7ed6" opacity="0.7"/>
-<rect x="620" y="195" width="80" height="22" rx="3" fill="currentColor" opacity="0.2"/>
-<rect x="700" y="195" width="140" height="22" rx="3" fill="#1c7ed6" opacity="0.7"/>
-<g fill="currentColor" font-size="10">
-<text x="90" y="210" text-anchor="middle">norm</text>
-<text x="175" y="210" text-anchor="middle" fill="#fff">qkv GEMM</text>
-<text x="300" y="210" text-anchor="middle">attention (CPU + accel)</text>
-<text x="400" y="210" text-anchor="middle" fill="#fff">proj</text>
-<text x="460" y="210" text-anchor="middle">norm</text>
-<text x="555" y="210" text-anchor="middle" fill="#fff">fc1 GEMM</text>
-<text x="660" y="210" text-anchor="middle">GELU</text>
-<text x="770" y="210" text-anchor="middle" fill="#fff">fc2 GEMM</text>
-</g>
-<g fill="currentColor" font-size="11">
-<text x="60" y="250">Blue = on the accelerator: every matrix multiply, and the requantisation that turns its int32 output back</text>
-<text x="60" y="266">into int16. Grey = element-wise work on the CPU: LayerNorm, the attention softmax and gathers, GELU, adds.</text>
-<text x="60" y="292">The model's own time is 14.2 s per frame (it was 93.6 s — see PERFORMANCE.md), of which 8.7 s is the</text>
-<text x="60" y="308">12 blocks and 5 s the DPT head. The weight load is not part of a frame: it happens once per session,</text>
-<text x="60" y="324">after which images go in over JTAG in 0.3 s and depth maps come out in 0.7 s.</text>
-</g>
-</svg>
-<figcaption>The JTAG weight load dominates the wall clock but is a one-time setup cost. Inside the model, every block alternates accelerator jobs (GEMM, requantisation) with CPU element-wise work; after the speed-up the two are of similar size.</figcaption>
-</figure>
+![Gantt-style timeline of one inference: weight load over JTAG about 66 seconds, patch embedding under a second, twelve transformer blocks about 0.7 seconds each, DPT head about five seconds. Within each block, GEMMs and requantisation run on the accelerator and the element-wise work on the CPU.](../img/inference_timeline.svg)
+
+*The JTAG weight load dominates the wall clock but is a one-time setup cost. Inside the model, every block alternates accelerator jobs (GEMM, requantisation) with CPU element-wise work; after the speed-up the two are of similar size.*
+
 
 Terms:
 
@@ -207,61 +116,10 @@ cache (same line index, different tags). The first write misses, is brought
 in, and lands in the cache RAM. The second write misses the same line the
 very next cycle and must evict the first — writing its contents back to DDR3.
 
-<figure>
-<svg viewBox="0 0 860 420" role="img" aria-label="Cycle diagram of the cache write-back bug. In cycle N the first write lands in the data RAM. In cycle N+1 the second write to the same line misses and the cache issues the write-back using data_rdata_raw, which is the RAM's output from before the cycle-N write landed. The forwarded signal data_rdata already had the correct value and was the fix." style="max-width:100%;height:auto;font-family:ui-monospace,monospace;font-size:12px">
-<g stroke="currentColor" stroke-width="1" opacity="0.25">
-<line x1="200" y1="30" x2="200" y2="330"/><line x1="330" y1="30" x2="330" y2="330"/>
-<line x1="460" y1="30" x2="460" y2="330"/><line x1="590" y1="30" x2="590" y2="330"/>
-<line x1="720" y1="30" x2="720" y2="330"/>
-</g>
-<g fill="currentColor" font-size="11">
-<text x="265" y="24" text-anchor="middle">N−1</text><text x="395" y="24" text-anchor="middle">N</text>
-<text x="525" y="24" text-anchor="middle">N+1</text><text x="655" y="24" text-anchor="middle">N+2</text>
-</g>
-<g fill="currentColor" font-size="12">
-<text x="20" y="70">front-end request</text>
-<text x="20" y="120">data RAM write</text>
-<text x="20" y="170">data_rdata_raw</text>
-<text x="20" y="220">data_rdata (fwd)</text>
-<text x="20" y="270">write-back to DDR3</text>
-</g>
-<!-- request row -->
-<rect x="205" y="52" width="120" height="26" rx="3" fill="currentColor" opacity="0.15"/>
-<rect x="335" y="52" width="120" height="26" rx="3" fill="#1c7ed6" opacity="0.5"/>
-<rect x="465" y="52" width="120" height="26" rx="3" fill="#d9480f" opacity="0.5"/>
-<g fill="currentColor" font-size="11">
-<text x="265" y="69" text-anchor="middle">write A (miss)</text>
-<text x="395" y="69" text-anchor="middle">A refilled</text>
-<text x="525" y="69" text-anchor="middle">write B: evict A</text>
-</g>
-<!-- RAM write row -->
-<rect x="335" y="102" width="120" height="26" rx="3" fill="#1c7ed6" opacity="0.5"/>
-<g fill="currentColor" font-size="11"><text x="395" y="119" text-anchor="middle">A's new data lands</text></g>
-<!-- raw row: shows OLD value in N+1 -->
-<rect x="335" y="152" width="120" height="26" rx="3" fill="currentColor" opacity="0.15"/>
-<rect x="465" y="152" width="120" height="26" rx="3" fill="#d9480f" opacity="0.5"/>
-<rect x="595" y="152" width="120" height="26" rx="3" fill="#1c7ed6" opacity="0.5"/>
-<g fill="currentColor" font-size="11">
-<text x="395" y="169" text-anchor="middle">old line</text>
-<text x="525" y="169" text-anchor="middle">STILL old line</text>
-<text x="655" y="169" text-anchor="middle">A's data (too late)</text>
-</g>
-<!-- fwd row: correct in N+1 -->
-<rect x="465" y="202" width="120" height="26" rx="3" fill="#2b8a3e" opacity="0.5"/>
-<g fill="currentColor" font-size="11"><text x="525" y="219" text-anchor="middle">A.s data ✓</text></g>
-<!-- write-back row -->
-<rect x="465" y="252" width="120" height="26" rx="3" fill="#d9480f" opacity="0.5"/>
-<g fill="currentColor" font-size="11"><text x="525" y="269" text-anchor="middle">sends data_rdata_raw</text></g>
-<!-- annotation -->
-<g fill="currentColor" font-size="11">
-<text x="20" y="360">The RAM is read one cycle behind: in N+1, data_rdata_raw still shows what the line held BEFORE</text>
-<text x="20" y="376">cycle N's write. The cache already had a forwarding path (data_rdata) that patches in last cycle's</text>
-<text x="20" y="392">write for exactly this case — it used it for the front-end response but not for the write-back.</text>
-<text x="20" y="410">Fix: one line — the write-back reads data_rdata instead of data_rdata_raw.</text>
-</g>
-</svg>
-<figcaption>Write A, then evict A one cycle later. The eviction reads the RAM before A's write is visible and sends the previous contents to DDR3. A's data is lost. Every lost word on the board was a tile's final write, because that is the write followed immediately by the next tile's first miss to the same line.</figcaption>
-</figure>
+![Cycle diagram of the cache write-back bug. In cycle N the first write lands in the data RAM. In cycle N+1 the second write to the same line misses and the cache issues the write-back using data_rdata_raw, which is the RAM&#x27;s output from before the cycle-N write landed. The forwarded signal data_rdata already had the correct value and was the fix.](../img/writeback_bug.svg)
+
+*Write A, then evict A one cycle later. The eviction reads the RAM before A's write is visible and sends the previous contents to DDR3. A's data is lost. Every lost word on the board was a tile's final write, because that is the write followed immediately by the next tile's first miss to the same line.*
+
 
 Why it hid so long:
 
@@ -287,38 +145,10 @@ point: when the CPU is wedged on a bus access it can never retire, the
 debugger cannot halt it, so the usual "read the program counter" is
 impossible. A hardware register that watches the bus was the way in.
 
-<figure>
-<svg viewBox="0 0 760 240" role="img" aria-label="Data flow of the watchdog diagnosis: the CPU is wedged and cannot be halted, but the debug module reads memory over the bus directly; the watchdog register on the DDR3 port has latched the oldest unanswered request, and reading it over JTAG names the stalled address, opcode and master." style="max-width:100%;height:auto;font-family:system-ui,sans-serif;font-size:12px">
-<defs><marker id="ah4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="currentColor"/></marker></defs>
-<g fill="none" stroke="currentColor" stroke-width="1.4">
-<rect x="20" y="40" width="120" height="60" rx="6" stroke-dasharray="5 3"/>
-<rect x="20" y="140" width="120" height="60" rx="6"/>
-<rect x="260" y="90" width="120" height="60" rx="6"/>
-<rect x="480" y="90" width="150" height="60" rx="6"/>
-<rect x="660" y="90" width="80" height="60" rx="6"/>
-<line x1="140" y1="70" x2="260" y2="110" stroke-dasharray="5 3"/>
-<line x1="140" y1="170" x2="260" y2="130" marker-end="url(#ah4)" stroke="#2b8a3e" stroke-width="2"/>
-<line x1="380" y1="120" x2="480" y2="120" marker-end="url(#ah4)" stroke="#2b8a3e" stroke-width="2"/>
-<line x1="630" y1="120" x2="660" y2="120" marker-end="url(#ah4)"/>
-</g>
-<g fill="currentColor">
-<text x="80" y="65" text-anchor="middle" font-weight="600">CPU</text>
-<text x="80" y="83" text-anchor="middle" font-size="11">wedged; halt ignored</text>
-<text x="80" y="165" text-anchor="middle" font-weight="600">Debug module</text>
-<text x="80" y="183" text-anchor="middle" font-size="11">sysbus read, via JTAG</text>
-<text x="320" y="115" text-anchor="middle" font-weight="600">crossbar</text>
-<text x="320" y="133" text-anchor="middle" font-size="11">still routing</text>
-<text x="555" y="112" text-anchor="middle" font-weight="600">watchdog reg</text>
-<text x="555" y="128" text-anchor="middle" font-size="11">latched: addr, opcode,</text>
-<text x="555" y="142" text-anchor="middle" font-size="11">master id, stall cycles</text>
-<text x="700" y="115" text-anchor="middle" font-size="11">DDR3</text>
-<text x="700" y="130" text-anchor="middle" font-size="11">port</text>
-<text x="200" y="78" text-anchor="middle" font-size="11">no answer</text>
-<text x="380" y="220" text-anchor="middle" font-size="11" fill="#2b8a3e">a read the CPU never has to execute</text>
-</g>
-</svg>
-<figcaption>The CPU's stalled access blocks the CPU, not the bus. The debug module's own bus port still works, so a register that has been watching the DDR3 port can be read out and says which request never came back — from which master, to which address, for how long.</figcaption>
-</figure>
+![Data flow of the watchdog diagnosis: the CPU is wedged and cannot be halted, but the debug module reads memory over the bus directly; the watchdog register on the DDR3 port has latched the oldest unanswered request, and reading it over JTAG names the stalled address, opcode and master.](../img/watchdog_probe.svg)
+
+*The CPU's stalled access blocks the CPU, not the bus. The debug module's own bus port still works, so a register that has been watching the DDR3 port can be read out and says which request never came back — from which master, to which address, for how long.*
+
 
 This is the diagnostic that broke the longest impasse in the project. The
 register (`student_tl_watch.sv`, exposed at `DDR_CTRL0 + 0x4/0x8`) reported

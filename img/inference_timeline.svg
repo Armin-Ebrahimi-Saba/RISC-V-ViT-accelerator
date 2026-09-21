@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 330" role="img" aria-label="Gantt-style timeline of one inference: weight load over JTAG about 66 seconds, patch embedding under a second, twelve transformer blocks about 0.7 seconds each, DPT head about five seconds. Within each block, GEMMs and requantisation run on the accelerator and the element-wise work on the CPU." style="font-family:system-ui,sans-serif;font-size:12px"><rect width="100%" height="100%" fill="#fff"/>
+<g fill="none" stroke="#222" stroke-width="1.2">
+<line x1="60" y1="70" x2="840" y2="70"/>
+<line x1="60" y1="66" x2="60" y2="74"/><line x1="703" y1="66" x2="703" y2="74"/>
+<line x1="708" y1="66" x2="708" y2="74"/><line x1="793" y1="66" x2="793" y2="74"/>
+<line x1="840" y1="66" x2="840" y2="74"/>
+</g>
+<g fill="#222" font-size="11">
+<text x="60" y="58" text-anchor="middle">0 s</text>
+<text x="703" y="58" text-anchor="middle">66 s</text>
+<text x="793" y="58" text-anchor="middle">75 s</text>
+<text x="840" y="58" text-anchor="middle">80 s</text>
+</g>
+<!-- phase bars -->
+<rect x="60" y="85" width="643" height="26" rx="3" fill="#222" opacity="0.15"/>
+<rect x="703" y="85" width="5" height="26" rx="3" fill="#d9480f"/>
+<rect x="708" y="85" width="85" height="26" rx="3" fill="#1c7ed6" opacity="0.6"/>
+<rect x="793" y="85" width="47" height="26" rx="3" fill="#2b8a3e" opacity="0.6"/>
+<g fill="#222" font-size="11">
+<text x="380" y="102" text-anchor="middle">weight load, JTAG, 0.37 MB/s — once per session</text>
+<text x="750" y="102" text-anchor="middle" fill="#fff">12 blocks</text>
+<text x="816" y="102" text-anchor="middle" fill="#fff" font-size="10">head</text>
+<text x="705" y="130" text-anchor="middle" fill="#d9480f">patch embed</text>
+</g>
+<!-- zoom into one block -->
+<g fill="none" stroke="#222" stroke-width="1" stroke-dasharray="3 3">
+<line x1="708" y1="111" x2="60" y2="170"/><line x1="715" y1="111" x2="840" y2="170"/>
+</g>
+<g fill="#222" font-size="11"><text x="450" y="160" text-anchor="middle">one block, ≈0.7 s (was ≈5 s)</text></g>
+<g fill="none" stroke="#222" stroke-width="1.2"><line x1="60" y1="185" x2="840" y2="185"/></g>
+<!-- block internals: attention then MLP; each has GEMMs (accel) and CPU work -->
+<rect x="60" y="195" width="60" height="22" rx="3" fill="#222" opacity="0.2"/>
+<rect x="120" y="195" width="110" height="22" rx="3" fill="#1c7ed6" opacity="0.7"/>
+<rect x="230" y="195" width="140" height="22" rx="3" fill="#222" opacity="0.2"/>
+<rect x="370" y="195" width="60" height="22" rx="3" fill="#1c7ed6" opacity="0.7"/>
+<rect x="430" y="195" width="60" height="22" rx="3" fill="#222" opacity="0.2"/>
+<rect x="490" y="195" width="130" height="22" rx="3" fill="#1c7ed6" opacity="0.7"/>
+<rect x="620" y="195" width="80" height="22" rx="3" fill="#222" opacity="0.2"/>
+<rect x="700" y="195" width="140" height="22" rx="3" fill="#1c7ed6" opacity="0.7"/>
+<g fill="#222" font-size="10">
+<text x="90" y="210" text-anchor="middle">norm</text>
+<text x="175" y="210" text-anchor="middle" fill="#fff">qkv GEMM</text>
+<text x="300" y="210" text-anchor="middle">attention (CPU + accel)</text>
+<text x="400" y="210" text-anchor="middle" fill="#fff">proj</text>
+<text x="460" y="210" text-anchor="middle">norm</text>
+<text x="555" y="210" text-anchor="middle" fill="#fff">fc1 GEMM</text>
+<text x="660" y="210" text-anchor="middle">GELU</text>
+<text x="770" y="210" text-anchor="middle" fill="#fff">fc2 GEMM</text>
+</g>
+<g fill="#222" font-size="11">
+<text x="60" y="250">Blue = on the accelerator: every matrix multiply, and the requantisation that turns its int32 output back</text>
+<text x="60" y="266">into int16. Grey = element-wise work on the CPU: LayerNorm, the attention softmax and gathers, GELU, adds.</text>
+<text x="60" y="292">The model's own time is 14.2 s per frame (it was 93.6 s — see PERFORMANCE.md), of which 8.7 s is the</text>
+<text x="60" y="308">12 blocks and 5 s the DPT head. The weight load is not part of a frame: it happens once per session,</text>
+<text x="60" y="324">after which images go in over JTAG in 0.3 s and depth maps come out in 0.7 s.</text>
+</g>
+</svg>

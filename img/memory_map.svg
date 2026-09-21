@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 700 300" role="img" aria-label="Memory map: BRAM at 0x0000_0000, peripherals around 0x1F00_0000, accelerator registers at 0x2001_0000, and DDR3 from 0x8000_0000 holding the weight blob, then the image-in and depth-out slots, then the activation arena" style="font-family:system-ui,sans-serif;font-size:12px"><rect width="100%" height="100%" fill="#fff"/>
+<g fill="none" stroke="#222" stroke-width="1.4">
+<rect x="20" y="30" width="660" height="40" rx="4"/>
+<rect x="20" y="90" width="660" height="40" rx="4"/>
+<rect x="20" y="150" width="660" height="40" rx="4"/>
+<rect x="20" y="210" width="240" height="70" rx="4"/>
+<rect x="265" y="210" width="170" height="70" rx="4"/>
+<rect x="440" y="210" width="240" height="70" rx="4"/>
+</g>
+<g fill="#222">
+<text x="30" y="55" font-family="ui-monospace,monospace">0x0000_0000</text>
+<text x="180" y="55">BRAM — program, stack, hostio console ring (256 kB)</text>
+<text x="30" y="115" font-family="ui-monospace,monospace">0x1F00_0000</text>
+<text x="180" y="115">peripherals — timer, DDR3 control + watchdog registers</text>
+<text x="30" y="175" font-family="ui-monospace,monospace">0x2001_0000</text>
+<text x="180" y="175">GEMM accelerator registers (student device)</text>
+<text x="30" y="235" font-family="ui-monospace,monospace">0x8000_0000</text>
+<text x="30" y="255" font-weight="600">weight blob, 24.87 MB</text>
+<text x="30" y="272" font-size="11">int8 weights + directory, over JTAG once</text>
+<text x="275" y="228" font-family="ui-monospace,monospace" font-size="11">0x81E0_0000</text>
+<text x="275" y="243" font-size="11">image in, 95 kB</text>
+<text x="275" y="260" font-family="ui-monospace,monospace" font-size="11">0x81F1_0000</text>
+<text x="275" y="275" font-size="11">depth map out, 63 kB</text>
+<text x="450" y="235" font-family="ui-monospace,monospace">0x8200_0000</text>
+<text x="450" y="255" font-weight="600">activation arena, 64 MB</text>
+<text x="450" y="272" font-size="11">bump allocator for intermediate tensors</text>
+</g>
+</svg>

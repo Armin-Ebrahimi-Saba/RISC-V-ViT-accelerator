@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 420" role="img" aria-label="The DDR3 path: crossbar port feeds a request mux, then a write-back cache, then (bypassed) prefetcher, then clock-domain crossing FIFO, block manager, and the UberDDR3 controller and PHY driving the DDR3 chip. Three defects are marked." style="font-family:system-ui,sans-serif;font-size:12px">
+<rect width="100%" height="100%" fill="#fff"/><defs><marker id="ah3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#222"/></marker></defs>
+<g fill="none" stroke="#222" stroke-width="1.4">
+<rect x="20" y="120" width="90" height="60" rx="6"/>
+<rect x="150" y="120" width="100" height="60" rx="6"/>
+<rect x="290" y="100" width="130" height="100" rx="6"/>
+<rect x="460" y="120" width="100" height="60" rx="6" stroke-dasharray="6 3"/>
+<rect x="600" y="120" width="80" height="60" rx="6"/>
+<rect x="720" y="120" width="80" height="60" rx="6"/>
+<rect x="830" y="100" width="60" height="100" rx="6"/>
+<line x1="110" y1="150" x2="150" y2="150" marker-end="url(#ah3)"/>
+<line x1="250" y1="150" x2="290" y2="150" marker-end="url(#ah3)"/>
+<line x1="420" y1="150" x2="460" y2="150" marker-end="url(#ah3)"/>
+<line x1="560" y1="150" x2="600" y2="150" marker-end="url(#ah3)"/>
+<line x1="680" y1="150" x2="720" y2="150" marker-end="url(#ah3)"/>
+<line x1="800" y1="150" x2="830" y2="150" marker-end="url(#ah3)"/>
+<!-- bypass around prefetch -->
+<path d="M420 130 Q 510 70 600 130" stroke-dasharray="6 3"/>
+<!-- clock boundary -->
+<line x1="590" y1="60" x2="590" y2="225" stroke-dasharray="3 4"/>
+<!-- defect markers -->
+<circle cx="200" cy="105" r="11" fill="#d9480f" stroke="none"/>
+<circle cx="355" cy="85" r="11" fill="#d9480f" stroke="none"/>
+<circle cx="510" cy="105" r="11" fill="#d9480f" stroke="none"/>
+</g>
+<g fill="#222">
+<text x="65" y="145" text-anchor="middle" font-size="11">crossbar</text>
+<text x="65" y="160" text-anchor="middle" font-size="11">DDR port</text>
+<text x="200" y="145" text-anchor="middle" font-size="11">request</text>
+<text x="200" y="160" text-anchor="middle" font-size="11">mux</text>
+<text x="355" y="130" text-anchor="middle" font-weight="600">cache</text>
+<text x="355" y="150" text-anchor="middle" font-size="11">16 kB, write-back</text>
+<text x="355" y="165" text-anchor="middle" font-size="11">direct-mapped</text>
+<text x="355" y="185" text-anchor="middle" font-size="11">512 × 32-byte lines</text>
+<text x="510" y="145" text-anchor="middle" font-size="11">prefetcher</text>
+<text x="510" y="78" text-anchor="middle" font-size="11">bypass (in use)</text>
+<text x="510" y="160" text-anchor="middle" font-size="11">(bypassed)</text>
+<text x="640" y="145" text-anchor="middle" font-size="11">CDC</text>
+<text x="640" y="160" text-anchor="middle" font-size="11">FIFO</text>
+<text x="760" y="145" text-anchor="middle" font-size="11">block</text>
+<text x="760" y="160" text-anchor="middle" font-size="11">manager</text>
+<text x="860" y="140" text-anchor="middle" font-size="11">UberDDR3</text>
+<text x="860" y="155" text-anchor="middle" font-size="11">ctrl</text>
+<text x="860" y="170" text-anchor="middle" font-size="11">+ PHY</text>
+<text x="590" y="50" text-anchor="middle" font-size="11">50 MHz | 100 MHz</text>
+<text x="200" y="109" text-anchor="middle" font-size="11" fill="#fff" font-weight="700">1</text>
+<text x="355" y="89" text-anchor="middle" font-size="11" fill="#fff" font-weight="700">2</text>
+<text x="510" y="109" text-anchor="middle" font-size="11" fill="#fff" font-weight="700">3</text>
+<text x="20" y="260" font-weight="600" fill="#d9480f">1</text>
+<text x="40" y="260" font-size="12">Request mux took its "ready" from the wrong block, so requests were accepted by nobody. CPU hung, unhaltable.</text>
+<text x="20" y="290" font-weight="600" fill="#d9480f">2</text>
+<text x="40" y="290" font-size="12">Cache wrote back a line's stale contents when that line had been written the cycle before. One word lost per tile.</text>
+<text x="20" y="320" font-weight="600" fill="#d9480f">3</text>
+<text x="40" y="320" font-size="12">Prefetcher returned another address's data when two regions collided in the cache. Bypassed rather than repaired.</text>
+<text x="20" y="360" font-size="12">Also in the cache: it ignores the bus "ready" on responses, so a busy receiver can lose one. Covered by the accelerator's retry timer.</text>
+</g>
+</svg>

@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 300" role="img" aria-label="Timing diagram of a TL-UL request and response. The request handshakes in cycle 3 when a_valid and a_ready are both high; the response handshakes in cycle 6 when d_valid and d_ready are both high. In cycle 5, d_valid is high but d_ready is low, and a compliant device holds the response." style="font-family:ui-monospace,monospace;font-size:12px"><rect width="100%" height="100%" fill="#fff"/>
+<g stroke="#222" stroke-width="1" opacity="0.25">
+<line x1="140" y1="30" x2="140" y2="280"/><line x1="220" y1="30" x2="220" y2="280"/>
+<line x1="300" y1="30" x2="300" y2="280"/><line x1="380" y1="30" x2="380" y2="280"/>
+<line x1="460" y1="30" x2="460" y2="280"/><line x1="540" y1="30" x2="540" y2="280"/>
+<line x1="620" y1="30" x2="620" y2="280"/><line x1="700" y1="30" x2="700" y2="280"/>
+</g>
+<g fill="#222" font-size="11">
+<text x="180" y="24" text-anchor="middle">1</text><text x="260" y="24" text-anchor="middle">2</text>
+<text x="340" y="24" text-anchor="middle">3</text><text x="420" y="24" text-anchor="middle">4</text>
+<text x="500" y="24" text-anchor="middle">5</text><text x="580" y="24" text-anchor="middle">6</text>
+<text x="660" y="24" text-anchor="middle">7</text>
+</g>
+<g fill="none" stroke="#222" stroke-width="2">
+<!-- a_valid: high 2..3 -->
+<polyline points="140,80 220,80 220,50 380,50 380,80 700,80"/>
+<!-- a_ready: high 3 -->
+<polyline points="140,125 300,125 300,95 380,95 380,125 700,125"/>
+<!-- d_valid: high 5..6 -->
+<polyline points="140,185 460,185 460,155 620,155 620,185 700,185"/>
+<!-- d_ready: low 5, high 6 -->
+<polyline points="140,230 540,230 540,200 620,200 620,230 700,230"/>
+</g>
+<!-- highlight handshake cycles -->
+<g fill="#2b8a3e" opacity="0.18"><rect x="300" y="40" width="80" height="95"/><rect x="540" y="145" width="80" height="95"/></g>
+<g fill="#d9480f" opacity="0.18"><rect x="460" y="145" width="80" height="95"/></g>
+<g fill="#222">
+<text x="20" y="70">a_valid</text>
+<text x="20" y="115">a_ready</text>
+<text x="20" y="175">d_valid</text>
+<text x="20" y="220">d_ready</text>
+<text x="340" y="150" text-anchor="middle" font-size="11" fill="#2b8a3e">request taken</text>
+<text x="580" y="255" text-anchor="middle" font-size="11" fill="#2b8a3e">response taken</text>
+<text x="500" y="270" text-anchor="middle" font-size="11" fill="#d9480f">must hold</text>
+</g>
+</svg>

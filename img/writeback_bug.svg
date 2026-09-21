@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 420" role="img" aria-label="Cycle diagram of the cache write-back bug. In cycle N the first write lands in the data RAM. In cycle N+1 the second write to the same line misses and the cache issues the write-back using data_rdata_raw, which is the RAM's output from before the cycle-N write landed. The forwarded signal data_rdata already had the correct value and was the fix." style="font-family:ui-monospace,monospace;font-size:12px"><rect width="100%" height="100%" fill="#fff"/>
+<g stroke="#222" stroke-width="1" opacity="0.25">
+<line x1="200" y1="30" x2="200" y2="330"/><line x1="330" y1="30" x2="330" y2="330"/>
+<line x1="460" y1="30" x2="460" y2="330"/><line x1="590" y1="30" x2="590" y2="330"/>
+<line x1="720" y1="30" x2="720" y2="330"/>
+</g>
+<g fill="#222" font-size="11">
+<text x="265" y="24" text-anchor="middle">N−1</text><text x="395" y="24" text-anchor="middle">N</text>
+<text x="525" y="24" text-anchor="middle">N+1</text><text x="655" y="24" text-anchor="middle">N+2</text>
+</g>
+<g fill="#222" font-size="12">
+<text x="20" y="70">front-end request</text>
+<text x="20" y="120">data RAM write</text>
+<text x="20" y="170">data_rdata_raw</text>
+<text x="20" y="220">data_rdata (fwd)</text>
+<text x="20" y="270">write-back to DDR3</text>
+</g>
+<!-- request row -->
+<rect x="205" y="52" width="120" height="26" rx="3" fill="#222" opacity="0.15"/>
+<rect x="335" y="52" width="120" height="26" rx="3" fill="#1c7ed6" opacity="0.5"/>
+<rect x="465" y="52" width="120" height="26" rx="3" fill="#d9480f" opacity="0.5"/>
+<g fill="#222" font-size="11">
+<text x="265" y="69" text-anchor="middle">write A (miss)</text>
+<text x="395" y="69" text-anchor="middle">A refilled</text>
+<text x="525" y="69" text-anchor="middle">write B: evict A</text>
+</g>
+<!-- RAM write row -->
+<rect x="335" y="102" width="120" height="26" rx="3" fill="#1c7ed6" opacity="0.5"/>
+<g fill="#222" font-size="11"><text x="395" y="119" text-anchor="middle">A's new data lands</text></g>
+<!-- raw row: shows OLD value in N+1 -->
+<rect x="335" y="152" width="120" height="26" rx="3" fill="#222" opacity="0.15"/>
+<rect x="465" y="152" width="120" height="26" rx="3" fill="#d9480f" opacity="0.5"/>
+<rect x="595" y="152" width="120" height="26" rx="3" fill="#1c7ed6" opacity="0.5"/>
+<g fill="#222" font-size="11">
+<text x="395" y="169" text-anchor="middle">old line</text>
+<text x="525" y="169" text-anchor="middle">STILL old line</text>
+<text x="655" y="169" text-anchor="middle">A's data (too late)</text>
+</g>
+<!-- fwd row: correct in N+1 -->
+<rect x="465" y="202" width="120" height="26" rx="3" fill="#2b8a3e" opacity="0.5"/>
+<g fill="#222" font-size="11"><text x="525" y="219" text-anchor="middle">A.s data ✓</text></g>
+<!-- write-back row -->
+<rect x="465" y="252" width="120" height="26" rx="3" fill="#d9480f" opacity="0.5"/>
+<g fill="#222" font-size="11"><text x="525" y="269" text-anchor="middle">sends data_rdata_raw</text></g>
+<!-- annotation -->
+<g fill="#222" font-size="11">
+<text x="20" y="360">The RAM is read one cycle behind: in N+1, data_rdata_raw still shows what the line held BEFORE</text>
+<text x="20" y="376">cycle N's write. The cache already had a forwarding path (data_rdata) that patches in last cycle's</text>
+<text x="20" y="392">write for exactly this case — it used it for the front-end response but not for the write-back.</text>
+<text x="20" y="410">Fix: one line — the write-back reads data_rdata instead of data_rdata_raw.</text>
+</g>
+</svg>

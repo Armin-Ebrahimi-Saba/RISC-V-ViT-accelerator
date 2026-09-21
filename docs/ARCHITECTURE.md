@@ -35,70 +35,10 @@ its DSP multipliers (77 of 740); timing is met with 0.12 ns to spare.
 An *SoC* (system on chip) is the collection of processor, memories,
 peripherals and interconnect that together make a computer. Here it is:
 
-<figure>
-<svg viewBox="0 0 860 470" role="img" aria-label="SoC block diagram: four bus masters on the left feed a crossbar, which routes to four device ports on the right; the accelerator is both a device and a master" style="max-width:100%;height:auto;font-family:system-ui,sans-serif;font-size:12px">
-<defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="currentColor"/></marker></defs>
-<g fill="none" stroke="currentColor" stroke-width="1.4">
-<!-- masters -->
-<rect x="20" y="40" width="150" height="110" rx="6"/>
-<rect x="20" y="180" width="150" height="60" rx="6"/>
-<rect x="20" y="270" width="150" height="110" rx="6"/>
-<!-- crossbar -->
-<rect x="260" y="40" width="120" height="340" rx="6"/>
-<!-- devices -->
-<rect x="470" y="40" width="150" height="60" rx="6"/>
-<rect x="470" y="120" width="150" height="60" rx="6"/>
-<rect x="470" y="200" width="150" height="60" rx="6"/>
-<rect x="470" y="280" width="150" height="100" rx="6"/>
-<rect x="690" y="200" width="150" height="60" rx="6"/>
-<!-- master -> xbar -->
-<line x1="170" y1="70" x2="260" y2="70" marker-end="url(#ah)"/>
-<line x1="170" y1="120" x2="260" y2="120" marker-end="url(#ah)"/>
-<line x1="170" y1="210" x2="260" y2="210" marker-end="url(#ah)"/>
-<!-- xbar -> devices -->
-<line x1="380" y1="70" x2="470" y2="70" marker-end="url(#ah)"/>
-<line x1="380" y1="150" x2="470" y2="150" marker-end="url(#ah)"/>
-<line x1="380" y1="230" x2="470" y2="230" marker-end="url(#ah)"/>
-<line x1="380" y1="310" x2="470" y2="310" marker-end="url(#ah)"/>
-<!-- ddr -> chip -->
-<line x1="620" y1="230" x2="690" y2="230" marker-end="url(#ah)"/>
-<!-- accelerator as master drives the crossbar -->
-<line x1="170" y1="325" x2="260" y2="325" marker-end="url(#ah)" stroke="#d9480f" stroke-width="2"/>
-<!-- the device-side registers and the master-side engine are one block -->
-<path d="M545 380 L545 420 L95 420 L95 380" stroke="#d9480f" stroke-width="2" stroke-dasharray="6 3"/>
-</g>
-<g fill="currentColor">
-<text x="95" y="62" text-anchor="middle" font-weight="600">CV32E40P</text>
-<text x="95" y="80" text-anchor="middle">RISC-V CPU</text>
-<text x="95" y="103" text-anchor="middle" font-size="11">instruction port</text>
-<text x="95" y="128" text-anchor="middle" font-size="11">data port</text>
-<text x="95" y="203" text-anchor="middle" font-weight="600">Debug module</text>
-<text x="95" y="222" text-anchor="middle" font-size="11">JTAG → system bus</text>
-<text x="95" y="295" text-anchor="middle" font-weight="600">GEMM accelerator</text>
-<text x="95" y="313" text-anchor="middle" font-size="11">(as a bus master)</text>
-<text x="95" y="345" text-anchor="middle" font-size="11">reads A and W,</text>
-<text x="95" y="360" text-anchor="middle" font-size="11">writes C</text>
-<text x="320" y="200" text-anchor="middle" font-weight="600">TL-UL</text>
-<text x="320" y="218" text-anchor="middle" font-weight="600">crossbar</text>
-<text x="320" y="245" text-anchor="middle" font-size="11">4 masters</text>
-<text x="320" y="260" text-anchor="middle" font-size="11">4 devices</text>
-<text x="545" y="65" text-anchor="middle" font-weight="600">BRAM</text>
-<text x="545" y="83" text-anchor="middle" font-size="11">256 kB on-chip, program</text>
-<text x="545" y="145" text-anchor="middle" font-weight="600">Peripherals</text>
-<text x="545" y="163" text-anchor="middle" font-size="11">timer, DDR3 control regs</text>
-<text x="545" y="225" text-anchor="middle" font-weight="600">DDR3 path</text>
-<text x="545" y="243" text-anchor="middle" font-size="11">cache → controller</text>
-<text x="545" y="305" text-anchor="middle" font-weight="600">Student device</text>
-<text x="545" y="323" text-anchor="middle" font-size="11">GEMM accelerator regs</text>
-<text x="545" y="341" text-anchor="middle" font-size="11">DMA regs</text>
-<text x="545" y="365" text-anchor="middle" font-size="11">(as a bus device)</text>
-<text x="765" y="225" text-anchor="middle" font-weight="600">DDR3 chip</text>
-<text x="765" y="243" text-anchor="middle" font-size="11">512 MB, off-chip</text>
-<text x="320" y="440" text-anchor="middle" font-size="11" fill="#d9480f">dashed: the same block — programmed as a device, fetching as a master</text>
-</g>
-</svg>
-<figcaption>Everything talks through one crossbar. The accelerator appears twice: as a <em>device</em> the CPU programs through registers, and as a <em>master</em> that fetches its own operands from DDR3 — the orange arrow and dashed link. That double role is why bus bugs affected it and the CPU differently.</figcaption>
-</figure>
+![SoC block diagram: four bus masters on the left feed a crossbar, which routes to four device ports on the right; the accelerator is both a device and a master](../img/soc_overview.svg)
+
+*Everything talks through one crossbar. The accelerator appears twice: as a *device* the CPU programs through registers, and as a *master* that fetches its own operands from DDR3 — the orange arrow and dashed link. That double role is why bus bugs affected it and the CPU differently.*
+
 
 **Bus masters** — the things that start transactions:
 
@@ -140,37 +80,10 @@ design, and two of the three bugs found were violations of it.
 
 ## 3. Memory map
 
-<figure>
-<svg viewBox="0 0 700 300" role="img" aria-label="Memory map: BRAM at 0x0000_0000, peripherals around 0x1F00_0000, accelerator registers at 0x2001_0000, and DDR3 from 0x8000_0000 holding the weight blob, then the image-in and depth-out slots, then the activation arena" style="max-width:100%;height:auto;font-family:system-ui,sans-serif;font-size:12px">
-<g fill="none" stroke="currentColor" stroke-width="1.4">
-<rect x="20" y="30" width="660" height="40" rx="4"/>
-<rect x="20" y="90" width="660" height="40" rx="4"/>
-<rect x="20" y="150" width="660" height="40" rx="4"/>
-<rect x="20" y="210" width="240" height="70" rx="4"/>
-<rect x="265" y="210" width="170" height="70" rx="4"/>
-<rect x="440" y="210" width="240" height="70" rx="4"/>
-</g>
-<g fill="currentColor">
-<text x="30" y="55" font-family="ui-monospace,monospace">0x0000_0000</text>
-<text x="180" y="55">BRAM — program, stack, hostio console ring (256 kB)</text>
-<text x="30" y="115" font-family="ui-monospace,monospace">0x1F00_0000</text>
-<text x="180" y="115">peripherals — timer, DDR3 control + watchdog registers</text>
-<text x="30" y="175" font-family="ui-monospace,monospace">0x2001_0000</text>
-<text x="180" y="175">GEMM accelerator registers (student device)</text>
-<text x="30" y="235" font-family="ui-monospace,monospace">0x8000_0000</text>
-<text x="30" y="255" font-weight="600">weight blob, 24.87 MB</text>
-<text x="30" y="272" font-size="11">int8 weights + directory, over JTAG once</text>
-<text x="275" y="228" font-family="ui-monospace,monospace" font-size="11">0x81E0_0000</text>
-<text x="275" y="243" font-size="11">image in, 95 kB</text>
-<text x="275" y="260" font-family="ui-monospace,monospace" font-size="11">0x81F1_0000</text>
-<text x="275" y="275" font-size="11">depth map out, 63 kB</text>
-<text x="450" y="235" font-family="ui-monospace,monospace">0x8200_0000</text>
-<text x="450" y="255" font-weight="600">activation arena, 64 MB</text>
-<text x="450" y="272" font-size="11">bump allocator for intermediate tensors</text>
-</g>
-</svg>
-<figcaption>The blob and the arena are 32 MB apart in DDR3. That distance matters: the cache in front of DDR3 is indexed by address bits [13:5], so both regions map onto the same 512 cache lines and constantly evict each other.</figcaption>
-</figure>
+![Memory map: BRAM at 0x0000_0000, peripherals around 0x1F00_0000, accelerator registers at 0x2001_0000, and DDR3 from 0x8000_0000 holding the weight blob, then the image-in and depth-out slots, then the activation arena](../img/memory_map.svg)
+
+*The blob and the arena are 32 MB apart in DDR3. That distance matters: the cache in front of DDR3 is indexed by address bits [13:5], so both regions map onto the same 512 cache lines and constantly evict each other.*
+
 
 Four regions in DDR3 do all the work:
 
@@ -207,60 +120,10 @@ result (M × N). *int8/int16/int32* are 8-, 16- and 32-bit integers; the
 network was quantised so all the arithmetic is integer, because the CPU has
 no floating-point hardware.
 
-<figure>
-<svg viewBox="0 0 860 400" role="img" aria-label="Accelerator dataflow: A tile of 64 rows is loaded once into on-chip memory, then weight rows stream through 64 multiply-accumulate units in parallel, and each completed weight row's 64 results are drained to DDR3 together with their max and min" style="max-width:100%;height:auto;font-family:system-ui,sans-serif;font-size:12px">
-<defs><marker id="ah2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="currentColor"/></marker></defs>
-<g fill="none" stroke="currentColor" stroke-width="1.4">
-<rect x="20" y="40" width="130" height="320" rx="6"/>
-<rect x="240" y="40" width="150" height="120" rx="6"/>
-<rect x="240" y="220" width="150" height="70" rx="6"/>
-<rect x="480" y="40" width="200" height="320" rx="6"/>
-<rect x="500" y="90" width="160" height="26" rx="3"/>
-<rect x="500" y="124" width="160" height="26" rx="3"/>
-<rect x="500" y="158" width="160" height="26" rx="3"/>
-<rect x="500" y="290" width="160" height="26" rx="3"/>
-<rect x="730" y="150" width="110" height="100" rx="6"/>
-<line x1="150" y1="100" x2="240" y2="100" marker-end="url(#ah2)"/>
-<line x1="150" y1="255" x2="240" y2="255" marker-end="url(#ah2)"/>
-<line x1="390" y1="100" x2="480" y2="100" marker-end="url(#ah2)"/>
-<line x1="390" y1="255" x2="480" y2="255" marker-end="url(#ah2)" stroke-dasharray="5 3"/>
-<line x1="680" y1="200" x2="730" y2="200" marker-end="url(#ah2)"/>
-<path d="M785 250 L785 385 L180 385 L180 340 L152 340" marker-end="url(#ah2)"/>
-</g>
-<g fill="currentColor">
-<text x="85" y="65" text-anchor="middle" font-weight="600">DDR3</text>
-<text x="85" y="95" text-anchor="middle" font-size="11">A: activations</text>
-<text x="85" y="110" text-anchor="middle" font-size="11">int16, N×K</text>
-<text x="85" y="250" text-anchor="middle" font-size="11">W: weights</text>
-<text x="85" y="265" text-anchor="middle" font-size="11">int8, M×K</text>
-<text x="85" y="340" text-anchor="middle" font-size="11">C: results, int32</text>
-<text x="195" y="90" text-anchor="middle" font-size="11">load once</text>
-<text x="195" y="245" text-anchor="middle" font-size="11">stream</text>
-<text x="315" y="65" text-anchor="middle" font-weight="600">A tile</text>
-<text x="315" y="85" text-anchor="middle" font-size="11">64 rows × K</text>
-<text x="315" y="103" text-anchor="middle" font-size="11">on-chip BRAM</text>
-<text x="315" y="130" text-anchor="middle" font-size="11">read every cycle</text>
-<text x="315" y="145" text-anchor="middle" font-size="11">for each W row</text>
-<text x="315" y="245" text-anchor="middle" font-weight="600">W beat</text>
-<text x="315" y="265" text-anchor="middle" font-size="11">4 × int8 per word</text>
-<text x="435" y="245" text-anchor="middle" font-size="11">broadcast</text>
-<text x="580" y="65" text-anchor="middle" font-weight="600">64 MAC units</text>
-<text x="580" y="107" text-anchor="middle" font-size="11">row 0: acc += A[0][k]·W[m][k]</text>
-<text x="580" y="141" text-anchor="middle" font-size="11">row 1: acc += A[1][k]·W[m][k]</text>
-<text x="580" y="175" text-anchor="middle" font-size="11">row 2: acc += A[2][k]·W[m][k]</text>
-<text x="580" y="230" text-anchor="middle">⋮</text>
-<text x="580" y="307" text-anchor="middle" font-size="11">row 63</text>
-<text x="580" y="345" text-anchor="middle" font-size="11">all 64 in parallel, one k per cycle</text>
-<text x="785" y="175" text-anchor="middle" font-weight="600">drain</text>
-<text x="785" y="200" text-anchor="middle" font-size="11">64 results</text>
-<text x="785" y="215" text-anchor="middle" font-size="11">per W row</text>
-<text x="785" y="230" text-anchor="middle" font-size="11">→ C column</text>
-<text x="785" y="244" text-anchor="middle" font-size="11">+ {max, min}</text>
-<text x="480" y="378" text-anchor="middle" font-size="11">write C[m][0..63] (and {max,min}) back to DDR3</text>
-</g>
-</svg>
-<figcaption>Reuse is the whole idea: 64 rows of A are loaded once and held on-chip, then every weight row streams past all 64 at once. Each int8 weight is multiplied against 64 activations the cycle it arrives, so the weight — the dominant memory traffic — crosses the bus once per tile: twice for the encoder's 82 tokens.</figcaption>
-</figure>
+![Accelerator dataflow: A tile of 64 rows is loaded once into on-chip memory, then weight rows stream through 64 multiply-accumulate units in parallel, and each completed weight row&#x27;s 64 results are drained to DDR3 together with their max and min](../img/accelerator_dataflow.svg)
+
+*Reuse is the whole idea: 64 rows of A are loaded once and held on-chip, then every weight row streams past all 64 at once. Each int8 weight is multiplied against 64 activations the cycle it arrives, so the weight — the dominant memory traffic — crosses the bus once per tile: twice for the encoder's 82 tokens.*
+
 
 The execution of one *GEMM job* (one 64-row tile of A against all of W):
 
@@ -329,66 +192,10 @@ retries per frame.
 Between the crossbar and the memory chip sit four blocks. All three defects
 fixed in this project were in this path, so it is worth seeing in full.
 
-<figure>
-<svg viewBox="0 0 900 420" role="img" aria-label="The DDR3 path: crossbar port feeds a request mux, then a write-back cache, then (bypassed) prefetcher, then clock-domain crossing FIFO, block manager, and the UberDDR3 controller and PHY driving the DDR3 chip. Three defects are marked." style="max-width:100%;height:auto;font-family:system-ui,sans-serif;font-size:12px">
-<defs><marker id="ah3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="currentColor"/></marker></defs>
-<g fill="none" stroke="currentColor" stroke-width="1.4">
-<rect x="20" y="120" width="90" height="60" rx="6"/>
-<rect x="150" y="120" width="100" height="60" rx="6"/>
-<rect x="290" y="100" width="130" height="100" rx="6"/>
-<rect x="460" y="120" width="100" height="60" rx="6" stroke-dasharray="6 3"/>
-<rect x="600" y="120" width="80" height="60" rx="6"/>
-<rect x="720" y="120" width="80" height="60" rx="6"/>
-<rect x="830" y="100" width="60" height="100" rx="6"/>
-<line x1="110" y1="150" x2="150" y2="150" marker-end="url(#ah3)"/>
-<line x1="250" y1="150" x2="290" y2="150" marker-end="url(#ah3)"/>
-<line x1="420" y1="150" x2="460" y2="150" marker-end="url(#ah3)"/>
-<line x1="560" y1="150" x2="600" y2="150" marker-end="url(#ah3)"/>
-<line x1="680" y1="150" x2="720" y2="150" marker-end="url(#ah3)"/>
-<line x1="800" y1="150" x2="830" y2="150" marker-end="url(#ah3)"/>
-<!-- bypass around prefetch -->
-<path d="M420 130 Q 510 70 600 130" stroke-dasharray="6 3"/>
-<!-- clock boundary -->
-<line x1="590" y1="60" x2="590" y2="225" stroke-dasharray="3 4"/>
-<!-- defect markers -->
-<circle cx="200" cy="105" r="11" fill="#d9480f" stroke="none"/>
-<circle cx="355" cy="85" r="11" fill="#d9480f" stroke="none"/>
-<circle cx="510" cy="105" r="11" fill="#d9480f" stroke="none"/>
-</g>
-<g fill="currentColor">
-<text x="65" y="145" text-anchor="middle" font-size="11">crossbar</text>
-<text x="65" y="160" text-anchor="middle" font-size="11">DDR port</text>
-<text x="200" y="145" text-anchor="middle" font-size="11">request</text>
-<text x="200" y="160" text-anchor="middle" font-size="11">mux</text>
-<text x="355" y="130" text-anchor="middle" font-weight="600">cache</text>
-<text x="355" y="150" text-anchor="middle" font-size="11">16 kB, write-back</text>
-<text x="355" y="165" text-anchor="middle" font-size="11">direct-mapped</text>
-<text x="355" y="185" text-anchor="middle" font-size="11">512 × 32-byte lines</text>
-<text x="510" y="145" text-anchor="middle" font-size="11">prefetcher</text>
-<text x="510" y="78" text-anchor="middle" font-size="11">bypass (in use)</text>
-<text x="510" y="160" text-anchor="middle" font-size="11">(bypassed)</text>
-<text x="640" y="145" text-anchor="middle" font-size="11">CDC</text>
-<text x="640" y="160" text-anchor="middle" font-size="11">FIFO</text>
-<text x="760" y="145" text-anchor="middle" font-size="11">block</text>
-<text x="760" y="160" text-anchor="middle" font-size="11">manager</text>
-<text x="860" y="140" text-anchor="middle" font-size="11">UberDDR3</text>
-<text x="860" y="155" text-anchor="middle" font-size="11">ctrl</text>
-<text x="860" y="170" text-anchor="middle" font-size="11">+ PHY</text>
-<text x="590" y="50" text-anchor="middle" font-size="11">50 MHz | 100 MHz</text>
-<text x="200" y="109" text-anchor="middle" font-size="11" fill="#fff" font-weight="700">1</text>
-<text x="355" y="89" text-anchor="middle" font-size="11" fill="#fff" font-weight="700">2</text>
-<text x="510" y="109" text-anchor="middle" font-size="11" fill="#fff" font-weight="700">3</text>
-<text x="20" y="260" font-weight="600" fill="#d9480f">1</text>
-<text x="40" y="260" font-size="12">Request mux took its "ready" from the wrong block, so requests were accepted by nobody. CPU hung, unhaltable.</text>
-<text x="20" y="290" font-weight="600" fill="#d9480f">2</text>
-<text x="40" y="290" font-size="12">Cache wrote back a line's stale contents when that line had been written the cycle before. One word lost per tile.</text>
-<text x="20" y="320" font-weight="600" fill="#d9480f">3</text>
-<text x="40" y="320" font-size="12">Prefetcher returned another address's data when two regions collided in the cache. Bypassed rather than repaired.</text>
-<text x="20" y="360" font-size="12">Also in the cache: it ignores the bus "ready" on responses, so a busy receiver can lose one. Covered by the accelerator's retry timer.</text>
-</g>
-</svg>
-<figcaption>The dashed vertical line is a clock-domain crossing: the controller runs at 100 MHz, the rest at 50 MHz. All three fixed defects (orange) sit on the 50 MHz side, in platform RTL rather than the accelerator.</figcaption>
-</figure>
+![The DDR3 path: crossbar port feeds a request mux, then a write-back cache, then (bypassed) prefetcher, then clock-domain crossing FIFO, block manager, and the UberDDR3 controller and PHY driving the DDR3 chip. Three defects are marked.](../img/ddr3_path.svg)
+
+*The dashed vertical line is a clock-domain crossing: the controller runs at 100 MHz, the rest at 50 MHz. All three fixed defects (orange) sit on the 50 MHz side, in platform RTL rather than the accelerator.*
+
 
 Terms used above:
 
