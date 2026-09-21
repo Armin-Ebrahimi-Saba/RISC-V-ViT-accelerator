@@ -24,7 +24,9 @@ is built from that fabric. Nothing here is a fixed silicon CPU.
 
 The design runs at **50 MHz**. That sounds slow next to a desktop CPU, and it
 is: it is the clock at which a soft processor synthesised into this fabric
-closes timing with margin.
+closes timing with margin. The whole SoC uses 14.8 % of the chip's logic,
+36.9 % of its block RAM (mostly the accelerator's 256 kB tile) and 10.4 % of
+its DSP multipliers (77 of 740); timing is met with 0.12 ns to spare.
 
 ---
 
@@ -109,11 +111,15 @@ peripherals and interconnect that together make a computer. Here it is:
   write memory directly on the bus without the CPU's involvement. That second
   ability turned out to be the most valuable debugging tool in the project.
 - **GEMM accelerator** — the custom hardware block, which fetches its own
-  operands.
+  operands with up to eight reads in flight. It has two job types: a matrix
+  product, and the requantisation of a product's int32 result to int16 (§4).
 
 **Bus devices** — the things that respond:
 
-- **BRAM** — 256 kB of on-chip memory. Holds the program and its stack.
+- **BRAM** — 256 kB of on-chip memory. Holds the program, its stack, and a
+  40 kB scratch buffer the C kernels use for anything reused many times
+  inside one operator (an attention head's q and k, LayerNorm's per-channel
+  tables). Single-cycle from the CPU's point of view, unlike DDR3.
 - **Peripherals** — a timer and the DDR3 controller's status registers.
 - **DDR3 path** — the cache and controller in front of the external memory.
   Holds the 25 MB of neural-network weights and all the working data.
@@ -135,13 +141,14 @@ design, and two of the three bugs found were violations of it.
 ## 3. Memory map
 
 <figure>
-<svg viewBox="0 0 700 300" role="img" aria-label="Memory map: BRAM at 0x0000_0000, peripherals around 0x1F00_0000, accelerator registers at 0x2001_0000, and DDR3 from 0x8000_0000 holding the weight blob then the activation arena" style="max-width:100%;height:auto;font-family:system-ui,sans-serif;font-size:12px">
+<svg viewBox="0 0 700 300" role="img" aria-label="Memory map: BRAM at 0x0000_0000, peripherals around 0x1F00_0000, accelerator registers at 0x2001_0000, and DDR3 from 0x8000_0000 holding the weight blob, then the image-in and depth-out slots, then the activation arena. Original label: blob then the activation arena" style="max-width:100%;height:auto;font-family:system-ui,sans-serif;font-size:12px">
 <g fill="none" stroke="currentColor" stroke-width="1.4">
 <rect x="20" y="30" width="660" height="40" rx="4"/>
 <rect x="20" y="90" width="660" height="40" rx="4"/>
 <rect x="20" y="150" width="660" height="40" rx="4"/>
-<rect x="20" y="210" width="330" height="70" rx="4"/>
-<rect x="350" y="210" width="330" height="70" rx="4"/>
+<rect x="20" y="210" width="240" height="70" rx="4"/>
+<rect x="265" y="210" width="170" height="70" rx="4"/>
+<rect x="440" y="210" width="240" height="70" rx="4"/>
 </g>
 <g fill="currentColor">
 <text x="30" y="55" font-family="ui-monospace,monospace">0x0000_0000</text>
@@ -152,16 +159,20 @@ design, and two of the three bugs found were violations of it.
 <text x="180" y="175">GEMM accelerator registers (student device)</text>
 <text x="30" y="235" font-family="ui-monospace,monospace">0x8000_0000</text>
 <text x="30" y="255" font-weight="600">weight blob, 24.87 MB</text>
-<text x="30" y="272" font-size="11">int8 weights + directory, loaded over JTAG</text>
-<text x="360" y="235" font-family="ui-monospace,monospace">0x8200_0000</text>
-<text x="360" y="255" font-weight="600">activation arena, 64 MB</text>
-<text x="360" y="272" font-size="11">bump allocator for intermediate tensors</text>
+<text x="30" y="272" font-size="11">int8 weights + directory, over JTAG once</text>
+<text x="275" y="228" font-family="ui-monospace,monospace" font-size="11">0x81E0_0000</text>
+<text x="275" y="243" font-size="11">image in, 95 kB</text>
+<text x="275" y="260" font-family="ui-monospace,monospace" font-size="11">0x81F1_0000</text>
+<text x="275" y="275" font-size="11">depth map out, 63 kB</text>
+<text x="450" y="235" font-family="ui-monospace,monospace">0x8200_0000</text>
+<text x="450" y="255" font-weight="600">activation arena, 64 MB</text>
+<text x="450" y="272" font-size="11">bump allocator for intermediate tensors</text>
 </g>
 </svg>
 <figcaption>The blob and the arena are 32 MB apart in DDR3. That distance matters: the cache in front of DDR3 is indexed by address bits [13:5], so both regions map onto the same 512 cache lines and constantly evict each other.</figcaption>
 </figure>
 
-Two regions in DDR3 do all the work:
+Four regions in DDR3 do all the work:
 
 - **The weight blob** at `0x8000_0000`. A single file produced by
   `export_dav2.py` containing every tensor the network needs — weights,
@@ -171,8 +182,11 @@ Two regions in DDR3 do all the work:
   126×126×3 int16 pixels then one float scale, 95 kB. It is *not* part of the
   blob, so a new picture is a quarter-second transfer rather than a new
   minute-long weight load. The program serves frames: it waits for the host
-  to write an image here and raise a flag, runs it, prints the result, and
-  waits for the next.
+  to write an image here and raise a flag, runs it, publishes the result,
+  and waits for the next.
+- **The depth map** at `0x81F1_0000`, also in the gap: 126×126 float32,
+  63 kB. The host reads it straight off the bus over JTAG in 0.7 s (it used
+  to be printed as hex text through the console, ~30 s).
 - **The activation arena** at `0x8200_0000`. Working memory for the tensors
   the network produces as it runs. A *bump allocator* hands out space by
   advancing a pointer and can only free it all at once, which suits a
@@ -370,7 +384,7 @@ fixed in this project were in this path, so it is worth seeing in full.
 <text x="40" y="290" font-size="12">Cache wrote back a line's stale contents when that line had been written the cycle before. One word lost per tile.</text>
 <text x="20" y="320" font-weight="600" fill="#d9480f">3</text>
 <text x="40" y="320" font-size="12">Prefetcher returned another address's data when two regions collided in the cache. Bypassed rather than repaired.</text>
-<text x="20" y="360" font-size="12">Also in the cache: it ignores the bus "ready" on responses, so a busy receiver loses one. Worked around by the accelerator's retry timer.</text>
+<text x="20" y="360" font-size="12">Also in the cache: it ignores the bus "ready" on responses, so a busy receiver can lose one. Covered by the accelerator's retry timer.</text>
 </g>
 </svg>
 <figcaption>The dashed vertical line is a clock-domain crossing: the controller runs at 100 MHz, the rest at 50 MHz. All three fixed defects (orange) sit on the 50 MHz side, in platform RTL rather than the accelerator.</figcaption>
@@ -410,16 +424,23 @@ last write of a tile followed by the next tile's first access produces.
 | Level | What runs | Where the DDR3 is | Time |
 |---|---|---|---|
 | Host reference | the C engine natively on the PC | `malloc` | ~4 s |
-| Module testbench | one RTL block against a behavioural memory | `ddr3_blk_model.sv` | seconds–minutes |
+| Module testbench | one RTL block against a behavioural memory (`student_gemm_tb`: GEMM shapes, strided operands, row statistics, the requantisation job against a bit-level model; `student_gemm_ddrpath_tb`: the same block through the real cache with eight reads in flight) | `ddr3_blk_model.sv` | seconds–minutes |
 | System testbench | the whole SoC, no DDR3 | none | ~17 min for 4 M cycles |
 | System + behavioural DDR3 | the whole SoC, cache and block manager real | `ddr3_blk_model.sv` | same rate |
 | Full DDR3 simulation | everything including the JEDEC chip model | real | ~600× slower; avoid |
-| Board | the bitstream on the FPGA | real | ~94 s per frame |
+| Board | the bitstream on the FPGA | real | 14.2 s per frame |
 
 The host reference is the *oracle*: the same C source compiled for the PC.
 Because every kernel is integer and the float bookkeeping is IEEE single
 precision on both sides, the board's output is required to be bit-identical
-to it — and now is, on every image tried.
+to it — and is, on every image tried. That equality was also the regression
+test for the speed-up work: every change was checked against the previous
+host output byte for byte (`PERFORMANCE.md`).
+
+The program also measures the board itself: a per-operator cycle profile
+printed after every frame, and a microbenchmark at boot giving cycles per
+instruction, per load and per taken branch on this core. Both exist because
+guessing where the time went was wrong twice.
 
 ---
 
@@ -432,10 +453,11 @@ to it — and now is, on every image tried.
 | `src/rtl/student/student_tl_rsp_hold.sv` | response skid buffer (currently bypassed) |
 | `src/rtl/ddr3/rvlab_tlul_ddr.sv` | the DDR3 path top; request mux fix; prefetch bypass |
 | `src/rtl/ddr3/rvlab_ddr_block_cache.sv` | the cache; write-back fix |
-| `src/sw/project/` | the C inference engine |
+| `src/sw/project/` | the C inference engine; `dav2_accel.c` is the accelerator driver, `dav2_ops.c` the kernels, `main.c` the frame server, profiler hooks and microbenchmark |
 | `src/sw/project/tools/` | exporter, board runner, image preprocessing (`dav2_image.py`) |
 | `src/tb/` | testbenches |
-| `docs/DATAFLOW.md` | timing diagrams of the bus and one inference |
+| `docs/DATAFLOW.md` | timing diagrams of the bus and one inference; the complete numbered flow of a frame |
 | `docs/DEBUGGING.md` | how every defect was found |
 | `docs/LESSONS.md` | portable rules for the next project |
 | `docs/HANDOFF.md` | current state and open items |
+| `docs/PERFORMANCE.md` | the speed-up from 93.6 s to 14.2 s: profile, each step, what is left |
