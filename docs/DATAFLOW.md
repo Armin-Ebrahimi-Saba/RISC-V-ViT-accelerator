@@ -65,46 +65,44 @@ Terms:
 
 ---
 
-## 3. The whole computation as a flow
+## 3. The whole computation, step by step
 
-Section 2 showed *when*; this shows *what happens, in what order, by whom,
-and on which memory*. Four lanes: the PC (a Python script talking over
-JTAG), the CPU, the accelerator, and memory. Numbers give the order. Every
-step carries tags for the memory it **R**eads and **W**rites, colour-coded to
-the regions in the right-hand lane. Two things are expanded at the bottom
-because every "GEMM" and "requant" above means them: **A**, one matrix
-product on the accelerator, and **B**, the requantisation that follows it.
+Every operation of one frame, in the order it runs, numbered 1–35. Each box
+says what is computed, which tensors it reads (**R**) and writes (**W**),
+with their shapes, and — by the coloured tag — which memory they live in.
+Blue boxes run on the CPU, orange on the accelerator, grey on the PC.
 
-Where things happen at the same time:
+Parallelism is drawn with fork/join bars:
 
-- **Inside the accelerator** (bracket under A): read requests are in flight
-  (up to eight), the 64 multipliers accumulate, and up to eight writes await
-  their acknowledgement — all at once. That overlap is what took it from
-  8.3 to 3.2 cycles per beat.
-- **Inside the requantisation job** (bracket under B): the element pipeline,
-  the output FIFO and the write engine run concurrently.
-- **Not yet overlapped:** the CPU and the accelerator. While a job runs, the
-  CPU polls its status register. The CPU work of the next step (say, the
-  gathers for the next attention head) could start meanwhile; nothing does
-  today. `PERFORMANCE.md` §5 lists it.
-- **Between frames:** the PC's readout of one result and its upload of the
-  next image are sequential with the board; a double-buffered image address
-  would let the upload overlap inference.
+- **Solid orange bars** mark work that is truly concurrent. Inside every
+  accelerator job (expanded once, in step 3) three engines run at the same
+  time: the read engine with up to eight requests in flight, the 64
+  multiply-accumulate units, and the write engine with up to eight writes
+  awaiting acknowledgement. That overlap is why the block moves a word every
+  3.2 cycles instead of every 8.3.
+- **Dashed grey bars** mark work that is *independent* — it could run in
+  parallel — but is executed one piece after another today: the six
+  attention heads, the two half-products in each attention GEMM (10a/10b,
+  12a/12b), and the four DPT feature levels (22–25). Everything else is a
+  strict chain: each step needs the previous step's output.
+- The CPU and the accelerator are not overlapped either: the CPU polls the
+  status register while a job runs. `PERFORMANCE.md` §5 lists what could be
+  overlapped and what it would gain.
+
+![Every computation of one frame in order: 35 numbered operations with the tensors they read and write and the memory they live in; fork/join bars for parallel and independent work](../img/computation.svg)
+
+*Steps 7–21 repeat for each of the twelve transformer blocks; steps 9–13 for each of the six heads within a block. "GEMM + requant" everywhere means steps 3–5: a matrix product on the accelerator, the per-row range it reports, the CPU's per-row parameters, and the accelerator's requantisation job. (`img/computation.png` is the same figure as a bitmap.)*
+
+### The same frame as a process
+
+The figure below is the complementary view: the same frame in four lanes (PC,
+CPU, accelerator, memory), with the block and the attention head expanded and
+the two accelerator jobs detailed underneath — where §3's figure is about
+*what is computed*, this one is about *who does it and where the data goes*.
 
 ![One frame, start to finish: PC, CPU, accelerator and memory lanes, steps numbered 1–8, the transformer block and attention expanded, GEMM and requantisation expanded underneath](../img/flow.svg)
 
-*One frame, start to finish. Steps 1–2 happen once per session; 3–8 once per image. The transformer block (5) runs twelve times, the attention sub-flow (5c) six times per block. The A and B expansions are what every "GEMM" and "requant" in the upper part stands for. (`img/flow.png` is the same figure as a bitmap.)*
-
-Reading it in simple terms: the PC puts the picture in memory and raises a
-flag (3). The CPU cuts the picture into 81 patches and turns each into a
-384-number vector (4). Twelve times over (5), the CPU normalises those
-vectors, the accelerator multiplies them by learned weights, the CPU lets
-every patch look at every other (attention, with the two big products on the
-accelerator), and so on through the block's four multiplications. The decoder
-(6) turns the transformer's features back into a 126×126 picture of depth,
-with the same tools: convolutions become matrix products on the accelerator,
-the CPU gathers patches and resizes. The CPU writes the depth map to a fixed
-address and lowers the flag (7); the PC reads it back (8).
+*Steps 1–2 happen once per session; 3–8 once per image. The A and B expansions are what every "GEMM" and "requant" in the upper part stands for.*
 
 ---
 

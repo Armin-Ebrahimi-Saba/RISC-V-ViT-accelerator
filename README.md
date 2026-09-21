@@ -59,11 +59,12 @@ How it works
 
 ![Accelerator architecture](img/accelerator.svg)
 
-The complete computation of one frame — who does what, in what order, on
-which memory, and what runs concurrently (`docs/DATAFLOW.md` §3 walks
-through it):
+Every computation of one frame, in order — 35 numbered steps with the exact
+tensors each reads and writes, where they live, and what runs in parallel
+(`docs/DATAFLOW.md` §3 walks through it; the same section has the frame as
+a process in four lanes):
 
-![The complete computation of one frame as a numbered flow](img/flow.svg)
+![Every computation of one frame, numbered, with the data each step reads and writes](img/computation.svg)
 
 **Software** (`src/sw/project/`) — ~2000 lines of C, freestanding. Weights are
 int8 with a per-output-channel scale, activations int16 at 14 bits, and each

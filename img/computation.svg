@@ -1,0 +1,701 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 3638" role="img" aria-label="Computation flow of one frame: 42 numbered operations from the input image to the depth map, each with the tensors it reads and writes and the memory they live in; parallel work shown with fork and join bars." style="font-family:system-ui,sans-serif;font-size:11px">
+<rect width="100%" height="100%" fill="#fff"/>
+<defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#222"/></marker></defs>
+<text x="20" y="30" font-size="16" font-weight="700">One frame of Depth-Anything V2 on the board: every computation, in order</text>
+<text x="20" y="48" font-size="11">Shapes are [rows × columns] of the matrix the operation sees; int16 activations, int8 weights, int32 sums, f32 = 32-bit float. 82 tokens = 81 patches + 1 class token; 384 = the model width.</text>
+<rect x="20" y="66" width="14" height="14" rx="3" fill="#fff" stroke="#1c7ed6" stroke-width="1.6"/><text x="40" y="77" font-size="10.5">runs on the CPU</text>
+<rect x="150" y="66" width="14" height="14" rx="3" fill="#fff" stroke="#e8590c" stroke-width="1.6"/><text x="170" y="77" font-size="10.5">runs on the accelerator (inside every such job: read engine ∥ 64 multipliers ∥ write engine, see 3)</text>
+<rect x="700" y="66" width="14" height="14" rx="3" fill="#fff" stroke="#868e96" stroke-width="1.6"/><text x="720" y="77" font-size="10.5">runs on the PC</text>
+<line x1="20" y1="95" x2="60" y2="95" stroke="#e8590c" stroke-width="4"/><text x="66" y="99" font-size="10.5">fork / join: truly concurrent</text>
+<line x1="260" y1="95" x2="300" y2="95" stroke="#495057" stroke-width="4" stroke-dasharray="6 3"/><text x="306" y="99" font-size="10.5">fork / join: independent work, executed one after another today (could be parallel)</text>
+<rect x="20" y="110.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="24" y="120" font-size="9">blob</text>
+<text x="57.2" y="119" font-size="9.5">DDR3 weights 0x8000_0000 (read-only, 25 MB)</text>
+<rect x="299.1" y="110.5" width="37" height="12" rx="3" fill="#d0ebff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="303.1" y="120" font-size="9">image</text>
+<text x="342.1" y="119" font-size="9.5">DDR3 image slot 0x81E0_0000</text>
+<rect x="499.20000000000005" y="110.5" width="43" height="12" rx="3" fill="#ffe8cc" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="503.20000000000005" y="120" font-size="9">result</text>
+<text x="548.0" y="119" font-size="9.5">DDR3 result slot 0x81F1_0000</text>
+<rect x="710.4000000000001" y="110.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="714.4000000000001" y="120" font-size="9">arena</text>
+<text x="753.4000000000001" y="119" font-size="9.5">DDR3 arena 0x8200_0000 (activations, sums, tables)</text>
+<rect x="20" y="126.5" width="49" height="12" rx="3" fill="#fff3bf" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="24" y="136" font-size="9">scratch</text>
+<text x="74.6" y="135" font-size="9.5">on-chip scratch, 40 kB BRAM</text>
+<rect x="231.7" y="126.5" width="31" height="12" rx="3" fill="#ffd8a8" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="235.7" y="136" font-size="9">tile</text>
+<text x="268.9" y="135" font-size="9.5">accelerator tile RAM, 256 kB</text>
+<rect x="431.3" y="126.5" width="20" height="12" rx="3" fill="#e9ecef" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="435.3" y="136" font-size="9">pc</text>
+<text x="456.90000000000003" y="135" font-size="9.5">PC file system</text>
+<text x="20" y="150" font-size="13" font-weight="700">Input</text>
+<line x1="20" y1="156" x2="1100" y2="156" stroke="#adb5bd" stroke-width="1"/>
+<rect x="40" y="168" width="560" height="60" rx="6" fill="#fff" stroke="#868e96" stroke-width="1.6"/>
+<circle cx="40" cy="180" r="11" fill="#868e96"/>
+<text x="40" y="184" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">1</text>
+<text x="56" y="184" font-weight="600" font-size="11">resize photo to 126×126, ImageNet-normalise, quantise to int16 (dav2_image.py)</text>
+<rect x="50" y="191.5" width="20" height="12" rx="3" fill="#e9ecef" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="201" font-size="9">pc</text>
+<text x="73.6" y="200" font-size="10">R  photo.jpg</text>
+<rect x="50" y="204.5" width="37" height="12" rx="3" fill="#d0ebff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="214" font-size="9">image</text>
+<text x="91.0" y="213" font-size="10">W  image [126×126×3] int16 + one f32 scale, 95 kB, over JTAG</text>
+<line x1="320.0" y1="228" x2="320.0" y2="242" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<rect x="40" y="242" width="560" height="60" rx="6" fill="#fff" stroke="#1c7ed6" stroke-width="1.6"/>
+<circle cx="40" cy="254" r="11" fill="#1c7ed6"/>
+<text x="40" y="258" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">2</text>
+<text x="56" y="258" font-weight="600" font-size="11">cut into 14×14 patches (im2col, stride 14)</text>
+<rect x="50" y="265.5" width="37" height="12" rx="3" fill="#d0ebff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="275" font-size="9">image</text>
+<text x="91.0" y="274" font-size="10">R  image [126×126×3]</text>
+<rect x="50" y="278.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="288" font-size="9">arena</text>
+<text x="91.0" y="287" font-size="10">W  cols [81 × 588] int16  (81 patches, 588 = 14·14·3 values each)</text>
+<line x1="320.0" y1="302" x2="320.0" y2="316" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<rect x="40" y="316" width="680" height="150" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
+<circle cx="40" cy="328" r="11" fill="#e8590c"/><text x="40" y="332" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">3</text>
+<text x="56" y="332" font-weight="600" font-size="11">patch-embedding GEMM:  acc = W · colsᵀ   — one accelerator job per 64-row tile (2 tiles: 64 + 17 rows)</text>
+<rect x="50" y="339.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="349" font-size="9">arena</text>
+<text x="91.0" y="348" font-size="10">R  cols [81 × 588] int16, 64 rows per tile → tile RAM</text>
+<rect x="50" y="352.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="362" font-size="9">blob</text>
+<text x="85.2" y="361" font-size="10">R  patch_embed.w [384 × 588] int8, streamed once per tile</text>
+<rect x="50" y="365.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="375" font-size="9">arena</text>
+<text x="91.0" y="374" font-size="10">W  acc [384 × 81] int32   and   stats [2 tiles × 384 × {max,min}] int32</text>
+<line x1="60" y1="390" x2="700" y2="390" stroke="#e8590c" stroke-width="4"/>
+<rect x="60" y="398" width="210" height="44" rx="4" fill="#fff5f0" stroke="#e8590c" stroke-width="1"/>
+<text x="165" y="413" text-anchor="middle" font-weight="600" font-size="10">read engine</text>
+<text x="165" y="426" text-anchor="middle" font-size="9">up to 8 word requests in flight; reord</text>
+<text x="165" y="437" text-anchor="middle" font-size="9">er buffer; lost response re-issued</text>
+<rect x="280" y="398" width="210" height="44" rx="4" fill="#fff5f0" stroke="#e8590c" stroke-width="1"/>
+<text x="385" y="413" text-anchor="middle" font-weight="600" font-size="10">64 multiply-accumulate units</text>
+<text x="385" y="426" text-anchor="middle" font-size="9">one int8 weight × 64 int16 activations</text>
+<text x="385" y="437" text-anchor="middle" font-size="9"> per cycle</text>
+<rect x="500" y="398" width="210" height="44" rx="4" fill="#fff5f0" stroke="#e8590c" stroke-width="1"/>
+<text x="605" y="413" text-anchor="middle" font-weight="600" font-size="10">write engine</text>
+<text x="605" y="426" text-anchor="middle" font-size="9">64 sums per weight row + {max,min}; up</text>
+<text x="605" y="437" text-anchor="middle" font-size="9"> to 8 writes awaiting ack</text>
+<line x1="60" y1="450" x2="700" y2="450" stroke="#e8590c" stroke-width="4"/>
+<text x="60" y="463" font-size="9.5" fill="#e8590c">the three run concurrently; the block is bound by the bus (3.2 cycles per word)</text>
+<line x1="320.0" y1="466" x2="320.0" y2="480" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<rect x="40" y="480" width="560" height="73" rx="6" fill="#fff" stroke="#1c7ed6" stroke-width="1.6"/>
+<circle cx="40" cy="492" r="11" fill="#1c7ed6"/>
+<text x="40" y="496" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">4</text>
+<text x="56" y="496" font-weight="600" font-size="11">requantisation parameters (per output channel)</text>
+<rect x="50" y="503.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="513" font-size="9">arena</text>
+<text x="91.0" y="512" font-size="10">R  stats [2 × 384 × {max,min}]</text>
+<rect x="50" y="516.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="526" font-size="9">blob</text>
+<text x="85.2" y="525" font-size="10">R  patch_embed scale [384] f32, bias [384] f32</text>
+<rect x="50" y="529.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="539" font-size="9">arena</text>
+<text x="91.0" y="538" font-size="10">W  params [384 × {mult, shift, bias}] int32; one output scale (f32) for the tensor</text>
+<line x1="320.0" y1="553" x2="320.0" y2="567" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<rect x="40" y="567" width="560" height="85" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
+<circle cx="40" cy="579" r="11" fill="#e8590c"/>
+<text x="40" y="583" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">5</text>
+<text x="56" y="583" font-weight="600" font-size="11">requantisation job:  emb[n][m] = sat14((acc[m][n]·mult + 2^(s−1)) &gt;&gt; s + bias)</text>
+<rect x="50" y="590.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="600" font-size="9">arena</text>
+<text x="91.0" y="599" font-size="10">R  acc [384 × 81] int32 (read transposed into tile RAM)</text>
+<rect x="50" y="603.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="613" font-size="9">arena</text>
+<text x="91.0" y="612" font-size="10">R  params [384 × 3]</text>
+<rect x="50" y="616.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="626" font-size="9">arena</text>
+<text x="91.0" y="625" font-size="10">W  emb [81 × 384] int16</text>
+<text x="50" y="638" font-size="9.5" font-style="italic" fill="#495057">the same job follows every GEMM below; written as “+ requant” from here on</text>
+<line x1="320.0" y1="652" x2="320.0" y2="666" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<rect x="40" y="666" width="560" height="73" rx="6" fill="#fff" stroke="#1c7ed6" stroke-width="1.6"/>
+<circle cx="40" cy="678" r="11" fill="#1c7ed6"/>
+<text x="40" y="682" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">6</text>
+<text x="56" y="682" font-weight="600" font-size="11">tokens:  x = [cls + pos₀ ;  emb + pos₁..₈₁]   (in float, requantised once)</text>
+<rect x="50" y="689.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="699" font-size="9">arena</text>
+<text x="91.0" y="698" font-size="10">R  emb [81 × 384]</text>
+<rect x="50" y="702.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="712" font-size="9">blob</text>
+<text x="85.2" y="711" font-size="10">R  cls_token [384] f32,  pos_embed [82 × 384] f32</text>
+<rect x="50" y="715.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="725" font-size="9">arena</text>
+<text x="91.0" y="724" font-size="10">W  x [82 × 384] int16  — the token matrix every block updates</text>
+<line x1="320.0" y1="739" x2="320.0" y2="753" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<text x="20" y="769" font-size="13" font-weight="700">Transformer encoder — steps 7–21 repeat for blocks b = 1 … 12 (weights of block b from the blob)</text>
+<line x1="20" y1="775" x2="1100" y2="775" stroke="#adb5bd" stroke-width="1"/>
+<rect x="30" y="783" width="1060" height="1468" rx="8" fill="none" stroke="#1c7ed6" stroke-width="1.2" stroke-dasharray="8 4"/>
+<rect x="40" y="799" width="560" height="73" rx="6" fill="#fff" stroke="#1c7ed6" stroke-width="1.6"/>
+<circle cx="40" cy="811" r="11" fill="#1c7ed6"/>
+<text x="40" y="815" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">7</text>
+<text x="56" y="815" font-weight="600" font-size="11">LayerNorm 1:  n = (x − mean_row) / std_row · γ + β</text>
+<rect x="50" y="822.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="832" font-size="9">arena</text>
+<text x="91.0" y="831" font-size="10">R  x [82 × 384]</text>
+<rect x="50" y="835.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="845" font-size="9">blob</text>
+<text x="85.2" y="844" font-size="10">R  norm1 γ, β [384] f32</text>
+<rect x="50" y="848.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="858" font-size="9">arena</text>
+<text x="91.0" y="857" font-size="10">W  n [82 × 384] int16</text>
+<line x1="320.0" y1="872" x2="320.0" y2="886" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<rect x="40" y="886" width="560" height="73" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
+<circle cx="40" cy="898" r="11" fill="#e8590c"/>
+<text x="40" y="902" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">8</text>
+<text x="56" y="902" font-weight="600" font-size="11">qkv GEMM + requant:  qkv = n · Wqkvᵀ</text>
+<rect x="50" y="909.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="919" font-size="9">arena</text>
+<text x="91.0" y="918" font-size="10">R  n [82 × 384] (2 tiles)</text>
+<rect x="50" y="922.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="932" font-size="9">blob</text>
+<text x="85.2" y="931" font-size="10">R  Wqkv [1152 × 384] int8</text>
+<rect x="50" y="935.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="945" font-size="9">arena</text>
+<text x="91.0" y="944" font-size="10">W  qkv [82 × 1152] int16  = [q | k | v], each 384 wide = 6 heads × 64</text>
+<line x1="320.0" y1="959" x2="320.0" y2="975" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<line x1="40" y1="975" x2="640" y2="975" stroke="#495057" stroke-width="4" stroke-dasharray="6 3"/>
+<text x="40" y="988" font-size="9.5" fill="#495057">6 attention heads: independent of each other — run one after another today</text>
+<rect x="50" y="997" width="840" height="563" rx="6" fill="none" stroke="#e8590c" stroke-width="1" stroke-dasharray="4 3"/>
+<text x="60" y="1011" font-size="10.5" font-weight="600" fill="#e8590c">head h = 1 … 6  (columns h·64 … h·64+63 of q, k, v)</text>
+<rect x="60" y="1021" width="520" height="99" rx="6" fill="#fff" stroke="#1c7ed6" stroke-width="1.6"/>
+<circle cx="60" cy="1033" r="11" fill="#1c7ed6"/>
+<text x="60" y="1037" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">9</text>
+<text x="76" y="1037" font-weight="600" font-size="11">gather this head, scale to 11 bits, split the int16 operands into int8 halves</text>
+<rect x="70" y="1044.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="74" y="1054" font-size="9">arena</text>
+<text x="111.0" y="1053" font-size="10">R  q, k, v slices of qkv [82 × 64] each</text>
+<rect x="70" y="1057.5" width="49" height="12" rx="3" fill="#fff3bf" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="74" y="1067" font-size="9">scratch</text>
+<text x="122.6" y="1066" font-size="10">W  q, k copies [82 × 64] (range search)</text>
+<rect x="70" y="1070.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="74" y="1080" font-size="9">arena</text>
+<text x="111.0" y="1079" font-size="10">W  k16 [82 × 64] int16 (k &gt;&gt; k_sh)</text>
+<rect x="70" y="1083.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="74" y="1093" font-size="9">arena</text>
+<text x="111.0" y="1092" font-size="10">W  q_hi = q&gt;&gt;4, q_lo = q&amp;15  [82 × 64] int8 each</text>
+<rect x="70" y="1096.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="74" y="1106" font-size="9">arena</text>
+<text x="111.0" y="1105" font-size="10">W  vᵀ_hi = v&gt;&gt;6, vᵀ_lo = v&amp;63  [64 × 84] int8 each (transposed, padded to 84)</text>
+<line x1="320.0" y1="1120" x2="320.0" y2="1134" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<line x1="60" y1="1134" x2="580" y2="1134" stroke="#495057" stroke-width="4" stroke-dasharray="6 3"/>
+<text x="60" y="1147" font-size="9.5" fill="#495057">two independent jobs — sequential today</text>
+<rect x="60" y="1154" width="250.0" height="73" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
+<circle cx="60" cy="1166" r="11" fill="#e8590c"/>
+<text x="60" y="1170" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">10a</text>
+<text x="76" y="1170" font-weight="600" font-size="11">S_hi = k16 · q_hiᵀ</text>
+<rect x="70" y="1177.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="74" y="1187" font-size="9">arena</text>
+<text x="111.0" y="1186" font-size="10">R  k16 [82 × 64]</text>
+<rect x="70" y="1190.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="74" y="1200" font-size="9">arena</text>
+<text x="111.0" y="1199" font-size="10">R  q_hi [82 × 64]</text>
+<rect x="70" y="1203.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="74" y="1213" font-size="9">arena</text>
+<text x="111.0" y="1212" font-size="10">W  S_hi [82 × 82] int32</text>
+<rect x="330.0" y="1154" width="250.0" height="73" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
+<circle cx="330.0" cy="1166" r="11" fill="#e8590c"/>
+<text x="330.0" y="1170" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">10b</text>
+<text x="346.0" y="1170" font-weight="600" font-size="11">S_lo = k16 · q_loᵀ</text>
+<rect x="340.0" y="1177.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="344.0" y="1187" font-size="9">arena</text>
+<text x="381.0" y="1186" font-size="10">R  k16 [82 × 64]</text>
+<rect x="340.0" y="1190.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="344.0" y="1200" font-size="9">arena</text>
+<text x="381.0" y="1199" font-size="10">R  q_lo [82 × 64]</text>
+<rect x="340.0" y="1203.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="344.0" y="1213" font-size="9">arena</text>
+<text x="381.0" y="1212" font-size="10">W  S_lo [82 × 82] int32</text>
+<line x1="60" y1="1235" x2="580" y2="1235" stroke="#495057" stroke-width="4" stroke-dasharray="6 3"/>
+<line x1="320.0" y1="1235" x2="320.0" y2="1247" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<rect x="60" y="1247" width="520" height="87" rx="6" fill="#fff" stroke="#1c7ed6" stroke-width="1.6"/>
+<circle cx="60" cy="1259" r="11" fill="#1c7ed6"/>
+<text x="60" y="1263" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">11</text>
+<text x="76" y="1263" font-weight="600" font-size="11">softmax per query row:  S = 16·S_hi + S_lo;  P[t][m] = 2^((S[t][m] −</text>
+<text x="76" y="1277" font-weight="600" font-size="11">max_t)·scale·log2e) in Q15</text>
+<rect x="70" y="1284.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="74" y="1294" font-size="9">arena</text>
+<text x="111.0" y="1293" font-size="10">R  S_hi, S_lo [82 × 82]</text>
+<rect x="70" y="1297.5" width="49" height="12" rx="3" fill="#fff3bf" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="74" y="1307" font-size="9">scratch</text>
+<text x="122.6" y="1306" font-size="10">R  score row [82] int32</text>
+<rect x="70" y="1310.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="74" y="1320" font-size="9">arena</text>
+<text x="111.0" y="1319" font-size="10">W  P [82 × 84] int16 (Q15, padded), sum[82] int32, 1/sum[82] int64</text>
+<line x1="320.0" y1="1334" x2="320.0" y2="1348" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<line x1="60" y1="1348" x2="580" y2="1348" stroke="#495057" stroke-width="4" stroke-dasharray="6 3"/>
+<text x="60" y="1361" font-size="9.5" fill="#495057">two independent jobs — sequential today</text>
+<rect x="60" y="1368" width="250.0" height="73" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
+<circle cx="60" cy="1380" r="11" fill="#e8590c"/>
+<text x="60" y="1384" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">12a</text>
+<text x="76" y="1384" font-weight="600" font-size="11">C_hi = P · vᵀ_hiᵀ</text>
+<rect x="70" y="1391.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="74" y="1401" font-size="9">arena</text>
+<text x="111.0" y="1400" font-size="10">R  P [82 × 84]</text>
+<rect x="70" y="1404.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="74" y="1414" font-size="9">arena</text>
+<text x="111.0" y="1413" font-size="10">R  vᵀ_hi [64 × 84]</text>
+<rect x="70" y="1417.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="74" y="1427" font-size="9">arena</text>
+<text x="111.0" y="1426" font-size="10">W  C_hi [64 × 82] int32</text>
+<rect x="330.0" y="1368" width="250.0" height="73" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
+<circle cx="330.0" cy="1380" r="11" fill="#e8590c"/>
+<text x="330.0" y="1384" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">12b</text>
+<text x="346.0" y="1384" font-weight="600" font-size="11">C_lo = P · vᵀ_loᵀ</text>
+<rect x="340.0" y="1391.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="344.0" y="1401" font-size="9">arena</text>
+<text x="381.0" y="1400" font-size="10">R  P [82 × 84]</text>
+<rect x="340.0" y="1404.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="344.0" y="1414" font-size="9">arena</text>
+<text x="381.0" y="1413" font-size="10">R  vᵀ_lo [64 × 84]</text>
+<rect x="340.0" y="1417.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="344.0" y="1427" font-size="9">arena</text>
+<text x="381.0" y="1426" font-size="10">W  C_lo [64 × 82] int32</text>
+<line x1="60" y1="1449" x2="580" y2="1449" stroke="#495057" stroke-width="4" stroke-dasharray="6 3"/>
+<line x1="320.0" y1="1449" x2="320.0" y2="1461" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<rect x="60" y="1461" width="520" height="87" rx="6" fill="#fff" stroke="#1c7ed6" stroke-width="1.6"/>
+<circle cx="60" cy="1473" r="11" fill="#1c7ed6"/>
+<text x="60" y="1477" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">13</text>
+<text x="76" y="1477" font-weight="600" font-size="11">normalise:  ctx[t][d] = (64·C_hi + C_lo)[d][t] / sum[t]   (reciprocal + one</text>
+<text x="76" y="1491" font-weight="600" font-size="11">correction step: exact)</text>
+<rect x="70" y="1498.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="74" y="1508" font-size="9">arena</text>
+<text x="111.0" y="1507" font-size="10">R  C_hi, C_lo [64 × 82], sum, 1/sum</text>
+<rect x="70" y="1511.5" width="49" height="12" rx="3" fill="#fff3bf" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="74" y="1521" font-size="9">scratch</text>
+<text x="122.6" y="1520" font-size="10">W  ctx head slice [82 × 64], assembled then copied out</text>
+<rect x="70" y="1524.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="74" y="1534" font-size="9">arena</text>
+<text x="111.0" y="1533" font-size="10">W  ctx [82 × 384] int16, columns of head h</text>
+<text x="604" y="1037" font-size="10" fill="#e8590c">Why the halves: the accelerator multiplies</text>
+<text x="604" y="1050" font-size="10" fill="#e8590c">int16 × int8. q and v are int16, so each is</text>
+<text x="604" y="1063" font-size="10" fill="#e8590c">split into a high and a low int8 part and the</text>
+<text x="604" y="1076" font-size="10" fill="#e8590c">product is run twice: a·x = 2ˢ·(a·hi) + (a·lo).</text>
+<text x="604" y="1089" font-size="10" fill="#e8590c">Exact — no rounding anywhere in 10–12.</text>
+<text x="604" y="1102" font-size="10" fill="#495057"></text>
+<text x="604" y="1115" font-size="10" fill="#495057">Per head the accelerator does 4 jobs of</text>
+<text x="604" y="1128" font-size="10" fill="#495057">82×64×82 or 82×84×64 MACs; the CPU does</text>
+<text x="604" y="1141" font-size="10" fill="#495057">the gathers, 6 724 exponentials and 5 248</text>
+<text x="604" y="1154" font-size="10" fill="#495057">normalisations.</text>
+<line x1="40" y1="1568" x2="640" y2="1568" stroke="#495057" stroke-width="4" stroke-dasharray="6 3"/>
+<line x1="320.0" y1="1568" x2="320.0" y2="1582" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<rect x="40" y="1582" width="560" height="73" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
+<circle cx="40" cy="1594" r="11" fill="#e8590c"/>
+<text x="40" y="1598" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">14</text>
+<text x="56" y="1598" font-weight="600" font-size="11">projection GEMM + requant:  attn = ctx · Wprojᵀ</text>
+<rect x="50" y="1605.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="1615" font-size="9">arena</text>
+<text x="91.0" y="1614" font-size="10">R  ctx [82 × 384]</text>
+<rect x="50" y="1618.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="1628" font-size="9">blob</text>
+<text x="85.2" y="1627" font-size="10">R  Wproj [384 × 384] int8</text>
+<rect x="50" y="1631.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="1641" font-size="9">arena</text>
+<text x="91.0" y="1640" font-size="10">W  attn [82 × 384] int16</text>
+<line x1="320.0" y1="1655" x2="320.0" y2="1669" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<rect x="40" y="1669" width="560" height="60" rx="6" fill="#fff" stroke="#1c7ed6" stroke-width="1.6"/>
+<circle cx="40" cy="1681" r="11" fill="#1c7ed6"/>
+<text x="40" y="1685" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">15</text>
+<text x="56" y="1685" font-weight="600" font-size="11">residual:  x = x + attn   (both rescaled to a common scale, saturated to 14 bits)</text>
+<rect x="50" y="1692.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="1702" font-size="9">arena</text>
+<text x="91.0" y="1701" font-size="10">R  x, attn [82 × 384]</text>
+<rect x="50" y="1705.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="1715" font-size="9">arena</text>
+<text x="91.0" y="1714" font-size="10">W  x [82 × 384]</text>
+<line x1="320.0" y1="1729" x2="320.0" y2="1743" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<rect x="40" y="1743" width="560" height="73" rx="6" fill="#fff" stroke="#1c7ed6" stroke-width="1.6"/>
+<circle cx="40" cy="1755" r="11" fill="#1c7ed6"/>
+<text x="40" y="1759" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">16</text>
+<text x="56" y="1759" font-weight="600" font-size="11">LayerNorm 2:  n2 = LN(x; γ₂, β₂)</text>
+<rect x="50" y="1766.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="1776" font-size="9">arena</text>
+<text x="91.0" y="1775" font-size="10">R  x [82 × 384]</text>
+<rect x="50" y="1779.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="1789" font-size="9">blob</text>
+<text x="85.2" y="1788" font-size="10">R  norm2 γ, β [384] f32</text>
+<rect x="50" y="1792.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="1802" font-size="9">arena</text>
+<text x="91.0" y="1801" font-size="10">W  n2 [82 × 384]</text>
+<line x1="320.0" y1="1816" x2="320.0" y2="1830" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<rect x="40" y="1830" width="560" height="73" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
+<circle cx="40" cy="1842" r="11" fill="#e8590c"/>
+<text x="40" y="1846" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">17</text>
+<text x="56" y="1846" font-weight="600" font-size="11">MLP up GEMM + requant:  hdn = n2 · Wfc1ᵀ</text>
+<rect x="50" y="1853.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="1863" font-size="9">arena</text>
+<text x="91.0" y="1862" font-size="10">R  n2 [82 × 384]</text>
+<rect x="50" y="1866.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="1876" font-size="9">blob</text>
+<text x="85.2" y="1875" font-size="10">R  Wfc1 [1536 × 384] int8</text>
+<rect x="50" y="1879.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="1889" font-size="9">arena</text>
+<text x="91.0" y="1888" font-size="10">W  hdn [82 × 1536] int16</text>
+<line x1="320.0" y1="1903" x2="320.0" y2="1917" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<rect x="40" y="1917" width="560" height="60" rx="6" fill="#fff" stroke="#1c7ed6" stroke-width="1.6"/>
+<circle cx="40" cy="1929" r="11" fill="#1c7ed6"/>
+<text x="40" y="1933" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">18</text>
+<text x="56" y="1933" font-weight="600" font-size="11">GELU in place:  hdn = gelu(hdn)   (257-entry table, linear interpolation)</text>
+<rect x="50" y="1940.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="1950" font-size="9">arena</text>
+<text x="91.0" y="1949" font-size="10">R  hdn [82 × 1536]</text>
+<rect x="50" y="1953.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="1963" font-size="9">arena</text>
+<text x="91.0" y="1962" font-size="10">W  hdn [82 × 1536]</text>
+<line x1="320.0" y1="1977" x2="320.0" y2="1991" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<rect x="40" y="1991" width="560" height="73" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
+<circle cx="40" cy="2003" r="11" fill="#e8590c"/>
+<text x="40" y="2007" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">19</text>
+<text x="56" y="2007" font-weight="600" font-size="11">MLP down GEMM + requant:  h2 = hdn · Wfc2ᵀ</text>
+<rect x="50" y="2014.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="2024" font-size="9">arena</text>
+<text x="91.0" y="2023" font-size="10">R  hdn [82 × 1536]</text>
+<rect x="50" y="2027.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="2037" font-size="9">blob</text>
+<text x="85.2" y="2036" font-size="10">R  Wfc2 [384 × 1536] int8</text>
+<rect x="50" y="2040.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="2050" font-size="9">arena</text>
+<text x="91.0" y="2049" font-size="10">W  h2 [82 × 384] int16</text>
+<line x1="320.0" y1="2064" x2="320.0" y2="2078" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<rect x="40" y="2078" width="560" height="60" rx="6" fill="#fff" stroke="#1c7ed6" stroke-width="1.6"/>
+<circle cx="40" cy="2090" r="11" fill="#1c7ed6"/>
+<text x="40" y="2094" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">20</text>
+<text x="56" y="2094" font-weight="600" font-size="11">residual:  x = x + h2</text>
+<rect x="50" y="2101.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="2111" font-size="9">arena</text>
+<text x="91.0" y="2110" font-size="10">R  x, h2 [82 × 384]</text>
+<rect x="50" y="2114.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="2124" font-size="9">arena</text>
+<text x="91.0" y="2123" font-size="10">W  x [82 × 384]  → next block (7)</text>
+<line x1="320.0" y1="2138" x2="320.0" y2="2152" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<rect x="40" y="2152" width="560" height="87" rx="6" fill="#fff" stroke="#1c7ed6" stroke-width="1.6"/>
+<circle cx="40" cy="2164" r="11" fill="#1c7ed6"/>
+<text x="40" y="2168" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">21</text>
+<text x="56" y="2168" font-weight="600" font-size="11">feature tap — only after blocks 3, 6, 9 and 12:  feats[i] = LN(x; γ, β)[1..81]   (class</text>
+<text x="56" y="2182" font-weight="600" font-size="11">token dropped)</text>
+<rect x="50" y="2189.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="2199" font-size="9">arena</text>
+<text x="91.0" y="2198" font-size="10">R  x [82 × 384]</text>
+<rect x="50" y="2202.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="2212" font-size="9">blob</text>
+<text x="85.2" y="2211" font-size="10">R  norm γ, β [384] f32 (the final norm)</text>
+<rect x="50" y="2215.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="2225" font-size="9">arena</text>
+<text x="91.0" y="2224" font-size="10">W  feats[i] [81 × 384] int16,  i = 0..3  (a 9 × 9 grid of 384-vectors)</text>
+<line x1="320.0" y1="2251" x2="320.0" y2="2265" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<text x="20" y="2281" font-size="13" font-weight="700">DPT decoder — four feature levels, then fused coarse to fine</text>
+<line x1="20" y1="2287" x2="1100" y2="2287" stroke="#adb5bd" stroke-width="1"/>
+<line x1="40" y1="2295" x2="1076" y2="2295" stroke="#495057" stroke-width="4" stroke-dasharray="6 3"/>
+<text x="40" y="2308" font-size="9.5" fill="#495057">the four levels are independent of one another — computed one after another today</text>
+<text x="44" y="2331" font-size="10.5" font-weight="600">level 0  ← feats[0] (block 3)</text>
+<rect x="40" y="2339" width="250" height="87" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
+<circle cx="40" cy="2351" r="11" fill="#e8590c"/>
+<text x="40" y="2355" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">22a</text>
+<text x="56" y="2355" font-weight="600" font-size="11">1×1 conv = GEMM + requant: p =</text>
+<text x="56" y="2369" font-weight="600" font-size="11">feats[0] · proj0ᵀ</text>
+<rect x="50" y="2376.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="2386" font-size="9">arena</text>
+<text x="91.0" y="2385" font-size="10">R  feats[0] [81 × 384]</text>
+<rect x="50" y="2389.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="2399" font-size="9">blob</text>
+<text x="85.2" y="2398" font-size="10">R  proj0 [48 × 384]</text>
+<rect x="50" y="2402.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="2412" font-size="9">arena</text>
+<text x="91.0" y="2411" font-size="10">W  p [81 × 48]</text>
+<line x1="165.0" y1="2426" x2="165.0" y2="2436" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<rect x="40" y="2436" width="250" height="87" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
+<circle cx="40" cy="2448" r="11" fill="#e8590c"/>
+<text x="40" y="2452" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">22b</text>
+<text x="56" y="2452" font-weight="600" font-size="11">upsample ×4: conv-transpose GEMM +</text>
+<text x="56" y="2466" font-weight="600" font-size="11">requant, scatter (CPU)</text>
+<rect x="50" y="2473.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="2483" font-size="9">arena</text>
+<text x="91.0" y="2482" font-size="10">R  p [81 × 48]</text>
+<rect x="50" y="2486.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="2496" font-size="9">blob</text>
+<text x="85.2" y="2495" font-size="10">R  resize0 [768 × 48]</text>
+<rect x="50" y="2499.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="2509" font-size="9">arena</text>
+<text x="91.0" y="2508" font-size="10">W  [81 × 768] → r [36×36 × 48]</text>
+<line x1="165.0" y1="2523" x2="165.0" y2="2533" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<rect x="40" y="2533" width="250" height="87" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
+<circle cx="40" cy="2545" r="11" fill="#e8590c"/>
+<text x="40" y="2549" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">22c</text>
+<text x="56" y="2549" font-weight="600" font-size="11">3×3 conv: im2col (CPU) + GEMM +</text>
+<text x="56" y="2563" font-weight="600" font-size="11">requant</text>
+<rect x="50" y="2570.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="2580" font-size="9">arena</text>
+<text x="91.0" y="2579" font-size="10">R  r as cols [1296 × 432]</text>
+<rect x="50" y="2583.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="2593" font-size="9">blob</text>
+<text x="85.2" y="2592" font-size="10">R  rn1 [64 × 432]</text>
+<rect x="50" y="2596.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="2606" font-size="9">arena</text>
+<text x="91.0" y="2605" font-size="10">W  rn1 [36×36 × 64]</text>
+<text x="306" y="2331" font-size="10.5" font-weight="600">level 1  ← feats[1] (block 6)</text>
+<rect x="302" y="2339" width="250" height="73" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
+<circle cx="302" cy="2351" r="11" fill="#e8590c"/>
+<text x="302" y="2355" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">23a</text>
+<text x="318" y="2355" font-weight="600" font-size="11">1×1 conv: p = feats[1] · proj1ᵀ</text>
+<rect x="312" y="2362.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="316" y="2372" font-size="9">arena</text>
+<text x="353.0" y="2371" font-size="10">R  feats[1] [81 × 384]</text>
+<rect x="312" y="2375.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="316" y="2385" font-size="9">blob</text>
+<text x="347.2" y="2384" font-size="10">R  proj1 [96 × 384]</text>
+<rect x="312" y="2388.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="316" y="2398" font-size="9">arena</text>
+<text x="353.0" y="2397" font-size="10">W  p [81 × 96]</text>
+<line x1="427.0" y1="2412" x2="427.0" y2="2422" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<rect x="302" y="2422" width="250" height="87" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
+<circle cx="302" cy="2434" r="11" fill="#e8590c"/>
+<text x="302" y="2438" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">23b</text>
+<text x="318" y="2438" font-weight="600" font-size="11">upsample ×2: conv-transpose GEMM +</text>
+<text x="318" y="2452" font-weight="600" font-size="11">scatter</text>
+<rect x="312" y="2459.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="316" y="2469" font-size="9">arena</text>
+<text x="353.0" y="2468" font-size="10">R  p [81 × 96]</text>
+<rect x="312" y="2472.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="316" y="2482" font-size="9">blob</text>
+<text x="347.2" y="2481" font-size="10">R  resize1 [384 × 96]</text>
+<rect x="312" y="2485.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="316" y="2495" font-size="9">arena</text>
+<text x="353.0" y="2494" font-size="10">W  [81 × 384] → r [18×18 × 96]</text>
+<line x1="427.0" y1="2509" x2="427.0" y2="2519" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<rect x="302" y="2519" width="250" height="73" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
+<circle cx="302" cy="2531" r="11" fill="#e8590c"/>
+<text x="302" y="2535" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">23c</text>
+<text x="318" y="2535" font-weight="600" font-size="11">3×3 conv: im2col + GEMM + requant</text>
+<rect x="312" y="2542.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="316" y="2552" font-size="9">arena</text>
+<text x="353.0" y="2551" font-size="10">R  cols [324 × 864]</text>
+<rect x="312" y="2555.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="316" y="2565" font-size="9">blob</text>
+<text x="347.2" y="2564" font-size="10">R  rn2 [64 × 864]</text>
+<rect x="312" y="2568.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="316" y="2578" font-size="9">arena</text>
+<text x="353.0" y="2577" font-size="10">W  rn2 [18×18 × 64]</text>
+<text x="568" y="2331" font-size="10.5" font-weight="600">level 2  ← feats[2] (block 9)</text>
+<rect x="564" y="2339" width="250" height="73" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
+<circle cx="564" cy="2351" r="11" fill="#e8590c"/>
+<text x="564" y="2355" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">24a</text>
+<text x="580" y="2355" font-weight="600" font-size="11">1×1 conv: p = feats[2] · proj2ᵀ</text>
+<rect x="574" y="2362.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="578" y="2372" font-size="9">arena</text>
+<text x="615.0" y="2371" font-size="10">R  feats[2] [81 × 384]</text>
+<rect x="574" y="2375.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="578" y="2385" font-size="9">blob</text>
+<text x="609.2" y="2384" font-size="10">R  proj2 [192 × 384]</text>
+<rect x="574" y="2388.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="578" y="2398" font-size="9">arena</text>
+<text x="615.0" y="2397" font-size="10">W  p [81 × 192]</text>
+<line x1="689.0" y1="2412" x2="689.0" y2="2422" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<rect x="564" y="2422" width="250" height="34" rx="6" fill="#fff" stroke="#1c7ed6" stroke-width="1.6"/>
+<circle cx="564" cy="2434" r="11" fill="#1c7ed6"/>
+<text x="564" y="2438" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">24b</text>
+<text x="580" y="2438" font-weight="600" font-size="11">no resize (9 × 9 stays)</text>
+<line x1="689.0" y1="2456" x2="689.0" y2="2466" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<rect x="564" y="2466" width="250" height="73" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
+<circle cx="564" cy="2478" r="11" fill="#e8590c"/>
+<text x="564" y="2482" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">24c</text>
+<text x="580" y="2482" font-weight="600" font-size="11">3×3 conv: im2col + GEMM + requant</text>
+<rect x="574" y="2489.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="578" y="2499" font-size="9">arena</text>
+<text x="615.0" y="2498" font-size="10">R  cols [81 × 1728]</text>
+<rect x="574" y="2502.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="578" y="2512" font-size="9">blob</text>
+<text x="609.2" y="2511" font-size="10">R  rn3 [64 × 1728]</text>
+<rect x="574" y="2515.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="578" y="2525" font-size="9">arena</text>
+<text x="615.0" y="2524" font-size="10">W  rn3 [9×9 × 64]</text>
+<text x="830" y="2331" font-size="10.5" font-weight="600">level 3  ← feats[3] (block 12)</text>
+<rect x="826" y="2339" width="250" height="73" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
+<circle cx="826" cy="2351" r="11" fill="#e8590c"/>
+<text x="826" y="2355" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">25a</text>
+<text x="842" y="2355" font-weight="600" font-size="11">1×1 conv: p = feats[3] · proj3ᵀ</text>
+<rect x="836" y="2362.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="840" y="2372" font-size="9">arena</text>
+<text x="877.0" y="2371" font-size="10">R  feats[3] [81 × 384]</text>
+<rect x="836" y="2375.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="840" y="2385" font-size="9">blob</text>
+<text x="871.2" y="2384" font-size="10">R  proj3 [384 × 384]</text>
+<rect x="836" y="2388.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="840" y="2398" font-size="9">arena</text>
+<text x="877.0" y="2397" font-size="10">W  p [81 × 384]</text>
+<line x1="951.0" y1="2412" x2="951.0" y2="2422" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<rect x="826" y="2422" width="250" height="115" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
+<circle cx="826" cy="2434" r="11" fill="#e8590c"/>
+<text x="826" y="2438" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">25b</text>
+<text x="842" y="2438" font-weight="600" font-size="11">downsample: 3×3 conv stride 2 =</text>
+<text x="842" y="2452" font-weight="600" font-size="11">im2col + GEMM in 2 K-chunks (1920 +</text>
+<text x="842" y="2466" font-weight="600" font-size="11">1536, partial sums added on the CPU)</text>
+<text x="842" y="2480" font-weight="600" font-size="11">+ requant</text>
+<rect x="836" y="2487.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="840" y="2497" font-size="9">arena</text>
+<text x="877.0" y="2496" font-size="10">R  cols [25 × 3456]</text>
+<rect x="836" y="2500.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="840" y="2510" font-size="9">blob</text>
+<text x="871.2" y="2509" font-size="10">R  resize3 [384 × 3456]</text>
+<rect x="836" y="2513.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="840" y="2523" font-size="9">arena</text>
+<text x="877.0" y="2522" font-size="10">W  r [5×5 × 384]</text>
+<line x1="951.0" y1="2537" x2="951.0" y2="2547" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<rect x="826" y="2547" width="250" height="87" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
+<circle cx="826" cy="2559" r="11" fill="#e8590c"/>
+<text x="826" y="2563" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">25c</text>
+<text x="842" y="2563" font-weight="600" font-size="11">3×3 conv: im2col + GEMM (2 chunks) +</text>
+<text x="842" y="2577" font-weight="600" font-size="11">requant</text>
+<rect x="836" y="2584.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="840" y="2594" font-size="9">arena</text>
+<text x="877.0" y="2593" font-size="10">R  cols [25 × 3456]</text>
+<rect x="836" y="2597.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="840" y="2607" font-size="9">blob</text>
+<text x="871.2" y="2606" font-size="10">R  rn4 [64 × 3456]</text>
+<rect x="836" y="2610.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="840" y="2620" font-size="9">arena</text>
+<text x="877.0" y="2619" font-size="10">W  rn4 [5×5 × 64]</text>
+<line x1="40" y1="2646" x2="1076" y2="2646" stroke="#495057" stroke-width="4" stroke-dasharray="6 3"/>
+<text x="40" y="2660" font-size="10">Result of 22–25: four 64-channel feature maps at 36×36, 18×18, 9×9 and 5×5 — the same content at four resolutions.</text>
+<text x="40" y="2673" font-size="10">Every 3×3 convolution above is: the CPU gathers each pixel’s 3×3 neighbourhood into one row (im2col), the accelerator multiplies, the accelerator requantises.</text>
+<text x="20" y="2695" font-size="13" font-weight="700">Fusion — coarse to fine; each step needs the previous one (strictly sequential)</text>
+<line x1="20" y1="2701" x2="1100" y2="2701" stroke="#adb5bd" stroke-width="1"/>
+<text x="40" y="2717" font-size="10">RCU(t) = t + conv3×3(relu(conv3×3(relu(t))))  — two 3×3 convolutions (im2col + GEMM + requant, weights rf·.u·c1/c2 [64 × 576]) with ReLUs on the CPU, plus the input.</text>
+<rect x="40" y="2729" width="760" height="85" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
+<circle cx="40" cy="2741" r="11" fill="#e8590c"/>
+<text x="40" y="2745" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">26</text>
+<text x="56" y="2745" font-weight="600" font-size="11">path4 = conv1×1( up_5→9( RCU(rn4) ) )</text>
+<rect x="50" y="2752.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="2762" font-size="9">arena</text>
+<text x="91.0" y="2761" font-size="10">R  rn4 [5×5 × 64]</text>
+<rect x="50" y="2765.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="2775" font-size="9">blob</text>
+<text x="85.2" y="2774" font-size="10">R  rf4.u2c1, u2c2 [64 × 576], rf4.out [64 × 64]</text>
+<rect x="50" y="2778.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="2788" font-size="9">arena</text>
+<text x="91.0" y="2787" font-size="10">W  path4 [9×9 × 64]</text>
+<text x="50" y="2800" font-size="9.5" font-style="italic" fill="#495057">bilinear 5×5 → 9×9 on the CPU</text>
+<line x1="420.0" y1="2814" x2="420.0" y2="2826" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<rect x="40" y="2826" width="760" height="85" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
+<circle cx="40" cy="2838" r="11" fill="#e8590c"/>
+<text x="40" y="2842" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">27</text>
+<text x="56" y="2842" font-weight="600" font-size="11">path3 = conv1×1( up_9→18( RCU( path4 + RCU(rn3) ) ) )</text>
+<rect x="50" y="2849.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="2859" font-size="9">arena</text>
+<text x="91.0" y="2858" font-size="10">R  path4 [9×9 × 64], rn3 [9×9 × 64]</text>
+<rect x="50" y="2862.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="2872" font-size="9">blob</text>
+<text x="85.2" y="2871" font-size="10">R  rf3.u1c1, u1c2, u2c1, u2c2 [64 × 576], rf3.out [64 × 64]</text>
+<rect x="50" y="2875.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="2885" font-size="9">arena</text>
+<text x="91.0" y="2884" font-size="10">W  path3 [18×18 × 64]</text>
+<text x="50" y="2897" font-size="9.5" font-style="italic" fill="#495057">add on the CPU; bilinear 9 → 18 on the CPU</text>
+<line x1="420.0" y1="2911" x2="420.0" y2="2923" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<rect x="40" y="2923" width="760" height="85" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
+<circle cx="40" cy="2935" r="11" fill="#e8590c"/>
+<text x="40" y="2939" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">28</text>
+<text x="56" y="2939" font-weight="600" font-size="11">path2 = conv1×1( up_18→36( RCU( path3 + RCU(rn2) ) ) )</text>
+<rect x="50" y="2946.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="2956" font-size="9">arena</text>
+<text x="91.0" y="2955" font-size="10">R  path3 [18×18 × 64], rn2 [18×18 × 64]</text>
+<rect x="50" y="2959.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="2969" font-size="9">blob</text>
+<text x="85.2" y="2968" font-size="10">R  rf2.* [64 × 576] ×4, rf2.out [64 × 64]</text>
+<rect x="50" y="2972.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="2982" font-size="9">arena</text>
+<text x="91.0" y="2981" font-size="10">W  path2 [36×36 × 64]</text>
+<text x="50" y="2994" font-size="9.5" font-style="italic" fill="#495057">bilinear 18 → 36 on the CPU</text>
+<line x1="420.0" y1="3008" x2="420.0" y2="3020" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<rect x="40" y="3020" width="760" height="85" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
+<circle cx="40" cy="3032" r="11" fill="#e8590c"/>
+<text x="40" y="3036" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">29</text>
+<text x="56" y="3036" font-weight="600" font-size="11">path1 = conv1×1( up_36→72( RCU( path2 + RCU(rn1) ) ) )</text>
+<rect x="50" y="3043.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="3053" font-size="9">arena</text>
+<text x="91.0" y="3052" font-size="10">R  path2 [36×36 × 64], rn1 [36×36 × 64]</text>
+<rect x="50" y="3056.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="3066" font-size="9">blob</text>
+<text x="85.2" y="3065" font-size="10">R  rf1.* [64 × 576] ×4, rf1.out [64 × 64]</text>
+<rect x="50" y="3069.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="3079" font-size="9">arena</text>
+<text x="91.0" y="3078" font-size="10">W  path1 [72×72 × 64]</text>
+<text x="50" y="3091" font-size="9.5" font-style="italic" fill="#495057">bilinear 36 → 72 on the CPU</text>
+<line x1="420.0" y1="3105" x2="420.0" y2="3117" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<text x="20" y="3129" font-size="13" font-weight="700">Output</text>
+<line x1="20" y1="3135" x2="1100" y2="3135" stroke="#adb5bd" stroke-width="1"/>
+<rect x="40" y="3143" width="760" height="73" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
+<circle cx="40" cy="3155" r="11" fill="#e8590c"/>
+<text x="40" y="3159" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">30</text>
+<text x="56" y="3159" font-weight="600" font-size="11">3×3 conv, 64 → 32:  im2col (CPU) + GEMM + requant</text>
+<rect x="50" y="3166.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="3176" font-size="9">arena</text>
+<text x="91.0" y="3175" font-size="10">R  path1 as cols [5184 × 576]</text>
+<rect x="50" y="3179.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="3189" font-size="9">blob</text>
+<text x="85.2" y="3188" font-size="10">R  out1 [32 × 576]</text>
+<rect x="50" y="3192.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="3202" font-size="9">arena</text>
+<text x="91.0" y="3201" font-size="10">W  o1 [72×72 × 32]</text>
+<line x1="420.0" y1="3216" x2="420.0" y2="3228" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<rect x="40" y="3228" width="760" height="60" rx="6" fill="#fff" stroke="#1c7ed6" stroke-width="1.6"/>
+<circle cx="40" cy="3240" r="11" fill="#1c7ed6"/>
+<text x="40" y="3244" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">31</text>
+<text x="56" y="3244" font-weight="600" font-size="11">bilinear upsample 72×72 → 126×126 (Q8 weights)</text>
+<rect x="50" y="3251.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="3261" font-size="9">arena</text>
+<text x="91.0" y="3260" font-size="10">R  o1 [72×72 × 32]</text>
+<rect x="50" y="3264.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="3274" font-size="9">arena</text>
+<text x="91.0" y="3273" font-size="10">W  u [126×126 × 32] int16</text>
+<line x1="420.0" y1="3288" x2="420.0" y2="3300" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<rect x="40" y="3300" width="760" height="73" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
+<circle cx="40" cy="3312" r="11" fill="#e8590c"/>
+<text x="40" y="3316" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">32</text>
+<text x="56" y="3316" font-weight="600" font-size="11">3×3 conv, 32 → 32:  im2col (CPU, 15 876 rows) + GEMM + requant, then ReLU (CPU)</text>
+<rect x="50" y="3323.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="3333" font-size="9">arena</text>
+<text x="91.0" y="3332" font-size="10">R  u as cols [15876 × 288]</text>
+<rect x="50" y="3336.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="3346" font-size="9">blob</text>
+<text x="85.2" y="3345" font-size="10">R  out2a [32 × 288]</text>
+<rect x="50" y="3349.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="3359" font-size="9">arena</text>
+<text x="91.0" y="3358" font-size="10">W  o2 [126×126 × 32]</text>
+<line x1="420.0" y1="3373" x2="420.0" y2="3385" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<rect x="40" y="3385" width="760" height="73" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
+<circle cx="40" cy="3397" r="11" fill="#e8590c"/>
+<text x="40" y="3401" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">33</text>
+<text x="56" y="3401" font-weight="600" font-size="11">1×1 conv, 32 → 1:  GEMM + requant, then ReLU (CPU)</text>
+<rect x="50" y="3408.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="3418" font-size="9">arena</text>
+<text x="91.0" y="3417" font-size="10">R  o2 [15876 × 32]</text>
+<rect x="50" y="3421.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="3431" font-size="9">blob</text>
+<text x="85.2" y="3430" font-size="10">R  out2b [1 × 32]</text>
+<rect x="50" y="3434.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="3444" font-size="9">arena</text>
+<text x="91.0" y="3443" font-size="10">W  d [126×126 × 1] int16</text>
+<line x1="420.0" y1="3458" x2="420.0" y2="3470" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<rect x="40" y="3470" width="760" height="60" rx="6" fill="#fff" stroke="#1c7ed6" stroke-width="1.6"/>
+<circle cx="40" cy="3482" r="11" fill="#1c7ed6"/>
+<text x="40" y="3486" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">34</text>
+<text x="56" y="3486" font-weight="600" font-size="11">to float:  depth = d · scale;  raise the done flag</text>
+<rect x="50" y="3493.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="3503" font-size="9">arena</text>
+<text x="91.0" y="3502" font-size="10">R  d [126×126] int16</text>
+<rect x="50" y="3506.5" width="43" height="12" rx="3" fill="#ffe8cc" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="3516" font-size="9">result</text>
+<text x="96.8" y="3515" font-size="10">W  depth [126 × 126] f32, 63 kB</text>
+<line x1="420.0" y1="3530" x2="420.0" y2="3542" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
+<rect x="40" y="3542" width="760" height="60" rx="6" fill="#fff" stroke="#868e96" stroke-width="1.6"/>
+<circle cx="40" cy="3554" r="11" fill="#868e96"/>
+<text x="40" y="3558" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">35</text>
+<text x="56" y="3558" font-weight="600" font-size="11">read the depth map over JTAG (0.7 s), save .npy, compare with the host build (bit-exact), render</text>
+<rect x="50" y="3565.5" width="43" height="12" rx="3" fill="#ffe8cc" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="3575" font-size="9">result</text>
+<text x="96.8" y="3574" font-size="10">R  depth [126 × 126] f32</text>
+<rect x="50" y="3578.5" width="20" height="12" rx="3" fill="#e9ecef" stroke="#2b8a3e" stroke-width="0.6"/>
+<text x="54" y="3588" font-size="9">pc</text>
+<text x="73.6" y="3587" font-size="10">W  fpga_depth_&lt;name&gt;.npy, PNG</text>
+<text x="40" y="3618" font-size="10" fill="#495057">Totals per frame: 2 275 accelerator jobs (GEMM and requantisation), 25 MB of weights read from DDR3 twice (once per tile), 15 MB peak of arena in use, 14.2 s at 50 MHz.</text>
+</svg>
