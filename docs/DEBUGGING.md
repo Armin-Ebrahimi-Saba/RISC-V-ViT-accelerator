@@ -441,6 +441,13 @@ thing it existed to test. Each is the same mistake.
 - **The stall-gating "fix"** in section 7, which passed a test that also
   passed unfixed.
 
+A fourth kind: **error paths no test could reach.** A GEMM that failed on
+one of its earlier tiles left stale statistics behind. The CPU redo then
+used them and produced a wrong depth map without a word. The bug lived
+from round two of the speed-up until round five, when the accelerator
+emulator could inject a bus error on any chosen job (`DAV2_EMU_FAIL_JOB`)
+and a sweep over the frame hit it (`PERFORMANCE.md`, round five).
+
 The rule that would have caught all three: **make the test fail before you
 make it pass.** Run it on the broken version first. If it passes there, it is
 not testing what you think.

@@ -28,7 +28,8 @@ static uint32_t regs[NREGS];
 
 /* the latched job */
 static struct {
-    int      busy, requant, gather;
+    int      busy, requant, gather, add, relu;
+    uint32_t x_addr, add_mx, add_mh, add_shift;
     uint32_t a_addr, a_stride, w_addr, w_stride, c_addr, c_stride, s_addr, p_addr;
     uint32_t k, m, n;
     uint32_t g_addr, g_geom, g_chan, g_conv, g_start;
@@ -91,6 +92,14 @@ static void gemm_row(uint32_t m)
     }
 }
 
+/* apply_multiplier, as the hardware and the C engine compute it */
+static int64_t apply_mult(int64_t v, int64_t mult, int sh)
+{
+    int64_t r = v * mult;
+    if (sh > 0) r += (int64_t)1 << (sh - 1);
+    return r >> sh;
+}
+
 static void requant_all(void)
 {
     const int32_t *par = (const int32_t *)ptr(job.p_addr);
@@ -106,6 +115,14 @@ static void requant_all(void)
             r = (r >> sh) + par[3 * m + 2];
             if (r >  8191) r =  8191;
             if (r < -8191) r = -8191;
+            if (job.add) {
+                /* the epilogue: residual and value rescaled, added, saturated */
+                int64_t x = ((const int16_t *)ptr(job.x_addr + n * job.c_stride))[m];
+                int64_t v = (int64_t)(int32_t)apply_mult(x, job.add_mx, (int)(job.add_shift & 63u))
+                          + (int64_t)(int32_t)apply_mult(r, job.add_mh, (int)((job.add_shift >> 8) & 63u));
+                r = v > 8191 ? 8191 : v < -8191 ? -8191 : v;
+            }
+            if (job.relu && r < 0) r = 0;
             orow[m] = (int16_t)r;
             int32_t a = r < 0 ? (int32_t)-r : (int32_t)r;
             if (a > amax) amax = a;
@@ -126,6 +143,10 @@ static void latch(void)
     job.busy     = 1;
     job.requant  = (ctrl >> 1) & 1u;
     job.gather   = ((ctrl >> 2) & 1u) && !job.requant;
+    job.add      = ((ctrl >> 3) & 1u) && job.requant;
+    job.relu     = ((ctrl >> 4) & 1u) && job.requant;
+    job.x_addr   = R(X_ADDR);   job.add_mx = R(ADD_MULT_X);
+    job.add_mh   = R(ADD_MULT_H); job.add_shift = R(ADD_SHIFT);
     job.a_addr   = R(A_ADDR);   job.a_stride = R(A_STRIDE);
     job.w_addr   = R(W_ADDR);   job.w_stride = R(W_STRIDE);
     job.c_addr   = R(C_ADDR);   job.c_stride = R(C_STRIDE);
@@ -139,6 +160,8 @@ static void latch(void)
     if (job.requant) {
         if (job.m < 2 || (job.m & 1u) || job.m > KMAX / 2) fail("requant M_LEN out of range");
         if (job.a_stride & 3u) fail("requant A_STRIDE not word aligned");
+        if (job.add && job.m > KMAX / 4) fail("requant+add: M_LEN over KMAX/4");
+        if (job.add && (job.x_addr & 3u)) fail("requant+add: X_ADDR unaligned");
     } else {
         if (job.k < 4 || (job.k & 3u) || job.k > KMAX) fail("K_LEN out of range");
         if (job.gather && job.k != ((job.g_conv >> 20) & 255u) * (job.g_chan & 0xffffu))

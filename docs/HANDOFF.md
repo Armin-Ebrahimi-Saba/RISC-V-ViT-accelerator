@@ -102,7 +102,8 @@ work.
   (`dav2_image.from_file` accepts anything PIL opens; feed it a frame). A
   camera on the board itself is an RTL project — see the options recorded in
   `DEBUGGING.md` § 11.
-- **Rounds two to four of the speed-up are not measured on the board.**
+- **Rounds two to five of the speed-up are not measured on the board**
+  (round five: residual add and ReLU inside the requantisation job).
   Round two: LayerNorm, the adds, attention's arithmetic, `make_multiplier`,
   and the accelerator's gather mode and `RQ_AMAX` register. Round three: a
   128-row tile and the repaired prefetcher. Round four: the CPU working
@@ -113,12 +114,21 @@ work.
   and the bitstream is built. First thing with the board:
   1. `flow rvlab_fpga_top.program`
   2. run the demo image
-  3. check the boot lines `self-test ok (130x64x6)` and
-     `gather self-test ok`
+  3. check the boot lines `self-test ok (130x64x6)`,
+     `gather self-test ok` and `add/ReLU self-test ok`
   4. compare the result with `build/dav2/host_depth.bin`
   5. put the measured frame time into `PERFORMANCE.md` §5.
   If anything is wrong, the two new risks are the prefetcher
   (`USE_PREFETCH`) and gather mode (the self-test disables it by itself).
+  The fused add/ReLU (`CTRL.add`, `CTRL.relu`) has its own boot line,
+  `add/ReLU self-test ok`; like gather mode it disables itself on a
+  mismatch (checked by breaking the emulator's ReLU on purpose).
+- **Failure recovery is swept, not sampled.** `DAV2_EMU_FAIL_JOB=n` makes
+  the emulator report a bus error on job *n*. A sweep over every 13th job
+  of a frame (100 runs) gives a bit-identical depth map every time,
+  after fixing the one case it first found (`DEBUGGING.md` §9). Re-run it
+  after any change to the driver or `qgemm_impl`:
+  `for n in $(seq 1 13 1300); do DAV2_EMU_FAIL_JOB=$n ./dav2_host_emu ...; done`
 - **Requant job constraints.** M must be even and a chunk is at most 128
   columns × 1024 rows (the driver chunks). All shapes in this model comply;
   `dav2_qgemm` falls back to the CPU path for odd M.

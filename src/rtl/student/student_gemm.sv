@@ -165,6 +165,9 @@ module student_gemm #(
   // meaningful the same cycle as start_strobe, so it is latched below.
   assign start_requant = reg2hw.ctrl.requant.q;   // sampled with start
   assign start_gather  = reg2hw.ctrl.gather.q;    // GEMM job: A tile via the gather walkers
+  logic start_add, start_relu;
+  assign start_add     = reg2hw.ctrl.add.q;       // requant job: add a residual
+  assign start_relu    = reg2hw.ctrl.relu.q;      // requant job: clamp the output at 0
 
   // Configuration snapshot, taken when a job starts so software may reprogram
   // the registers for the next tile while this one runs.
@@ -178,6 +181,11 @@ module student_gemm #(
   logic [NRW-1:0] n_rows_q;                  // number of A-tile rows actually in use (<= NROWS)
   logic           stats_en_q;                // s_addr_q != 0, GEMM jobs
   logic           gather_q;                  // A tile comes from the gather walkers
+  // Requant epilogue (snapshot at start): residual add and ReLU.
+  logic           add_q, relu_q;
+  logic [31:0]    x_addr_q;                  // residual chunk, rows C_STRIDE apart
+  logic [31:0]    add_mx_q, add_mh_q;        // multipliers for residual and value
+  logic [5:0]     add_sx_q, add_sh_q;        // their shifts
   // Gather parameters (snapshot at start) and the walker signals the read
   // engine and the A-load writer use; the walkers themselves are further down.
   logic [31:0]    g_addr_q;
@@ -201,6 +209,7 @@ module student_gemm #(
     // requantisation job
     RQ_LOAD_P,     // parameter table -> param RAM
     RQ_LOAD_ACC,   // acc chunk -> tile RAM, transposed
+    RQ_LOAD_X,     // residual chunk -> upper half of tile RAM (CTRL.add)
     RQ_OUT         // stream int16 pairs out
   } state_e;
 
@@ -426,6 +435,13 @@ module student_gemm #(
   logic [NRW-1:0] rq_n_q;       // load: current column n;  out: current row
   logic [AW-1:0]  rq_mlen;      // rows m in this chunk (M_LEN)
   assign rq_mlen = AW'(m_len_q);
+  // Residual chunk: in add mode an acc chunk is at most KWORDS/2 rows, so the
+  // upper half of every tile-RAM row is free for that row's residual words.
+  localparam logic [AW-1:0] XOFF = AW'(KWORDS / 2);
+  logic [AW-1:0]  rq_xw_q;      // residual load: word within the row
+  logic [AW-1:0]  rq_xwords;    // residual words per row = M_LEN/2
+  logic           rq_x_done;    // residual chunk fully loaded
+  assign rq_xwords = AW'(m_len_q >> 1);
   logic [1:0]     rq_p_sel_q;   // param load: which of the three words is arriving
   logic [AW-1:0]  rq_p_cnt_q;   // param load: row m being filled
   logic           rq_p_done;    // the {mult,shift,bias} table has been fully loaded
@@ -452,6 +468,10 @@ module student_gemm #(
       a_wr_addr = rq_m_q;
       if (rd_valid) a_we[rq_n_q[RW-1:0]] = 1'b1;
     end
+    if (state_q == RQ_LOAD_X) begin
+      a_wr_addr = XOFF + rq_xw_q;
+      if (rd_valid) a_we[rq_n_q[RW-1:0]] = 1'b1;
+    end
   end
 
   // ---------------------------------------------------------------- MAC phase
@@ -473,7 +493,13 @@ module student_gemm #(
 
   // A-tile read address: the requant output stage reads row rq_m_q (one
   // word = one output row m); the MAC phase reads word k/2 of every row.
-  assign a_rd_addr = (state_q == RQ_OUT) ? rq_m_q : AW'(kcnt_q >> 1);
+  // In add mode the output pipeline reads the tile RAM twice per element:
+  // the accumulator in the cycle the element enters, the residual word the
+  // cycle after (rq_xcyc_q); no element enters on that second cycle.
+  logic          rq_xcyc_q;
+  logic [AW-1:0] rq_xaddr_q;
+  assign a_rd_addr = (state_q == RQ_OUT) ? (rq_xcyc_q ? rq_xaddr_q : rq_m_q)
+                                         : AW'(kcnt_q >> 1);
 
   // When to consume the next word from the read stream (rd_pop -> rb_rd_q
   // advances): every load phase takes one word at a time as it arrives;
@@ -482,7 +508,7 @@ module student_gemm #(
     rd_pop = 1'b0;
     if (state_q == ST_LOAD_A) begin
       rd_pop = rd_valid & (gather_q ? gw_inb : 1'b1);
-    end else if (state_q == RQ_LOAD_P || state_q == RQ_LOAD_ACC) begin
+    end else if (state_q == RQ_LOAD_P || state_q == RQ_LOAD_ACC || state_q == RQ_LOAD_X) begin
       rd_pop = rd_valid;
     end else if (state_q == ST_MAC) begin
       // Refill an empty buffer, or replace the buffer as its last byte is
@@ -591,7 +617,8 @@ module student_gemm #(
                      state_d = (m_q == (m_len_q - 1'b1)) ? ST_FINISH : ST_MAC; // last W row? else next row
       ST_FINISH:   if (wr_out_q == '0)           state_d = ST_IDLE;     // all writes acked
       RQ_LOAD_P:   if (rq_p_done)                state_d = RQ_LOAD_ACC; // param table loaded
-      RQ_LOAD_ACC: if (rq_acc_done)              state_d = RQ_OUT;      // acc chunk loaded
+      RQ_LOAD_ACC: if (rq_acc_done)              state_d = add_q ? RQ_LOAD_X : RQ_OUT;
+      RQ_LOAD_X:   if (rq_x_done)                state_d = RQ_OUT;      // residual loaded
       RQ_OUT:      if (rq_out_done)              state_d = ST_FINISH;   // every output word written
       default:                                   state_d = ST_IDLE;
     endcase
@@ -623,6 +650,8 @@ module student_gemm #(
       w_stride_q  <= '0;
       s_addr_q    <= '0;
       gather_q    <= 1'b0;
+      add_q <= 1'b0; relu_q <= 1'b0; x_addr_q <= '0;
+      rq_xw_q <= '0;
       g_addr_q <= '0; g_h_q <= '0; g_w_q <= '0; g_ow_q <= '0; g_c_q <= '0;
       g_k_q <= '0; g_stride_q <= '0; g_pad_q <= '0; g_ky0_q <= '0; g_kx0_q <= '0; g_kpos_q <= '0;
       a_addr_q    <= '0;
@@ -731,6 +760,9 @@ module student_gemm #(
             a_stride_q <= reg2hw.a_stride.q;
             stats_en_q <= (reg2hw.s_addr.q != 32'd0) & ~start_requant;
             gather_q   <= start_gather & ~start_requant;
+            add_q      <= start_add & start_requant;
+            relu_q     <= start_relu & start_requant;
+            x_addr_q   <= reg2hw.x_addr.q;
             g_addr_q   <= reg2hw.g_addr.q;
             g_h_q      <= reg2hw.g_geom.q[31:16];
             g_w_q      <= reg2hw.g_geom.q[15:0];
@@ -898,6 +930,33 @@ module student_gemm #(
             end
           end
           if (rq_acc_done) begin
+            rq_m_q <= '0;
+            rq_n_q <= '0;
+            rq_xw_q <= '0;
+            if (add_q) begin
+              // residual chunk: N_ROWS rows of M_LEN/2 words, C_STRIDE apart
+              rd_addr_q      <= x_addr_q;
+              rd_row_base_q  <= x_addr_q;
+              rd_row_beats_q <= 32'(rq_xwords);
+              rd_row_left_q  <= 32'(rq_xwords);
+              rd_stride_q    <= c_stride_q;
+              rd_left_q      <= 32'(n_rows_q) * 32'(rq_xwords);
+            end
+          end
+        end
+
+        RQ_LOAD_X: begin
+          // Walk rq_n_q (row, outer) / rq_xw_q (word, inner) over the
+          // residual words: they are already [n][m], so no transpose.
+          if (rd_valid) begin
+            if (rq_xw_q == rq_xwords - 1'b1) begin
+              rq_xw_q <= '0;
+              rq_n_q  <= rq_n_q + 1'b1;
+            end else begin
+              rq_xw_q <= rq_xw_q + 1'b1;
+            end
+          end
+          if (rq_x_done) begin
             rq_m_q <= '0;
             rq_n_q <= '0;
           end
@@ -1113,6 +1172,8 @@ module student_gemm #(
   assign rq_p_done   = (state_q == RQ_LOAD_P) & rd_valid
                      & (rq_p_sel_q == 2'd2) & (rq_p_cnt_q == rq_mlen - 1'b1);
   // rq_acc_done: the acc chunk's last word (last row, last column) has just arrived.
+  assign rq_x_done   = (state_q == RQ_LOAD_X) & rd_valid
+                     & (rq_n_q == n_rows_q - 1'b1) & (rq_xw_q == rq_xwords - 1'b1);
   assign rq_acc_done = (state_q == RQ_LOAD_ACC) & rd_valid
                      & (rq_n_q == n_rows_q - 1'b1) & (rq_m_q == rq_mlen - 1'b1);
 
@@ -1123,11 +1184,17 @@ module student_gemm #(
   //   q3  product registered again (DSP output register)
   //   q4  + rounding constant
   //   q5  arithmetic shift right
-  //   q6  + bias, saturate to 14 bits, pair with the previous element
+  //   q6  + bias, saturate to 14 bits
+  //   q7  epilogue, add mode: residual * ADD_MULT_X and value * ADD_MULT_H
+  //   q8  products registered again
+  //   q9  + rounding constants
+  //   q10 arithmetic shifts
+  //   q11 sum, saturate to 14 bits (add mode); ReLU; pair with the previous
+  //       element. Without CTRL.add the q6 value passes through unchanged.
   // The producer only advances while the small output FIFO has room for
   // everything already in the pipeline.
-  localparam int unsigned RQ_STAGES = 7;
-  localparam int unsigned RQ_FIFO_D = 16;
+  localparam int unsigned RQ_STAGES = 12;
+  localparam int unsigned RQ_FIFO_D = 32;
 
   // Naming convention: a signal suffixed N holds the value valid at pipeline
   // stage qN (see the stage table above) — it is the same quantity shifted
@@ -1193,16 +1260,88 @@ module student_gemm #(
     end
     rq_odd6 <= rq_odd5;  rq_last6 <= rq_last5;
   end
+  // Epilogue multipliers and shifts, latched at job start. No reset: they
+  // are always written before a job uses them, and a register with an
+  // asynchronous reset cannot be folded into the DSP48 it feeds (DPIR-1).
+  always_ff @(posedge clk_i) begin
+    if (state_q == ST_IDLE && start_strobe) begin
+      add_mx_q <= reg2hw.add_mult_x.q;
+      add_mh_q <= reg2hw.add_mult_h.q;
+      add_sx_q <= reg2hw.add_shift.q[5:0];
+      add_sh_q <= reg2hw.add_shift.q[13:8];
+    end
+  end
+
+  // ---- epilogue (q2 .. q11)
+  logic [NRW-1:0]     rq_row2;
+  logic signed [15:0] rq_x3, rq_x4, rq_x5, rq_x6;       // residual element
+  logic               rq_v7, rq_v8, rq_v9, rq_v10, rq_v11;
+  logic               rq_odd7, rq_odd8, rq_odd9, rq_odd10, rq_odd11;
+  logic               rq_last7, rq_last8, rq_last9, rq_last10, rq_last11;
+  logic signed [31:0] rq_h7, rq_h8, rq_h9, rq_h10;      // q6 value carried along
+  logic signed [63:0] rq_px7, rq_ph7, rq_px8, rq_ph8, rq_px9, rq_ph9, rq_px10, rq_ph10;
+  logic signed [31:0] rq_val11;                         // final value
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      rq_xcyc_q <= 1'b0;
+      rq_v7 <= 1'b0; rq_v8 <= 1'b0; rq_v9 <= 1'b0; rq_v10 <= 1'b0; rq_v11 <= 1'b0;
+    end else begin
+      rq_xcyc_q <= rq_adv & add_q;
+      rq_v7 <= rq_v6; rq_v8 <= rq_v7; rq_v9 <= rq_v8; rq_v10 <= rq_v9; rq_v11 <= rq_v10;
+    end
+  end
+  always_ff @(posedge clk_i) begin
+    if (rq_adv) rq_xaddr_q <= XOFF + (rq_m_q >> 1);
+    rq_row2 <= rq_row1;
+    // q2 -> q3: the residual word read the cycle after the accumulator
+    rq_x3 <= rq_odd2 ? $signed(a_q[rq_row2[RW-1:0]][31:16])
+                     : $signed(a_q[rq_row2[RW-1:0]][15:0]);
+    rq_x4 <= rq_x3; rq_x5 <= rq_x4; rq_x6 <= rq_x5;
+    // q7: the two products
+    rq_px7 <= $signed(rq_x6)  * $signed({1'b0, add_mx_q});
+    rq_ph7 <= $signed(rq_val6) * $signed({1'b0, add_mh_q});
+    rq_h7  <= rq_val6;
+    rq_odd7 <= rq_odd6; rq_last7 <= rq_last6;
+    // q8
+    rq_px8 <= rq_px7; rq_ph8 <= rq_ph7; rq_h8 <= rq_h7;
+    rq_odd8 <= rq_odd7; rq_last8 <= rq_last7;
+    // q9: rounding
+    rq_px9 <= rq_px8 + ((add_sx_q != 6'd0) ? (64'sd1 <<< (add_sx_q - 6'd1)) : 64'sd0);
+    rq_ph9 <= rq_ph8 + ((add_sh_q != 6'd0) ? (64'sd1 <<< (add_sh_q - 6'd1)) : 64'sd0);
+    rq_h9  <= rq_h8;
+    rq_odd9 <= rq_odd8; rq_last9 <= rq_last8;
+    // q10: shifts
+    rq_px10 <= rq_px9 >>> add_sx_q;
+    rq_ph10 <= rq_ph9 >>> add_sh_q;
+    rq_h10  <= rq_h9;
+    rq_odd10 <= rq_odd9; rq_last10 <= rq_last9;
+    // q11: sum and saturate (add mode), ReLU
+    begin
+      logic signed [32:0] sum;
+      logic signed [31:0] v;
+      sum = 33'($signed(rq_px10[31:0])) + 33'($signed(rq_ph10[31:0]));
+      v = !add_q ? rq_h10
+        : (sum >  33'sd8191) ?  32'sd8191
+        : (sum < -33'sd8191) ? -32'sd8191 : 32'(sum);
+      rq_val11 <= (relu_q && v < 0) ? 32'sd0 : v;
+    end
+    rq_odd11 <= rq_odd10; rq_last11 <= rq_last10;
+  end
+
   // acc value: tile RAM read happens on the a_rd_addr presented at q0; a_q
   // is registered, so it is valid in q1 -- select the row there.
   assign rq_acc1 = a_q[rq_row1[RW-1:0]];
 
   // "last pair of this output row" travels with the element
   logic rq_row_end0, rq_row_end1, rq_row_end2, rq_row_end3, rq_row_end4, rq_row_end5, rq_row_end6;
+  logic rq_row_end7, rq_row_end8, rq_row_end9, rq_row_end10, rq_row_end11;
   assign rq_row_end0 = (rq_m_q == rq_mlen - 1'b1);
   always_ff @(posedge clk_i) begin
     rq_row_end1 <= rq_row_end0; rq_row_end2 <= rq_row_end1; rq_row_end3 <= rq_row_end2;
     rq_row_end4 <= rq_row_end3; rq_row_end5 <= rq_row_end4; rq_row_end6 <= rq_row_end5;
+    rq_row_end7 <= rq_row_end6; rq_row_end8 <= rq_row_end7; rq_row_end9 <= rq_row_end8;
+    rq_row_end10 <= rq_row_end9; rq_row_end11 <= rq_row_end10;
   end
 
   // Largest |out| of the job, for the consumer of the result (the residual
@@ -1213,20 +1352,20 @@ module student_gemm #(
       rq_amax_q <= '0;
     end else if (start_strobe && start_requant) begin
       rq_amax_q <= '0;
-    end else if (rq_v6) begin
-      rq_amax_q <= (rq_val6 < 0) ? (32'(-rq_val6) > rq_amax_q ? 32'(-rq_val6) : rq_amax_q)
-                                 : (32'(rq_val6)  > rq_amax_q ? 32'(rq_val6)  : rq_amax_q);
+    end else if (rq_v11) begin
+      rq_amax_q <= (rq_val11 < 0) ? (32'(-rq_val11) > rq_amax_q ? 32'(-rq_val11) : rq_amax_q)
+                                  : (32'(rq_val11)  > rq_amax_q ? 32'(rq_val11)  : rq_amax_q);
     end
   end
 
   // Pair the even element with the odd one and enqueue the word.
   logic        rq_fifo_push;
   logic [63:0] rq_fifo_wdata;   // {addr, data}
-  assign rq_fifo_push  = rq_v6 & rq_odd6;
-  assign rq_fifo_wdata = {rq_out_ptr_q, rq_val6[15:0], rq_prev_q};
+  assign rq_fifo_push  = rq_v11 & rq_odd11;
+  assign rq_fifo_wdata = {rq_out_ptr_q, rq_val11[15:0], rq_prev_q};
 
   always_ff @(posedge clk_i) begin
-    if (rq_v6 & ~rq_odd6) rq_prev_q <= rq_val6[15:0];
+    if (rq_v11 & ~rq_odd11) rq_prev_q <= rq_val11[15:0];
   end
 
   // Output FIFO and write issue. rq_out_ptr_q walks the output row: +4 per
@@ -1245,7 +1384,7 @@ module student_gemm #(
 
   // Produce while there is room for what is in flight plus a margin.
   logic rq_last_seen_q;        // the last element has entered the pipeline
-  assign rq_adv = (state_q == RQ_OUT) & ~rq_drained_q & ~rq_last_seen_q
+  assign rq_adv = (state_q == RQ_OUT) & ~rq_drained_q & ~rq_last_seen_q & ~rq_xcyc_q
                 & (rq_fifo_cnt_q < ($clog2(RQ_FIFO_D)+1)'(RQ_FIFO_D - RQ_STAGES - 1));
   assign rq_out_done = (state_q == RQ_OUT) & rq_drained_q & (rq_fifo_cnt_q == '0);
 
@@ -1266,12 +1405,12 @@ module student_gemm #(
         rq_row_ptr_q   <= c_ptr_q;
       end
       if (rq_adv & rq_last_elem) rq_last_seen_q <= 1'b1;
-      if (rq_v6 & rq_last6)      rq_drained_q   <= 1'b1;
+      if (rq_v11 & rq_last11)    rq_drained_q   <= 1'b1;
       if (rq_fifo_push) begin
         rq_fifo[rq_fifo_wr_q] <= rq_fifo_wdata;
         rq_fifo_wr_q <= rq_fifo_wr_q + 1'b1;
         // next word: along the row, or the next row after the row's last pair
-        if (rq_last6 || rq_row_end6) begin
+        if (rq_last11 || rq_row_end11) begin
           rq_out_ptr_q <= rq_row_ptr_q + c_stride_q;
           rq_row_ptr_q <= rq_row_ptr_q + c_stride_q;
         end else begin

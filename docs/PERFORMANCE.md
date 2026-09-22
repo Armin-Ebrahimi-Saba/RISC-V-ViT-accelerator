@@ -317,6 +317,49 @@ This also verified the round-two and round-three driver code, which until
 then had never run anywhere; the RTL itself stays covered by the module
 testbenches.
 
+### Round five — the residual add and ReLU inside the requantisation job
+
+Also not yet on the board (RTL change: bitstream rebuilt).
+
+Each transformer block ends its attention and its MLP with a residual add,
+`x = x + GEMM(...)`. Each residual conv unit in the DPT head ends with one,
+and several convolutions are followed by a ReLU. Each of these was a
+separate CPU pass over a tensor the requantisation job had only just
+written. They now happen in the job's epilogue (`CTRL.add`, `CTRL.relu`,
+`ARCHITECTURE.md` §4), so the intermediate tensor and the CPU pass are gone.
+In the blocks, `x` is also updated in place.
+
+The fused path is bit-identical because the add's scale is computed before
+the job runs. It needs the largest |h|, and per row h is a non-decreasing
+function of the accumulator, so that maximum is at the row's largest or
+smallest accumulator, which the drain statistics provide.
+
+| | Result |
+|---|---|
+| `student_gemm_tb` | ReLU alone, add, add + ReLU; one chunk, 512-row chunks, two row tiles — pass |
+| host vs emulator | bit-identical on the demo and three example photographs |
+| CPU add/ReLU time (emulator run, host units) | 3 318 k → 525 k (−84 %); the rest is a ReLU on a copied input and one add of two non-GEMM tensors, neither fusable |
+| boot self-test | requant + add, then + ReLU, against C, in BRAM; disables the epilogue alone on a mismatch — shown to fire by breaking the emulator's ReLU |
+| injected job failures | see below |
+
+**A latent bug found by fault injection.** Sweeping `DAV2_EMU_FAIL_JOB`
+over the frame turned up one failure point, job 1150, where the output
+came out wrong, and silently. A multi-tile GEMM that failed on a tile
+before its last one returned "declined" but left its statistics descriptor
+set. The CPU redid the product correctly, then took the row ranges from the
+stale statistics. The bug dated from round two. Fixed in
+`dav2_accel_qgemm`; the sweep result is recorded in `HANDOFF.md`.
+
+An in-place residual add is failure-safe the same way: the job writes to a
+temporary and the result is copied back only when every job has succeeded.
+So a failure leaves `x` intact for the CPU redo, at ~0.3 Mcycles per add.
+
+Build: LUT 18.9 %, BRAM 54.4 %, DSP 20.4 %, WNS +0.173 ns, WHS +0.044 ns,
+0 failing endpoints.
+
+Expected gain: roughly 30 Mcycles (~0.6 s) per frame. That would move the
+estimate for the next board frame from ~7.8 s to about **7.2 s, ~0.14 FPS**.
+
 ## 6. What is left, in order of expected gain
 | Item | Now | Estimate | How |
 |---|---|---|---|

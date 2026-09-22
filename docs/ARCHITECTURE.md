@@ -162,12 +162,33 @@ frame — and is now the block's second job type (`CTRL.requant`):
 2. Read a chunk of C — up to 1024 rows × 128 columns — into the A-tile RAM
    **transposed**: RAM row = n, word = m. This is what turns the m-major
    result into n-major output for free.
-3. Stream out: one element per cycle through a seven-stage pipeline
-   (multiply in DSPs, round, shift, add bias, saturate), two int16 packed
-   per word, into a 16-entry FIFO that the write engine drains.
+3. Stream out: one element per cycle through the pipeline (multiply in
+   DSPs, round, shift, add bias, saturate), two int16 packed per word, into
+   a 32-entry FIFO that the write engine drains.
 
-The arithmetic matches the C code to the bit; `student_gemm_tb` checks it
-against a bit-level model and the board against the host build.
+The job has an optional **epilogue**, so the operation that usually follows
+a GEMM doesn't need a pass of its own:
+
+- **`CTRL.add`** — a residual connection. The job also loads the residual
+  chunk `x` (`X_ADDR`, laid out like the output) into the upper half of the
+  tile RAM, then writes
+  `sat14(((x·ADD_MULT_X + r) >> sx) + ((h·ADD_MULT_H + r) >> sh))`, where
+  *h* is the plain requantised value. That is exactly what the CPU's
+  `dav2_add` computes. The RAM has one read port, so the pipeline reads the
+  accumulator in one cycle and the residual in the next. The job is limited
+  by the bus anyway (~6 cycles per element), so this costs nothing. A chunk
+  is at most 512 rows in this mode.
+- **`CTRL.relu`** — clamp the output at 0.
+
+The add needs the output scale of *h* before any *h* exists. Per row,
+requantisation is non-decreasing in the accumulator, so the row's largest
+|h| is reached at its largest or smallest accumulator, which the drain
+statistics already give. The CPU therefore computes the add's multipliers
+exactly, and the fused result is bit-identical to requantise-then-add.
+
+The arithmetic matches the C code to the bit; `student_gemm_tb` checks
+every mode against a bit-level model, and the board is checked against the
+host build.
 
 The block has a register interface the CPU programs (addresses and strides
 of A, W and C; K, M and the tile row count; `S_ADDR`, `P_ADDR`; a control

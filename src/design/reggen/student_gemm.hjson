@@ -80,6 +80,16 @@
           desc: "1 - start a job"
         }
         {
+          bits: 3
+          name: "add"
+          desc: "Requantisation job only: 1 - add a residual. With h the requantised value, out[n][m] = sat14(((x[n][m]*ADD_MULT_X + r) >> sx) + ((h*ADD_MULT_H + r) >> sh)), x read from X_ADDR + n*C_STRIDE + m*2, rounding as for the requantisation. M_LEN at most CAPS.KMAX/4."
+        }
+        {
+          bits: 4
+          name: "relu"
+          desc: "Requantisation job only: 1 - clamp the final output below at 0."
+        }
+        {
           bits: 2
           name: "gather"
           desc: "GEMM job only: 1 - the A tile is gathered from an NHWC int16 image as im2col would lay it out (G_ADDR, G_GEOM, G_CHAN, G_CONV, G_START), instead of read from A_ADDR. K_LEN must equal kpos_count * C. C must be even."
@@ -409,6 +419,62 @@
     {
       name: g_start
       desc: "Gather: output pixel where the tile's first row lies: oy (bits 31:16), ox (bits 15:0). Rows advance ox, wrapping to the next oy at the output width."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+      {
+      name: x_addr
+      desc: "Requantisation job with CTRL.add: byte address of the residual chunk, int16, same layout as the output (rows C_STRIDE apart). 4-byte aligned."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: add_mult_x
+      desc: "Requantisation job with CTRL.add: multiplier applied to the residual."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: add_mult_h
+      desc: "Requantisation job with CTRL.add: multiplier applied to the requantised value."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: add_shift
+      desc: "Requantisation job with CTRL.add: shift for the residual (bits 5:0) and for the requantised value (bits 13:8)."
       swaccess: rw
       hwaccess: hro
       fields:

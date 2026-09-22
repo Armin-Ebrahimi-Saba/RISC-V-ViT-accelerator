@@ -34,6 +34,7 @@
 #include "dav2_accel.h"
 #include "dav2_mathf.h"
 
+#include <stdio.h>
 #include <string.h>
 
 /* ------------------------------------------------------------- profiler */
@@ -353,21 +354,47 @@ void dav2_qgemm_cpu(const int16_t *av, const int8_t *w, int32_t *acc,
  * CPU, because the requantisation pass below can then hoist mult/shift/bias
  * out of the inner loop. The software kernel uses the same layout so that
  * everything downstream is bit-identical whichever path ran. */
+/* Largest |value| of a tensor, the scan dav2_add does when its producer did
+ * not record amax_q. */
+static int32_t amax_scan(const dav2_tensor_t *t)
+{
+    const int total = t->n * t->c;
+    int32_t m = 0;
+    for (int i = 0; i < total; i++) {
+        int32_t v = t->v[i] < 0 ? -t->v[i] : t->v[i];
+        if (v > m) m = v;
+    }
+    return m;
+}
+
 /* A convolution's geometry, for a GEMM whose A matrix is the im2col of an
  * image rather than a tensor in memory. */
 typedef struct { int h, w, k, stride, pad; } conv_desc_t;
 
 static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
-                       const dav2_qw_t *wt, dav2_tensor_t *out);
+                       const dav2_qw_t *wt, const dav2_tensor_t *res, int relu,
+                       dav2_tensor_t *out);
 
 void dav2_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, dav2_tensor_t *out)
 {
-    qgemm_impl(a, 0, wt, out);
+    qgemm_impl(a, 0, wt, 0, 0, out);
 }
 
-/* a is the input image when cv is set: N = output pixels, K = k*k*C. */
+/* dav2_qgemm followed by dav2_add(res, result) and/or dav2_relu, with the
+ * same result bit for bit. On the accelerator the add and the ReLU happen
+ * inside the requantisation job (its epilogue), so neither the
+ * intermediate tensor nor the CPU pass over it exists. out may be res. */
+void dav2_qgemm_ex(const dav2_tensor_t *a, const dav2_qw_t *wt,
+                   const dav2_tensor_t *res, int relu, dav2_tensor_t *out)
+{
+    qgemm_impl(a, 0, wt, res, relu, out);
+}
+
+/* a is the input image when cv is set: N = output pixels, K = k*k*C.
+ * res, relu: the epilogue, see dav2_qgemm_ex. */
 static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
-                       const dav2_qw_t *wt, dav2_tensor_t *out)
+                       const dav2_qw_t *wt, const dav2_tensor_t *res, int relu,
+                       dav2_tensor_t *out)
 {
     const int M = wt->m;
     const int N = cv ? ((cv->h + 2 * cv->pad - cv->k) / cv->stride + 1)
@@ -384,7 +411,10 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
     /* per-row requantisation parameters, {mult, shift, bias} interleaved:
      * the layout the accelerator's requantisation job reads */
     int32_t *par    = (int32_t *)dav2_arena_alloc((size_t)M * 3 * sizeof(int32_t));
-    if (!acc || !par) {
+    /* with a residual: each row's extreme accumulators, kept for the add */
+    int32_t *rmax   = res ? (int32_t *)dav2_arena_alloc((size_t)M * 2 * sizeof(int32_t)) : 0;
+    int32_t *rmin   = rmax ? rmax + M : 0;
+    if (!acc || !par || (res && !rmax)) {
         /* dav2_arena_failed is set; unwinding here beats faulting on NULL,
          * which on the target just hangs the core. */
         dav2_arena_release(mark);
@@ -464,6 +494,7 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
                 if (ar[n] < cmin) cmin = ar[n];
             }
         }
+        if (rmax) { rmax[m] = cmax; rmin[m] = cmin; }
         float k_c = a->scale * wt->s[m];
         float bias = wt->b ? wt->b[m] : 0.0f;
         float hi = (float)cmax * k_c + bias;
@@ -499,15 +530,62 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
         }                                                                     \
     } while (0)
 
-    if ((M & 1) == 0 && run) {
-        enum { RQ_CHUNK = 256 };
+    const int res_ok = !res || (res->n == N && res->c == M
+                                && (((uintptr_t)res->v) & 3u) == 0);
+    if ((M & 1) == 0 && run && res_ok) {
+        enum { RQ_CHUNK = 256 };          /* <= CAPS.KMAX/4, the add-mode limit */
         int32_t rq_amax = 0;
         int ok = 1;
+        float fin_scale = out_scale;
+        dav2_rq_epi_t epi;
+        memset(&epi, 0, sizeof epi);
+        epi.relu = relu;
+        if (res) {
+            /* The add's scale needs the largest |h| of this result before
+             * any h exists. Per row, h is a non-decreasing function of the
+             * accumulator (the multiplier is >= 0), so that maximum is
+             * reached at the row's largest or smallest accumulator -- which
+             * the range pass kept. Exactly the value a scan of h would give,
+             * so the parameters below are dav2_add's, bit for bit. This
+             * needs every row's parameters first, so in add mode they are
+             * not overlapped with the chunks. */
+            PAR_UPTO(M);
+            int32_t amax_h = 0;
+            for (int m = 0; m < M; m++) {
+                int32_t e0 = sat_act(apply_multiplier(rmax[m], par[3 * m], par[3 * m + 1])
+                                     + par[3 * m + 2]);
+                int32_t e1 = sat_act(apply_multiplier(rmin[m], par[3 * m], par[3 * m + 1])
+                                     + par[3 * m + 2]);
+                if (e0 < 0) e0 = -e0;
+                if (e1 < 0) e1 = -e1;
+                if (e0 > amax_h) amax_h = e0;
+                if (e1 > amax_h) amax_h = e1;
+            }
+            int32_t amax_x = res->amax_q >= 0 ? res->amax_q : amax_scan(res);
+            /* as in dav2_add (the sum is commutative, so operand order
+             * does not matter) */
+            float bound = (float)amax_x * res->scale + (float)amax_h * out_scale;
+            fin_scale = (bound > 0.0f) ? bound * (1.0f / (float)DAV2_ACT_QMAX) : 1.0f;
+            float inv = 1.0f / fin_scale;
+            dav2_make_multiplier(res->scale * inv, &epi.mx, &epi.sx);
+            dav2_make_multiplier(out_scale * inv, &epi.mh, &epi.sh);
+            epi.x = res->v;
+            epi.add = 1;
+        }
+        /* In place (out is the residual): write elsewhere and copy back
+         * only once every job has succeeded, so a failure leaves the
+         * residual intact for the CPU redo. */
+        int16_t *dst = out->v;
+        if (res && out->v == res->v) {
+            dst = (int16_t *)dav2_arena_alloc((size_t)N * M * sizeof(int16_t));
+            if (!dst) ok = 0;
+        }
         for (int m0 = 0; m0 < M && ok; m0 += RQ_CHUNK) {
             int mc = M - m0 < RQ_CHUNK ? M - m0 : RQ_CHUNK;
             PAR_UPTO(m0 + mc);                    /* overlaps the previous chunk */
             uint64_t w0 = dav2_cycles();
-            ok = dav2_accel_requant_rows_async(acc, N, M, m0, mc, par, out->v, &rq_amax) != 0;
+            ok = dav2_accel_requant_rows_async(acc, N, M, m0, mc, par, dst, &rq_amax,
+                                               (epi.add || epi.relu) ? &epi : 0) != 0;
             waited += dav2_cycles() - w0;         /* includes settling the previous */
         }
         if (ok) {
@@ -515,24 +593,35 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
             ok = dav2_accel_finish();
             waited += dav2_cycles() - w0;
         }
+        if (ok && dst != out->v)
+            dav2_copy16(out->v, dst, (size_t)N * M);
         if (ok) {
             uint64_t now = dav2_cycles();
             dav2_prof_add(DAV2_PROF_GEMM_ACCEL, waited);
             dav2_prof_add(DAV2_PROF_REQUANT, (now - t_start) - waited);
             out->n = N;
             out->c = M;
-            out->scale = out_scale;
+            out->scale = fin_scale;
             out->amax_q = rq_amax;
             trace_tensor("qgemm", out);
             dav2_arena_release(mark);
             return;
         }
-        /* declined or failed: the CPU path below does the whole conversion */
+        /* Declined or failed: the CPU path below does the whole conversion
+         * (the residual is intact, see dst above). */
     }
     PAR_UPTO(M);
 #undef PAR_UPTO
     dav2_prof_add(DAV2_PROF_GEMM_ACCEL, waited);
     uint64_t prof_t0 = t_start + waited;
+
+    /* with an epilogue, the plain result goes to a temporary first */
+    dav2_tensor_t htmp, *hdst = out;
+    if (res) {
+        htmp = dav2_tensor_new(N, M);
+        if (!htmp.v) { dav2_arena_release(mark); return; }
+        hdst = &htmp;
+    }
 
     /* acc is [m][n]; out is [n][m]. Either loop order strides one side by
      * hundreds of bytes and misses the 16 kB direct-mapped DDR3 cache on
@@ -557,7 +646,7 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
                             (const int16_t *)(acc + (size_t)(m0 + j) * N + n0),
                             (size_t)nb * 2);
             for (int n = 0; n < nb; n++) {
-                int16_t *orow = out->v + (size_t)(n0 + n) * M + m0;
+                int16_t *orow = hdst->v + (size_t)(n0 + n) * M + m0;
                 int j = 0;
                 /* Two outputs per word store: every store is a bus
                  * transaction on this core, so pairs halve them. M is a
@@ -589,11 +678,15 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
     }
 
     PROF_STOP(DAV2_PROF_REQUANT);
-    out->n = N;
-    out->c = M;
-    out->scale = out_scale;
-    out->amax_q = omax;
-    trace_tensor("qgemm", out);
+    hdst->n = N;
+    hdst->c = M;
+    hdst->scale = out_scale;
+    hdst->amax_q = omax;
+    trace_tensor("qgemm", hdst);
+    if (res)
+        dav2_add(res, hdst, out);
+    if (relu)
+        dav2_relu(out);
     dav2_arena_release(mark);
     return;
 
@@ -602,7 +695,7 @@ redo_on_cpu:
      * printed why); acc is incomplete. Start over -- every path is now the
      * CPU's. */
     dav2_arena_release(mark);
-    qgemm_impl(a, cv, wt, out);
+    qgemm_impl(a, cv, wt, res, relu, out);
 }
 
 /* -------------------------------------------------------------- LayerNorm */
@@ -1007,6 +1100,16 @@ dav2_tensor_t dav2_conv2d(const dav2_tensor_t *in, int h, int w,
                           const dav2_qw_t *wt, int k, int stride, int pad,
                           int *oh_out, int *ow_out)
 {
+    return dav2_conv2d_ex(in, h, w, wt, k, stride, pad, 0, 0, oh_out, ow_out);
+}
+
+/* dav2_conv2d followed by dav2_add(res, result) and/or dav2_relu -- see
+ * dav2_qgemm_ex. */
+dav2_tensor_t dav2_conv2d_ex(const dav2_tensor_t *in, int h, int w,
+                             const dav2_qw_t *wt, int k, int stride, int pad,
+                             const dav2_tensor_t *res, int relu,
+                             int *oh_out, int *ow_out)
+{
     const int oh = (h + 2 * pad - k) / stride + 1;
     const int ow = (w + 2 * pad - k) / stride + 1;
 
@@ -1015,12 +1118,12 @@ dav2_tensor_t dav2_conv2d(const dav2_tensor_t *in, int h, int w,
     if (k == 1 && stride == 1 && pad == 0) {
         /* A 1x1 convolution is a GEMM over the pixels as they are; im2col
          * would only copy the tensor. */
-        dav2_qgemm(in, wt, &out);
+        qgemm_impl(in, 0, wt, res, relu, &out);
     } else {
         /* Gathered in hardware when the accelerator can (no patch matrix is
          * ever built); otherwise im2col in software, inside qgemm_impl. */
         conv_desc_t cv = { h, w, k, stride, pad };
-        qgemm_impl(in, &cv, wt, &out);
+        qgemm_impl(in, &cv, wt, res, relu, &out);
     }
     dav2_arena_release(mark);
 

@@ -73,6 +73,12 @@
 #define GEMM_G_CHAN   STUDENT_GEMM_G_CHAN(0)
 #define GEMM_G_CONV   STUDENT_GEMM_G_CONV(0)
 #define GEMM_G_START  STUDENT_GEMM_G_START(0)
+#define GEMM_X_ADDR   STUDENT_GEMM_X_ADDR(0)
+#define GEMM_ADD_MX   STUDENT_GEMM_ADD_MULT_X(0)
+#define GEMM_ADD_MH   STUDENT_GEMM_ADD_MULT_H(0)
+#define GEMM_ADD_SH   STUDENT_GEMM_ADD_SHIFT(0)
+#define CTRL_ADD      0x8u
+#define CTRL_RELU     0x10u
 
 #define STATUS_BUSY 0x1u
 #define STATUS_DONE 0x2u
@@ -98,6 +104,7 @@ static uint32_t accel_mcycle(void)
 
 static int      accel_probed;
 static int      accel_gather_ok = 1;   /* cleared if the gather self-test fails */
+static int      accel_epi_ok = 1;      /* cleared if the add/ReLU self-test fails */
 static int      accel_ok;
 static unsigned accel_nrows;
 static unsigned accel_kmax;
@@ -404,11 +411,21 @@ static int accel_wait_simple(const char *what)
  * raised to the largest |out| written (directly, or when a deferred last job
  * is collected by dav2_accel_finish). mc even, at most KMAX/2. */
 static int accel_requant_rows(const int32_t *acc, int N, int M, int m0, int mc,
-                              const int32_t *params, int16_t *out, int32_t *amax)
+                              const int32_t *params, int16_t *out, int32_t *amax,
+                              const dav2_rq_epi_t *epi)
 {
     const int nc_max = (int)accel_nrows;
+    uint32_t ctrl = CTRL_START | CTRL_REQUANT;
     if (!dav2_accel_finish())
         return 0;
+    if (epi && epi->add) {
+        REG32(GEMM_ADD_MX) = (uint32_t)epi->mx;
+        REG32(GEMM_ADD_MH) = (uint32_t)epi->mh;
+        REG32(GEMM_ADD_SH) = ((uint32_t)epi->sh << 8) | (uint32_t)epi->sx;
+        ctrl |= CTRL_ADD;
+    }
+    if (epi && epi->relu)
+        ctrl |= CTRL_RELU;
     REG32(GEMM_A_STRIDE) = (uint32_t)N * 4u;
     REG32(GEMM_C_STRIDE) = (uint32_t)M * 2u;
     REG32(GEMM_S_ADDR)   = 0u;
@@ -421,8 +438,10 @@ static int accel_requant_rows(const int32_t *acc, int N, int M, int m0, int mc,
                             + (unsigned long)mc * nc / 2u;
         REG32(GEMM_A_ADDR) = (uint32_t)(uintptr_t)(acc + (size_t)m0 * N + n0);
         REG32(GEMM_C_ADDR) = (uint32_t)(uintptr_t)(out + (size_t)n0 * M + m0);
+        if (epi && epi->add)
+            REG32(GEMM_X_ADDR) = (uint32_t)(uintptr_t)(epi->x + (size_t)n0 * M + m0);
         REG32(GEMM_N_ROWS) = (uint32_t)nc;
-        REG32(GEMM_CTRL)   = CTRL_START | CTRL_REQUANT;
+        REG32(GEMM_CTRL)   = ctrl;
         if (accel_maybe_defer(n0 + nc >= N, beats, amax))
             return 2;
         if (!accel_wait_simple("requant"))
@@ -458,7 +477,7 @@ int dav2_accel_requant(const int32_t *acc, int N, int M, const int32_t *params,
     for (int m0 = 0; m0 < M; m0 += mc_max) {
         int mc = M - m0;
         if (mc > mc_max) mc = mc_max;
-        if (!accel_requant_rows(acc, N, M, m0, mc, params, out, &amax))
+        if (!accel_requant_rows(acc, N, M, m0, mc, params, out, &amax, 0))
             return 0;
     }
     if (amax_out) *amax_out = amax;
@@ -466,14 +485,22 @@ int dav2_accel_requant(const int32_t *acc, int N, int M, const int32_t *params,
 }
 
 int dav2_accel_requant_rows_async(const int32_t *acc, int N, int M, int m0, int mc,
-                                  const int32_t *params, int16_t *out, int32_t *amax)
+                                  const int32_t *params, int16_t *out, int32_t *amax,
+                                  const dav2_rq_epi_t *epi)
 {
     if (!dav2_accel_init() || !requant_ok(acc, N, M, params, out))
         return 0;
-    if (m0 < 0 || mc < 2 || (mc & 1) || m0 + mc > M || mc > (int)(accel_kmax / 2u))
+    const int add = epi && epi->add;
+    if (epi && (epi->add || epi->relu) && !accel_epi_ok)
+        return 0;
+    if (m0 < 0 || mc < 2 || (mc & 1) || m0 + mc > M
+        || mc > (int)(accel_kmax / (add ? 4u : 2u)))
+        return 0;
+    if (add && ((((uintptr_t)epi->x) & 3u) || epi->sx < 0 || epi->sx > 63
+                || epi->sh < 0 || epi->sh > 63 || epi->mx < 0 || epi->mh < 0))
         return 0;
     accel_defer = 1;
-    int r = accel_requant_rows(acc, N, M, m0, mc, params, out, amax);
+    int r = accel_requant_rows(acc, N, M, m0, mc, params, out, amax, epi);
     accel_defer = 0;
     return r;
 }
@@ -646,7 +673,12 @@ int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc,
             stats = (int32_t *)dav2_arena_alloc((size_t)tiles * M * 2 * sizeof(int32_t));
             if (stats) { st->v = stats; st->tiles = tiles; }
         }
-        return accel_run(a->v, 0, wt->w, 0, acc, N, K, M, stats);
+        int r = accel_run(a->v, 0, wt->w, 0, acc, N, K, M, stats);
+        /* Failed part-way: the caller recomputes acc on the CPU and must not
+         * take its row ranges from half-written statistics. (Found by
+         * injecting a bus error on a multi-tile job in the emulator.) */
+        if (!r && st) { st->v = 0; st->tiles = 0; }
+        return r;
     }
 
     /* K longer than the A-tile RAM: the 3x3 convolutions on the 384-channel
@@ -842,6 +874,70 @@ static int accel_check_gather(void)
     return 0;      /* the plain GEMM path is still good */
 }
 
+/* The requantisation epilogue (CTRL.add, then CTRL.add + CTRL.relu)
+ * against the same arithmetic in C, on a 20 x 8 chunk in BRAM, before DDR3
+ * exists. A mismatch disables the epilogue alone; the engine then adds and
+ * applies ReLU on the CPU as before. */
+static int64_t chk_apply(int64_t v, int64_t mult, int sh)
+{
+    int64_t r = v * mult;
+    if (sh > 0) r += (int64_t)1 << (sh - 1);
+    return r >> sh;
+}
+static int32_t chk_sat(int64_t v) { return v > 8191 ? 8191 : v < -8191 ? -8191 : (int32_t)v; }
+
+static int accel_check_epilogue(void)
+{
+    enum { N = 20, M = 8 };
+    static int32_t par[3 * M] __attribute__((aligned(4)));
+    int32_t *acc = chk_sw;                      /* M x N int32 */
+    int16_t *x   = chk_a;                       /* N x M int16 */
+    int16_t *out = chk_a + 256;                 /* N x M int16 */
+    uint32_t seed = 0x13579bdu;
+    for (int i = 0; i < M * N; i++)
+        acc[i] = (int32_t)(chk_rand(&seed) % 2000001u) - 1000000;
+    for (int i = 0; i < N * M; i++)
+        x[i] = (int16_t)((int32_t)(chk_rand(&seed) % 16383u) - 8191);
+    for (int m = 0; m < M; m++) {
+        par[3 * m]     = (int32_t)(0x40000000u + chk_rand(&seed) % 0x3fffffffu);
+        par[3 * m + 1] = 38 + (int32_t)(chk_rand(&seed) % 4u);
+        par[3 * m + 2] = (int32_t)(chk_rand(&seed) % 2001u) - 1000;
+    }
+    dav2_rq_epi_t epi = { x, 0x5a000000, 0x61000000, 31, 32, 1, 0 };
+    int bad = 0;
+    for (int pass = 0; pass < 2 && !bad; pass++) {
+        int32_t amax = 0;
+        epi.relu = pass;
+        int r = dav2_accel_requant_rows_async(acc, N, M, 0, M, par, out, &amax, &epi);
+        if (r == 0 || !dav2_accel_finish()) {
+            printf("GEMM accelerator: add/ReLU self-test could not run\n");
+            accel_epi_ok = 0;
+            return 0;
+        }
+        for (int n = 0; n < N; n++)
+            for (int m = 0; m < M; m++) {
+                int32_t h = chk_sat(chk_apply(acc[m * N + n], par[3 * m], par[3 * m + 1])
+                                    + par[3 * m + 2]);
+                int32_t e = chk_sat((int64_t)(int32_t)chk_apply(x[n * M + m], epi.mx, epi.sx)
+                                  + (int64_t)(int32_t)chk_apply(h, epi.mh, epi.sh));
+                if (epi.relu && e < 0) e = 0;
+                if (out[n * M + m] != e) {
+                    if (bad < 4)
+                        printf("  add/ReLU mismatch n=%d m=%d: hw %d != %d\n",
+                               n, m, (int)out[n * M + m], (int)e);
+                    bad++;
+                }
+            }
+    }
+    if (bad) {
+        printf("GEMM accelerator: ADD/RELU SELF-TEST FAILED (%d), epilogue disabled\n", bad);
+        accel_epi_ok = 0;
+    } else {
+        printf("GEMM accelerator: add/ReLU self-test ok\n");
+    }
+    return 0;      /* the plain paths are still good */
+}
+
 int dav2_accel_check(void)
 {
     if (!dav2_accel_init())
@@ -883,6 +979,8 @@ int dav2_accel_check(void)
     }
     if (!bad)
         bad = accel_check_gather();
+    if (!bad)
+        bad = accel_check_epilogue();
     return bad;
 }
 
@@ -949,9 +1047,11 @@ int dav2_accel_gemm_raw_async(const int16_t *a, uint32_t a_stride,
 }
 
 int dav2_accel_requant_rows_async(const int32_t *acc, int N, int M, int m0, int mc,
-                                  const int32_t *params, int16_t *out, int32_t *amax)
+                                  const int32_t *params, int16_t *out, int32_t *amax,
+                                  const dav2_rq_epi_t *epi)
 {
     (void)acc; (void)N; (void)M; (void)m0; (void)mc; (void)params; (void)out; (void)amax;
+    (void)epi;
     return 0;
 }
 

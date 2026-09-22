@@ -114,6 +114,11 @@ void dav2_quantize_f32(const float *src, int n, int c, dav2_tensor_t *out);
 /* out = A * W^T + bias, with dynamic output scale. out must be preallocated
  * with n = A->n and c = W->m. */
 void dav2_qgemm(const dav2_tensor_t *a, const dav2_qw_t *w, dav2_tensor_t *out);
+/* dav2_qgemm, then dav2_add(res, result) if res, then dav2_relu if relu --
+ * bit-identical, but on the accelerator the add and the ReLU run inside the
+ * requantisation job. out may be res (in-place residual update). */
+void dav2_qgemm_ex(const dav2_tensor_t *a, const dav2_qw_t *wt,
+                   const dav2_tensor_t *res, int relu, dav2_tensor_t *out);
 
 /* LayerNorm over channels, producing a fresh dynamic scale. */
 void dav2_layernorm(const dav2_tensor_t *in, const float *g, const float *b,
@@ -137,6 +142,10 @@ void dav2_im2col(const dav2_tensor_t *in, int h, int w,
 dav2_tensor_t dav2_conv2d(const dav2_tensor_t *in, int h, int w,
                           const dav2_qw_t *wt, int k, int stride, int pad,
                           int *oh, int *ow);
+dav2_tensor_t dav2_conv2d_ex(const dav2_tensor_t *in, int h, int w,
+                             const dav2_qw_t *wt, int k, int stride, int pad,
+                             const dav2_tensor_t *res, int relu,
+                             int *oh_out, int *ow_out);
 
 /* Non-overlapping transposed convolution (kernel == stride). */
 dav2_tensor_t dav2_conv_transpose(const dav2_tensor_t *in, int h, int w,

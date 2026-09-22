@@ -264,3 +264,15 @@ also made failure paths testable: inject a bus error on job *n* and check
 that the output is still right. Half a day of work, and it retroactively
 checked two rounds of driver code.
 
+**Fuse an operation into its producer when its parameters can be known
+first.** The residual add looked unfusable, because its scale depends on the
+largest value of an output that doesn't exist yet. But requantisation is
+monotonic per row, so that largest value sits at the row's extreme
+accumulators, which the hardware already reports. Look for such a property
+before accepting a second pass.
+
+**Sweep fault injection; don't pick a few points.** Five hand-picked failure
+points all recovered. A sweep over every thirteenth job found a sixth that
+silently produced a wrong result. Error paths are where untested state
+survives.
+

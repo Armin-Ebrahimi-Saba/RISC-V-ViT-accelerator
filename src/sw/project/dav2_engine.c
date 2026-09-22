@@ -476,14 +476,10 @@ static void run_block(dav2_tensor_t *x, int i, int n_tokens)
     }
 
     BDUMP("ctx", &ctx);
-    dav2_tensor_t attn = dav2_tensor_new(n_tokens, ED);
-    dav2_qgemm(&ctx, &bw.proj, &attn);
-    BDUMP("attn", &attn);
-
-    dav2_tensor_t sum1 = dav2_tensor_new(n_tokens, ED);
-    dav2_add(x, &attn, &sum1);
-    dav2_copy16(x->v, sum1.v, (size_t)n_tokens * ED);
-    x->scale = sum1.scale;
+    /* x = x + proj(ctx): the residual add is the requantisation job's
+     * epilogue on the accelerator, and x is updated in place */
+    dav2_qgemm_ex(&ctx, &bw.proj, x, 0, x);
+    BDUMP("res1", x);
     dav2_arena_release(mark);
 
     mark = dav2_arena_mark();
@@ -497,14 +493,9 @@ static void run_block(dav2_tensor_t *x, int i, int n_tokens)
     dav2_gelu(&h1);
     BDUMP("gelu", &h1);
 
-    dav2_tensor_t h2 = dav2_tensor_new(n_tokens, ED);
-    dav2_qgemm(&h1, &bw.fc2, &h2);
-
-    BDUMP("fc2", &h2);
-    dav2_tensor_t sum2 = dav2_tensor_new(n_tokens, ED);
-    dav2_add(x, &h2, &sum2);
-    dav2_copy16(x->v, sum2.v, (size_t)n_tokens * ED);
-    x->scale = sum2.scale;
+    /* x = x + fc2(h1), likewise fused and in place */
+    dav2_qgemm_ex(&h1, &bw.fc2, x, 0, x);
+    BDUMP("res2", x);
     dav2_arena_release(mark);
 }
 
@@ -527,10 +518,12 @@ static dav2_tensor_t res_conv_unit(const dav2_tensor_t *x, int h, int w,
     t.scale = x->scale;
     dav2_relu(&t);
 
-    dav2_tensor_t a = dav2_conv2d(&t, h, w, &c1, 3, 1, 1, 0, 0);
-    dav2_relu(&a);
-    dav2_tensor_t b = dav2_conv2d(&a, h, w, &c2, 3, 1, 1, 0, 0);
-    dav2_add(&b, x, &out);
+    /* relu(conv1) and x + conv2 each fused into the conv's requantisation */
+    dav2_tensor_t a = dav2_conv2d_ex(&t, h, w, &c1, 3, 1, 1, 0, 1, 0, 0);
+    dav2_tensor_t b = dav2_conv2d_ex(&a, h, w, &c2, 3, 1, 1, x, 0, 0, 0);
+    dav2_copy16(out.v, b.v, (size_t)h * w * DAV2_FEATURES);
+    out.scale = b.scale;
+    out.amax_q = b.amax_q;
 
     dav2_arena_release(mark);
     return out;
@@ -760,10 +753,8 @@ void dav2_infer(const dav2_cfg_t *cfg, float *depth_out)
     dav2_tensor_t up = dav2_tensor_new(out_size * out_size, c1.c);
     dav2_interpolate(&c1, oh, ow, out_size, out_size, &up);
 
-    dav2_tensor_t c2 = dav2_conv2d(&up, out_size, out_size, &o2a, 3, 1, 1, &oh, &ow);
-    dav2_relu(&c2);
-    dav2_tensor_t c3 = dav2_conv2d(&c2, out_size, out_size, &o2b, 1, 1, 0, &oh, &ow);
-    dav2_relu(&c3);
+    dav2_tensor_t c2 = dav2_conv2d_ex(&up, out_size, out_size, &o2a, 3, 1, 1, 0, 1, &oh, &ow);
+    dav2_tensor_t c3 = dav2_conv2d_ex(&c2, out_size, out_size, &o2b, 1, 1, 0, 0, 1, &oh, &ow);
 
     for (int i = 0; i < out_size * out_size; i++)
         depth_out[i] = (float)c3.v[i] * c3.scale;

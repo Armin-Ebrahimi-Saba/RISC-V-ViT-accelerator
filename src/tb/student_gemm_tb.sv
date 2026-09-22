@@ -55,6 +55,11 @@ module student_gemm_tb;
   localparam logic [31:0] R_G_CONV   = 32'h5c;
   localparam logic [31:0] R_G_START  = 32'h60;
   localparam logic [31:0] I_BASE     = 32'h8012_0000;   // gather: input image
+  localparam logic [31:0] R_X_ADDR   = 32'h64;
+  localparam logic [31:0] R_ADD_MX   = 32'h68;
+  localparam logic [31:0] R_ADD_MH   = 32'h6c;
+  localparam logic [31:0] R_ADD_SH   = 32'h70;
+  localparam logic [31:0] X_BASE     = 32'h8016_0000;   // requant: residual
   localparam logic [31:0] S_BASE     = 32'h800C_0000;   // per-row {max,min}
   localparam logic [31:0] P_BASE     = 32'h800D_0000;   // requant params
   localparam logic [31:0] O_BASE     = 32'h800E_0000;   // requant output
@@ -415,6 +420,102 @@ module student_gemm_tb;
       $display("  ok, %0d words", mdim * ndim);
   endtask
 
+  // apply_multiplier as the C code does it: (v*mult + 2^(sh-1)) >> sh
+  function automatic longint apply_mult(input longint v, input longint mult, input int sh);
+    longint r = v * mult;
+    if (sh > 0) r += 64'sd1 <<< (sh - 1);
+    return r >>> sh;
+  endfunction
+  function automatic int sat14(input longint v);
+    return (v > 8191) ? 8191 : (v < -8191) ? -8191 : int'(v);
+  endfunction
+
+  // Requantisation with the epilogue: out = sat14(apply(x, mx, sx) +
+  // apply(h, mh, sh)) with h the plain requantised value, optionally ReLU.
+  // mode: 0 = requant only + relu, 1 = add, 2 = add + relu. Chunks of at
+  // most 512 rows, as the add mode requires.
+  task automatic run_requant_epi(input int ndim, input int mdim, input int mode);
+    int mismatches = 0;
+    logic [31:0] st;
+    int guard;
+    longint mx = 32'h4000_0000 + ($urandom % 32'h3fff_ffff);
+    longint mh = 32'h4000_0000 + ($urandom % 32'h3fff_ffff);
+    int sx = 31 + ($urandom % 2), shh = 31 + ($urandom % 2);   // factors near 1/2..1
+    int add = (mode != 0), relu = (mode != 1);
+    $display("--- REQUANT+%s%s N=%0d M=%0d", add ? "ADD" : "", relu ? "+RELU" : "", ndim, mdim);
+
+    for (int m = 0; m < mdim; m++) begin
+      memory.mem[mem_word(P_BASE) + 3*m]     = 32'h4000_0000 + ($urandom % 32'h3fff_ffff);
+      memory.mem[mem_word(P_BASE) + 3*m + 1] = 36 + ($urandom % 6);
+      memory.mem[mem_word(P_BASE) + 3*m + 2] = 32'($signed($urandom % 2001) - 1000);
+    end
+    for (int i = 0; i < ndim * mdim / 2; i++) begin
+      memory.mem[mem_word(X_BASE) + i] = {16'($signed($urandom % 16383) - 8191),
+                                          16'($signed($urandom % 16383) - 8191)};
+      memory.mem[mem_word(O_BASE) + i] = 32'hdead_beef;
+    end
+
+    for (int n0 = 0; n0 < ndim; n0 += NROWS) begin
+      int nc = (ndim - n0 > int'(NROWS)) ? NROWS : ndim - n0;
+      for (int m0 = 0; m0 < mdim; m0 += 512) begin
+        int mc = (mdim - m0 > 512) ? 512 : mdim - m0;
+        bus.put_word(R_A_ADDR,   C_BASE + 32'((m0 * ndim + n0) * 4));
+        bus.put_word(R_A_STRIDE, ndim * 4);
+        bus.put_word(R_P_ADDR,   P_BASE + 32'(m0 * 12));
+        bus.put_word(R_C_ADDR,   O_BASE + 32'(n0 * mdim * 2 + m0 * 2));
+        bus.put_word(R_X_ADDR,   X_BASE + 32'(n0 * mdim * 2 + m0 * 2));
+        bus.put_word(R_C_STRIDE, mdim * 2);
+        bus.put_word(R_ADD_MX,   32'(mx));
+        bus.put_word(R_ADD_MH,   32'(mh));
+        bus.put_word(R_ADD_SH,   {18'd0, 6'(shh), 2'd0, 6'(sx)});
+        bus.put_word(R_M_LEN,    mc);
+        bus.put_word(R_N_ROWS,   nc);
+        bus.put_word(R_CTRL,     32'h3 | (add ? 32'h8 : 0) | (relu ? 32'h10 : 0));
+        guard = 0;
+        forever begin
+          bus.get_word(R_STATUS, st);
+          if (!(st & 32'h1)) break;
+          if (++guard > 200000) begin
+            $display("FAIL: epilogue job did not finish (status=0x%08x)", st);
+            errors++;
+            return;
+          end
+        end
+      end
+    end
+
+    for (int n = 0; n < ndim; n++) begin
+      for (int m = 0; m < mdim; m++) begin
+        longint acc  = longint'(int'(memory.mem[mem_word(C_BASE) + m * ndim + n]));
+        longint mult = longint'(int'(memory.mem[mem_word(P_BASE) + 3*m]));
+        int     sh   = int'(memory.mem[mem_word(P_BASE) + 3*m + 1]);
+        longint bias = longint'(int'(memory.mem[mem_word(P_BASE) + 3*m + 2]));
+        int     idx  = n * mdim + m;
+        logic [31:0] xw = memory.mem[mem_word(X_BASE) + (idx >> 1)];
+        longint x    = idx[0] ? longint'($signed(xw[31:16])) : longint'($signed(xw[15:0]));
+        int     h    = sat14(apply_mult(acc, mult, sh) + bias);
+        int     e    = add ? sat14(longint'(int'(apply_mult(x, mx, sx))) +
+                               longint'(int'(apply_mult(h, mh, shh)))) : h;
+        logic [31:0] w;
+        int     got;
+        if (relu && e < 0) e = 0;
+        w   = memory.mem[mem_word(O_BASE) + (idx >> 1)];
+        got = idx[0] ? int'($signed(w[31:16])) : int'($signed(w[15:0]));
+        checks++;
+        if (got !== e) begin
+          if (mismatches < 5)
+            $display("  FAIL n=%0d m=%0d: got %0d expected %0d (h=%0d x=%0d)", n, m, got, e, h, x);
+          mismatches++;
+        end
+      end
+    end
+    if (mismatches) begin
+      $display("  %0d/%0d outputs wrong", mismatches, ndim * mdim);
+      errors += mismatches;
+    end else
+      $display("  ok, %0d outputs", ndim * mdim);
+  endtask
+
   task automatic run_requant(input int ndim, input int mdim, input int sh_min = 33);
     int mismatches = 0;
     logic [31:0] st;
@@ -558,6 +659,12 @@ module student_gemm_tb;
     run_gemm(82, 128, 12);   run_requant(82, 12);     // two tiles
     run_gemm(20, 64, 30);    run_requant(20, 30);     // one partial tile
     run_requant(20, 30, 46);                          // small outputs: rq_amax < 8191
+    // epilogue: ReLU alone, add, add + ReLU; one chunk and chunks of 512
+    run_gemm(20, 64, 30);    run_requant_epi(20, 30, 0);
+    run_requant_epi(20, 30, 1);
+    run_requant_epi(20, 30, 2);
+    run_gemm(70, 96, 1100);  run_requant_epi(70, 1100, 1);  // 512 + 512 + 76 rows
+    run_gemm(130, 64, 8);    run_requant_epi(130, 8, 2);    // two n-tiles
     run_gemm(70, 96, 1100);  run_requant(70, 1100);   // M over one param chunk
     stats_addr = 0;
 

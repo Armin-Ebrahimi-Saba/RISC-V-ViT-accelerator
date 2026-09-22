@@ -106,8 +106,22 @@ int dav2_accel_gemm_raw_async(const int16_t *a, uint32_t a_stride,
                               int32_t *acc, int N, int K, int M);
 /* Rows m0..m0+mc of a requantisation (mc even, <= CAPS.KMAX/2); *amax is
  * raised to the largest |out| once the job has been collected. */
+/* Optional epilogue of a requantisation job (CTRL.add / CTRL.relu):
+ *   add:  out = sat14(apply(x[n][m], mx, sx) + apply(h, mh, sh)), x laid out
+ *         like out (rows M int16 apart); h the plain requantised value
+ *   relu: out = max(out, 0)
+ * apply(v, mult, shift) is apply_multiplier in dav2_ops.c. With add, a chunk
+ * is at most CAPS.KMAX/4 rows. */
+typedef struct {
+    const int16_t *x;
+    int32_t        mx, mh;
+    int            sx, sh;
+    int            add, relu;
+} dav2_rq_epi_t;
+
 int dav2_accel_requant_rows_async(const int32_t *acc, int N, int M, int m0, int mc,
-                                  const int32_t *params, int16_t *out, int32_t *amax);
+                                  const int32_t *params, int16_t *out, int32_t *amax,
+                                  const dav2_rq_epi_t *epi);
 int dav2_accel_finish(void);
 int dav2_accel_busy(void);      /* a job is pending and still running */
 
