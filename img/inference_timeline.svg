@@ -49,8 +49,8 @@
 </g>
 <g fill="#222" font-size="11">
 <text x="60" y="250">Blue = on the accelerator: every matrix multiply, and the requantisation that turns its int32 output back</text>
-<text x="60" y="266">into int16. Grey = element-wise work on the CPU: LayerNorm, the attention softmax and gathers, GELU, adds.</text>
-<text x="60" y="292">The model's own time is 14.2 s per frame (it was 93.6 s — see PERFORMANCE.md), of which 8.7 s is the</text>
+<text x="60" y="266">into int16, with the residual adds and ReLUs. Grey = element-wise work on the CPU: LayerNorm, softmax, GELU.</text>
+<text x="60" y="292">Last measured: 14.2 s per frame (it was 93.6 s; later rounds not yet on the board — PERFORMANCE.md), 8.7 s the</text>
 <text x="60" y="308">12 blocks and 5 s the DPT head. The weight load is not part of a frame: it happens once per session,</text>
 <text x="60" y="324">after which images go in over JTAG in 0.3 s and depth maps come out in 0.7 s.</text>
 </g>

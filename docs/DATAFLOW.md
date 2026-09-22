@@ -1,305 +1,320 @@
-# How data flows — timing diagrams
+# How data flows
 
-Companion to `ARCHITECTURE.md`. Where that document shows *what* the blocks
-are, this one shows *when* things happen: the bus handshake cycle by cycle,
-one inference from weights to depth map, and the exact cycle sequence of the
-bug that was hardest to find.
+This document is a companion to `ARCHITECTURE.md`. That document shows what
+the blocks are. This document shows when things happen. It covers the bus
+handshake cycle by cycle, one full inference run, and the cycle sequence of
+the hardest bug in the project.
 
-A *timing diagram* shows signals as horizontal traces against time running
-left to right, with vertical divisions marking clock cycles. A signal drawn
-high is 1, low is 0. Reading one is mostly a matter of finding the cycle
-where two things are true at once.
+A timing diagram shows signals as horizontal lines. Time runs left to right.
+Vertical lines mark clock cycles. A high line means the signal is 1. A low
+line means it is 0. To read one, find the cycle where two signals are both
+high at the same time.
 
 ---
 
 ## 1. The TL-UL handshake
 
-One rule governs every transfer on the bus, in either direction: **data
-moves only in a cycle where `valid` and `ready` are both high.** The sender
-raises `valid` and holds its data steady; the receiver raises `ready` once it
-can accept it. Neither side may assume the other is watching — and once
-`valid` is up, the sender is not allowed to change or withdraw the data until
-the transfer actually happens.
+One rule governs every transfer on the bus. Data moves only in a cycle
+where `valid` and `ready` are both high. The sender raises `valid` and holds
+its data steady. The receiver raises `ready` once it can accept the data.
+Neither side may assume the other is watching. Once `valid` is high, the
+sender must not change or withdraw its data until the transfer happens.
 
 ![Timing diagram of a TL-UL request and response. The request handshakes in cycle 3 when a_valid and a_ready are both high; the response handshakes in cycle 6 when d_valid and d_ready are both high. In cycle 5, d_valid is high but d_ready is low, and a compliant device holds the response.](../img/tlul_handshake.svg)
 
-*Cycle 3: the request goes through, since a_valid and a_ready are both high. Cycle 5: the device offers its response, but the receiver isn't ready yet — a compliant device would keep offering it. Cycle 6: the response finally goes through. The platform's cache does not behave like this: it drops the response after cycle 5 instead of holding it. That single misbehaviour is the "d_ready defect" the accelerator's retry timer exists to survive.*
+*Cycle 3: the request goes through. Both a_valid and a_ready are high. Cycle
+5: the device offers its response, but the receiver is not ready. A
+compliant device would keep offering the response. Cycle 6: the response
+goes through. The platform's cache does not behave this way. It drops the
+response after cycle 5 instead of holding it. This is the "d_ready defect".
+The accelerator's retry timer exists to survive it.*
 
-Each of the three fixed bugs broke this picture in a different way:
+The three fixed bugs each broke this picture in a different way.
 
-- **Request mux (bug 1)** — the CPU saw `a_ready` go high from a block that
-  was never actually going to accept the request. Cycle 3 looked like a
-  transfer to the CPU, but nothing on the other side recorded it, so no
-  response could ever arrive.
-- **d_ready defect (worked around, not fixed)** — the device raises
-  `d_valid` for exactly one cycle (cycle 5 here) and never checks whether the
-  receiver is ready. If the receiver is busy that one cycle, the response is
-  simply gone.
-- **Write-back (bug 2)** — the handshake itself was fine; the *data* riding
-  on the write-back was one cycle stale. A handshake diagram can't show a
-  bug like this — §4 below does.
+- **Request mux (bug 1).** The CPU saw `a_ready` go high from a block that
+  was never going to accept the request. Cycle 3 looked like a transfer to
+  the CPU. Nothing on the other side recorded it. No response could ever
+  arrive.
+- **d_ready defect (worked around, not fixed).** The device raises
+  `d_valid` for exactly one cycle and never checks whether the receiver is
+  ready. If the receiver is busy that one cycle, the response is gone.
+- **Write-back (bug 2).** The handshake itself was correct. The data on the
+  write-back was one cycle old. A handshake diagram cannot show this bug.
+  Section 4 below shows it.
 
 ---
 
 ## 2. One inference, end to end
 
-The wall-clock view of running a single frame on the board: 94 seconds
-total, at a 50 MHz clock.
+This is the wall-clock view of running one frame on the board, at a 50 MHz
+clock. The last frame measured on the board took 14.2 seconds, after a
+one-time weight load of about 66 seconds. The changes made since then have
+not yet been measured on the board (`PERFORMANCE.md` §5).
 
 ![Gantt-style timeline of one inference: weight load over JTAG about 66 seconds, patch embedding under a second, twelve transformer blocks about 0.7 seconds each, DPT head about five seconds. Within each block, GEMMs and requantisation run on the accelerator and the element-wise work on the CPU.](../img/inference_timeline.svg)
 
-*The JTAG weight load takes up most of the wall clock, but it's a one-time setup cost, not something every frame pays. Inside the model itself, every transformer block alternates accelerator jobs (GEMM, requantisation) with CPU element-wise work — after the speed-up work described in PERFORMANCE.md, the two now take about the same amount of time.*
+*The JTAG weight load takes up most of the wall clock. It is a one-time
+setup cost, not something every frame pays. Inside the model itself, every
+transformer block alternates accelerator jobs (GEMM, requantisation) with
+CPU element-wise work. After the speed-up work in PERFORMANCE.md, the two
+now take about the same amount of time.*
 
-Terms:
+Terms used above:
 
-- **Patch embedding** — the first layer, which cuts the image into 14×14
-  patches and turns each into a 384-number vector.
-- **Transformer block** — the repeated unit of a vision transformer:
-  self-attention (each patch looks at every other patch) followed by an MLP
-  (a two-layer per-patch network). Twelve of them, in sequence.
-- **qkv / proj / fc1 / fc2** — the four matrix multiplies in one block.
-- **DPT head** — the decoder that turns the transformer's features back into
+- **Patch embedding.** The first layer. It cuts the image into 14x14
+  patches and turns each patch into a 384-number vector.
+- **Transformer block.** The repeated unit of a vision transformer. It has
+  self-attention, where each patch looks at every other patch, followed by
+  an MLP, a two-layer network applied to each patch. There are twelve
+  blocks, run one after another.
+- **qkv / proj / fc1 / fc2.** The four matrix multiplies in one block.
+- **DPT head.** The decoder. It turns the transformer's features back into
   a full-resolution depth map.
-- **LayerNorm, GELU, softmax** — element-wise normalisation and activation
-  functions. Cheap per element, but there are millions of elements and they
-  run on a scalar CPU that retires about one instruction per cycle; they are
-  in fixed point now, the per-row statistics excepted.
+- **LayerNorm, GELU, softmax.** Element-wise normalisation and activation
+  functions. Each one is cheap, but there are millions of elements. They run
+  on a scalar CPU that finishes about one instruction per cycle. They now
+  run in fixed point, except for the per-row statistics.
 
 ---
 
 ## 3. The whole computation, step by step
 
-One full picture, numbered 1–35 in the order things happen for a single
-frame. Each box names an operation, which tensors it reads (**R**) and
-writes (**W**) and their shapes, and — by its colour — where it runs: blue
-for the CPU, orange for the accelerator, grey for the PC. A coloured tag
-under each box (blob, image, arena, scratch, tile, result, pc) says which
-memory it touched — see the memory map in `ARCHITECTURE.md` §3.
+One picture shows every operation of one frame, numbered 1 to 35, in the
+order they run. Each box names an operation. It also lists the tensors it
+reads (R) and writes (W), with their shapes. The box colour shows where it
+runs: blue for the CPU, orange for the accelerator, grey for the PC. A tag
+under each box names the memory region it used. See the memory map in
+`ARCHITECTURE.md` section 3.
 
-Parallelism is drawn with fork/join bars, and most of the computation has
-none — it's a straight chain where each step needs the output of the one
-before it:
+Most of the computation is a straight chain. Each step needs the output of
+the step before it. A few parts can run at the same time or in any order,
+and the picture marks those with fork and join bars.
 
-- **Solid orange bars** mark work that genuinely happens at the same time.
-  This occurs in exactly one place: inside every accelerator job (detailed
-  once, in step 3), where three engines run concurrently — a read engine
-  with up to eight requests in flight, the 128 multiply-accumulate units, and
-  a write engine with up to eight writes awaiting acknowledgement. That
-  overlap is the whole reason the block moves one word every 3.2 cycles
-  instead of every 8.3.
-- **Dashed grey bars** mark work that *could* run in parallel — because the
-  pieces don't depend on each other — but today runs one after another: the
-  six attention heads, the two half-products of each attention GEMM
-  (10a/10b and 12a/12b), and the four DPT feature levels (22–25).
-- The CPU and the accelerator are never overlapped either — while a job
-  runs, the CPU just polls the status register instead of doing other useful
-  work. `PERFORMANCE.md` §5 lists what overlapping them would gain.
+- **Solid orange bars** mark work that truly runs at the same time. The
+  figure marks one such place: inside every accelerator job. Three engines
+  run together there. A read engine keeps up to eight requests in flight.
+  128 multiply-accumulate units do the arithmetic. A write engine keeps up
+  to eight writes waiting for acknowledgement. This overlap is why the
+  block moves one word every 3.2 cycles instead of every 8.3.
+- **Dashed grey bars** mark work that does not depend on other work at the
+  same stage, so it could run in parallel. Today it still runs one piece
+  after another. Examples: the six attention heads, the two half-products
+  in each attention GEMM, and the four DPT feature levels.
+- The CPU and the accelerator overlap where the work allows it. The last
+  job of an operation can be left running while the CPU does work that
+  does not need its result. It reads each finished row's range while the
+  GEMM drains later rows. It computes the next chunk's requantisation
+  parameters while the current chunk converts. In attention, it prepares
+  the next head while the current one multiplies. Most steps still need
+  the previous result, so most of the frame stays a chain. See
+  `PERFORMANCE.md` section 5, round four.
 
 ![Every computation of one frame in order: 35 numbered operations with the tensors they read and write and the memory they live in; fork/join bars for parallel and independent work](../img/computation.svg)
 
-*Steps 7–21 repeat for each of the twelve transformer blocks; steps 9–13 for each of the six heads within a block. "GEMM + requant" everywhere means steps 3–5: a matrix product on the accelerator, the per-row range it reports back, the CPU turning that range into per-row scaling parameters, and the accelerator's requantisation job that applies them. (`img/computation.png` is the same figure as a bitmap.)*
+*Steps 7 to 21 repeat for each of the twelve transformer blocks. Steps 9 to
+13 repeat for each of the six heads inside a block. "GEMM + requant" always
+means the same three-step pattern: the accelerator multiplies two matrices,
+the CPU turns the per-row range it reports into scaling parameters, and the
+accelerator applies those parameters to produce int16 output.*
 
-### Step by step, in plain terms
+### Step by step, in plain words
 
-The table groups the 35 steps by what part of the network they belong to.
-"GEMM+requant" stands for the same three-step pattern every time: the
-accelerator multiplies two matrices, the CPU computes per-row scaling from
-the ranges the accelerator reported, and the accelerator scales the int32
-result back down to int16 (see §4 of `ARCHITECTURE.md`).
+**Input**
 
-**Input (once per frame)**
-
-| # | What happens |
+| Step | What happens |
 |---|---|
-| 1 | The host resizes the photo to 126×126, normalises it the way the model was trained to expect, and quantises it to int16, then sends it to the board over JTAG. |
-| 2 | The CPU cuts the image into 81 non-overlapping 14×14 patches (`im2col`) — the standard way to turn an image into a sequence a transformer can consume. |
+| 1 | The host resizes the photo to 126x126 pixels. It normalises the pixels and converts them to int16. It sends the result to the board over JTAG. |
+| 2 | The CPU cuts the image into 81 patches of 14x14 pixels each. This step is called im2col. |
 
-**Patch embedding (once per frame)**
+**Patch embedding**
 
-| # | What happens |
+| Step | What happens |
 |---|---|
-| 3 | GEMM+requant: each patch is turned into a 384-number vector by multiplying it against the patch-embedding weights. Two accelerator tiles (64 + 17 patches). |
-| 4 | The CPU computes the requantisation table from the accelerator's per-row ranges. |
-| 5 | The accelerator's requantisation job produces `emb`, the embedded patches, as int16. |
-| 6 | The CPU builds the 82-token sequence: a learned class token plus the 81 embedded patches, each with its learned position added. This is the `x` matrix every transformer block updates. |
+| 3 | GEMM + requant. Each patch becomes a 384-number vector, by multiplying it with the patch-embedding weights. The 81 patches fit in one accelerator tile. |
+| 4 | The CPU computes the requantisation table from the ranges the accelerator reported. |
+| 5 | The accelerator's requantisation job produces the embedded patches as int16. |
+| 6 | The CPU builds the 82-token sequence. It adds a learned class token, then adds a learned position to each of the 81 patches. The result is the matrix that every transformer block updates. |
 
-**Transformer encoder — steps 7–21 repeat for each of the 12 blocks**
+**Transformer encoder (steps 7 to 21 repeat for each of the 12 blocks)**
 
-| # | What happens |
+| Step | What happens |
 |---|---|
-| 7 | LayerNorm 1: the CPU rescales each token's row to zero mean and unit variance (in float, for accuracy), producing `n`. |
-| 8 | GEMM+requant: `n` is multiplied by the block's qkv weights, producing query, key and value vectors for all 6 attention heads at once. |
-| 9–13 | Attention, repeated for each of the 6 heads (see below) — independent work, run one head after another today. |
-| 14 | GEMM+requant: the combined attention output (`ctx`) is projected back to 384 dimensions. |
-| 15 | Residual add: `x = x + attn`, so the block's output builds on its input rather than replacing it. |
-| 16 | LayerNorm 2, same idea as step 7, producing `n2`. |
-| 17 | GEMM+requant: the MLP's first layer expands `n2` from 384 to 1536 dimensions. |
-| 18 | GELU: a smooth nonlinearity applied element-wise, via a 257-entry lookup table with linear interpolation (fast on a CPU with no floating-point unit). |
-| 19 | GEMM+requant: the MLP's second layer compresses back down to 384 dimensions. |
-| 20 | Residual add, same idea as step 15; `x` now holds this block's output and feeds the next block's step 7. |
-| 21 | After blocks 3, 6, 9 and 12 only: a normalised copy of `x` is saved as one of the four feature maps the decoder needs. |
+| 7 | LayerNorm 1. The CPU rescales each token's row to zero mean and unit variance. The row statistics are computed in float; the per-element work is fixed point. |
+| 8 | GEMM + requant. The block's qkv weights produce query, key and value vectors for all 6 attention heads at once. |
+| 9 to 13 | Attention, repeated for each of the 6 heads. See the table below. Heads do not depend on each other, but run one after another today. |
+| 14 | GEMM + requant. The combined attention output is projected back to 384 dimensions. |
+| 15 | Residual add. The block's output is added to its input, so information is not lost. This runs inside step 14's requantisation job, on the accelerator, and updates the token matrix in place. |
+| 16 | LayerNorm 2, the same idea as step 7. |
+| 17 | GEMM + requant. The MLP's first layer expands the data from 384 to 1536 dimensions. |
+| 18 | GELU. A smooth activation function, applied to each element. It uses a 257-entry lookup table with linear interpolation, because the CPU has no floating-point unit. |
+| 19 | GEMM + requant. The MLP's second layer compresses the data back to 384 dimensions. |
+| 20 | Residual add, the same idea as step 15, inside step 19's requantisation job. The result feeds the next block's step 7. |
+| 21 | After blocks 3, 6, 9 and 12 only: a normalised copy of the data is saved as one of the four feature maps the decoder needs. |
 
-*Attention (steps 9–13, once per head):* the accelerator only multiplies
-int8 by int16, but `q`, `k` and `v` are int16, so each is split into an
-8-bit high and low half and the product run twice — `a·x = 2ˢ·(a·hi) +
-(a·lo)` — which is exact, not an approximation.
+*Attention, steps 9 to 13, once per head.* The accelerator can only multiply
+int8 by int16. The query, key and value vectors are int16, so each is split
+into a high half and a low half, both int8. The multiply then runs twice
+and the two results are combined. This gives an exact answer, not an
+approximation.
 
-| # | What happens |
+| Step | What happens |
 |---|---|
-| 9 | The CPU gathers this head's slice of q/k/v and splits q and v into their high/low int8 halves. |
-| 10a/10b | Two independent GEMMs compute the attention scores from the high and low halves; run one after another today. |
-| 11 | Softmax: the CPU turns each row of scores into probabilities (fixed-point, per query token). |
-| 12a/12b | Two more independent GEMMs combine the probabilities with `v`'s high/low halves into the raw context. |
-| 13 | The CPU normalises by each row's probability sum and writes this head's slice of `ctx`. |
+| 9 | The CPU gathers this head's slice of the query, key and value vectors. It splits the query and value vectors into high and low int8 halves. |
+| 10a, 10b | Two GEMMs compute the attention scores, one from the high halves and one from the low halves. They do not depend on each other, but run one after another today. |
+| 11 | Softmax. The CPU turns each row of scores into probabilities. |
+| 12a, 12b | Two more GEMMs combine the probabilities with the value vector's high and low halves. |
+| 13 | The CPU divides by each row's probability sum and writes this head's result. |
 
-**DPT decoder — steps 22–25 build four feature maps, 26–29 fuse them**
+**DPT decoder**
 
-The four feature maps saved in step 21 are at four different resolutions
-(9×9 up to 36×36 after this stage); the decoder folds them together from
-coarsest to finest.
+Steps 22 to 25 build four feature maps, one per level. Steps 26 to 29 fuse
+them together.
 
-| # | What happens |
+The four feature maps from step 21 are at four resolutions, from 9x9 up to
+36x36. The decoder combines them starting from the coarsest.
+
+| Step | What happens |
 |---|---|
-| 22–25 | One per feature level (independent, run one after another today): a 1×1 convolution (GEMM+requant) projects the features to fewer channels, an upsample or downsample brings it to that level's target resolution, then a 3×3 convolution (im2col on the CPU, GEMM+requant on the accelerator) refines it. |
-| 26–29 | Strictly sequential, coarsest level first: each step's `ResidualConvUnit` (two 3×3 convolutions with ReLUs, plus the original input added back) refines the previous level's output, adds it to this level's own feature map, upsamples on the CPU, and projects with a 1×1 convolution. |
+| 22 to 25 | One step per feature level. Each level does not depend on the others, but they run one after another today. A 1x1 convolution reduces the number of channels. A resize brings the result to the level's target resolution. A 3x3 convolution then refines it. For every 3x3 convolution the accelerator gathers the pixel neighbourhoods from the image itself (gather mode), then multiplies and requantises. A 1x1 convolution needs no gathering. |
+| 26 to 29 | Strictly sequential, from the coarsest level to the finest. Each step refines the previous level's output with a residual conv unit, two 3x3 convolutions with a ReLU between them, adds the current level's own feature map, upsamples on the CPU, and projects the result with a 1x1 convolution. |
 
-**Output (once per frame)**
+**Output**
 
-| # | What happens |
+| Step | What happens |
 |---|---|
-| 30 | A 3×3 convolution narrows 64 channels down to 32. |
-| 31 | Bilinear upsampling (CPU) from 72×72 to the full 126×126. |
-| 32 | Another 3×3 convolution at 32 channels, then a ReLU. |
-| 33 | A final 1×1 convolution collapses 32 channels to the single depth channel, then a ReLU. |
-| 34 | The CPU converts the fixed-point result to a float depth map and raises the "done" flag. |
-| 35 | The host reads the depth map back over JTAG (0.7 s), saves it, and renders it beside the PyTorch reference. |
+| 30 | A 3x3 convolution reduces 64 channels to 32. |
+| 31 | Bilinear upsampling on the CPU, from 72x72 to the full 126x126. |
+| 32 | Another 3x3 convolution at 32 channels, followed by a ReLU. |
+| 33 | A final 1x1 convolution reduces 32 channels to one, the depth channel, followed by a ReLU. |
+| 34 | The CPU converts the fixed-point result to a float depth map and raises the done flag. |
+| 35 | The host reads the depth map over JTAG. This takes 0.7 seconds. It saves the map and renders it next to the PyTorch reference. |
 
-Across all 35 steps, one frame runs 2,275 accelerator jobs, reads the 25 MB
-weight blob from DDR3 twice (once per activation tile), uses a 15 MB peak of
-the 64 MB scratch arena, and takes 14.2 s at 50 MHz.
+One frame runs 1,268 accelerator jobs in total (counted by the accelerator
+emulator on the current code). Each weight matrix is read from DDR3 once,
+because every activation tile of the encoder fits in one 128-row tile. The
+frame uses about 6 MB of the 64 MB scratch arena at peak. The last frame
+measured on the board took 14.2 seconds at 50 MHz, before the most recent
+changes.
 
 ### The same frame as a process
 
-The figure below is a complementary view of the same frame: instead of *what
-is computed* (§3's figure above), it shows *who does it and where the data
-goes*, laid out in four lanes — PC, CPU, accelerator, and memory.
+The figure below shows the same frame from a different angle. Section 3's
+figure above shows what is computed. This figure shows who does it and
+where the data goes. It uses four lanes: PC, CPU, accelerator, and memory.
 
 ![One frame, start to finish: PC, CPU, accelerator and memory lanes, steps numbered 1–8, the transformer block and attention expanded, GEMM and requantisation expanded underneath](../img/flow.svg)
 
-Steps 1–2 happen once per session (boot and weight load); 3–8 repeat once
-per image. The lanes run partly in parallel: while the accelerator drains
-a GEMM's last job, the CPU is already reading each finished row's range; it
-computes the next chunk's requantisation parameters while the current chunk
-converts; and in attention it prepares the next head while the current one
-multiplies (`PERFORMANCE.md` §5, round four). Step 5 (one transformer block) and its sub-step 5c (one attention
-head) are expanded into their own numbered rows; "GEMM" and "requant" boxes
-everywhere point to the A and B expansions at the bottom, which are what
-every such box in the rest of the diagram stands for.
+Steps 1 and 2 happen once per session, at boot and weight load. Steps 3 to 8
+repeat once per image. Step 5, one transformer block, and its sub-step 5c,
+one attention head, are expanded into their own numbered rows. "GEMM" and
+"requant" boxes point to the A and B expansions at the bottom. Those two
+expansions apply everywhere a "GEMM" or "requant" box appears above.
 
-| # | Who | What happens |
+| Step | Who | What happens |
 |---|---|---|
-| 1 | Host | Loads the 25 MB weight blob over JTAG — once per session, about 66 s — and spot-checks a few words to confirm it landed correctly. |
-| 2 | CPU | Boots, initialises DDR3, runs a small self-test GEMM against a known answer, then waits for the host's "go" flag. |
-| 3 | Host | Sends one image (0.3 s) and raises the "run a frame" flag. |
-| 4 | CPU + accelerator | Patch embedding: `im2col`, then GEMM+requant (→ A, B), then the CPU adds position embeddings and the class token. |
-| 5 | CPU + accelerator | One transformer block, sub-steps 5a–5k: LayerNorm, qkv GEMM, six attention heads (5c), projection GEMM, residual add, LayerNorm, MLP up GEMM, GELU, MLP down GEMM, residual add, and — on blocks 3/6/9/12 — the feature tap. Runs strictly in that order; the CPU polls STATUS during every accelerator job rather than doing something else. |
-| 6 | CPU + accelerator | The DPT head: four feature levels each get a 1×1 convolution, a resize, and a 3×3 convolution (6a); the levels are then fused coarsest-to-finest with residual conv units and 1×1 convolutions (6b); a final 3×3 → upsample → 3×3 → 1×1 chain produces the depth map (6c). Every convolution is `im2col` (CPU) + GEMM + requant (→ A, B) — 2,275 accelerator jobs in total per frame. |
-| 7 | CPU | Publishes the depth map to its DDR3 result slot, prints timing, and raises the "done" flag. |
-| 8 | Host | Reads the result over JTAG (0.7 s), saves it, and compares it against the host build — then loops back to step 3 for the next image. |
+| 1 | Host | Loads the 25 MB weight blob over JTAG. This happens once per session and takes about 66 seconds. The host checks a few words afterward to confirm the load worked. |
+| 2 | CPU | Boots, sets up DDR3, and runs three small accelerator self-tests against the CPU: a GEMM, gather mode, and the add/ReLU epilogue. A failed test switches off only that feature. It also prints a short microbenchmark of the core. Then it waits for the host's go flag. |
+| 3 | Host | Sends one image, which takes 0.3 seconds, and raises the "run a frame" flag. |
+| 4 | CPU and accelerator | Patch embedding: im2col, then GEMM and requant. The CPU then adds position embeddings and the class token. |
+| 5 | CPU and accelerator | One transformer block. Its sub-steps run in this order: LayerNorm, qkv GEMM, six attention heads, projection GEMM, residual add, LayerNorm, MLP up GEMM, GELU, MLP down GEMM, residual add, and, on blocks 3, 6, 9 and 12, the feature tap. Both residual adds run inside the requantisation job of the GEMM before them. While the last job of each operation runs, the CPU carries on with the work that does not need its result. |
+| 6 | CPU and accelerator | The DPT head. Four feature levels each get a 1x1 convolution, a resize, and a 3x3 convolution. The levels are then fused from coarsest to finest with residual conv units and 1x1 convolutions. A final chain of 3x3 convolution, upsample, 3x3 convolution and 1x1 convolution produces the depth map. Every 3x3 convolution gathers its patches on the accelerator (gather mode), then multiplies and requantises; the ReLUs after convolutions and the adds in the residual conv units run inside the requantisation job. The whole frame runs 1,268 accelerator jobs. |
+| 7 | CPU | Writes the depth map to its DDR3 result slot, prints timing information, and raises the done flag. |
+| 8 | Host | Reads the result over JTAG, which takes 0.7 seconds, saves it, and compares it against the host build. Then it loops back to step 3 for the next image. |
 
-**A — one GEMM on the accelerator**, what every "GEMM" box above means:
+**A. One GEMM on the accelerator.** This is what every "GEMM" box above
+means.
 
-| # | What happens |
+| Step | What happens |
 |---|---|
-| A1 | The CPU programs the job's registers — A/W/C addresses and strides, K, M, row count, `S_ADDR` for stats — and sets `CTRL.start`, then polls `STATUS`. |
-| A2 | The accelerator loads a 128-row tile of A into on-chip RAM, up to 8 reads in flight through a reorder buffer; a lost response is automatically re-issued. |
-| A3 | It streams W a word at a time (4 packed int8 weights each), broadcasting each to all 128 multiply-accumulate units — 128 MACs per cycle, K cycles per weight row. |
-| A4 | It drains that row's 64 int32 sums to column m of C, then (if stats are on) that row's max and min. |
-| A5 | It moves to the next row, or — once all M rows are done — reports `STATUS.done`; the CPU then starts the next 128-row tile back at A2. |
+| A1 | The CPU programs the job's registers: the A, W and C addresses and strides, K, M, the row count, and S_ADDR for statistics. It then sets CTRL.start. For the last job of an operation it may carry on with independent work and collect the job later; otherwise it polls STATUS. |
+| A2 | The accelerator loads a 128-row tile of A into on-chip RAM. Up to 8 reads stay in flight, using a reorder buffer. If a response is lost, it is re-issued automatically. |
+| A3 | The accelerator streams W one word at a time. Each word carries 4 packed int8 weights. Each weight is broadcast to all 128 multiply-accumulate units. This gives 128 MACs per cycle, and K cycles per weight row. |
+| A4 | The accelerator writes that row's 128 int32 sums to column m of C. If statistics are enabled, it then writes that row's maximum and minimum. |
+| A5 | The accelerator moves to the next row. Once all M rows are done, it reports STATUS.done. The CPU then starts the next 128-row tile, back at step A2. |
 
-Everything above A3 runs concurrently inside the block, as noted in §3.
+The three parts of step A3, reading, multiplying and writing, run at the
+same time inside the block, as described in section 3.
 
-**B — requantisation**, what every "requant" box above means, run right
-after every GEMM:
+**B. Requantisation.** This is what every "requant" box above means. It
+runs right after every GEMM.
 
-| # | What happens |
+| Step | What happens |
 |---|---|
-| B1 | From each row's {max, min}, the CPU computes one output scale for the whole tensor, then a per-row {multiplier, shift, bias} table. |
-| B2 | The accelerator reads the int32 result chunk transposed into its tile RAM, and the parameter table into a small RAM alongside it. |
-| B3 | It streams the scaled, rounded, saturated int16 result out, two values packed per 32-bit word. |
+| B1 | From each row's maximum and minimum, the CPU computes one output scale for the whole tensor, then a multiplier, shift and bias for each row. |
+| B2 | The accelerator reads the int32 result, transposed, into its tile RAM. It reads the parameter table into a small RAM alongside it. |
+| B3 | The accelerator streams out the scaled, rounded and saturated int16 result, with two values packed per 32-bit word. |
 
 ---
 
 ## 4. The write-back bug, cycle by cycle
 
-This was the most expensive bug to track down, so it's drawn at the level
-where the mistake actually becomes visible: two back-to-back writes whose
-addresses collide in the cache (same line index, different tags — meaning
-they map to the same cache slot but hold different data). The first write
-misses, is fetched from DDR3, and lands in the cache's RAM. The very next
-cycle, the second write misses that same line and must evict the first one
-first — which means writing the first write's data back to DDR3.
+This was the most expensive bug to find in the project. It is drawn at the
+level where the mistake becomes visible. Two writes happen back to back, to
+addresses that collide in the cache: they map to the same cache line, but
+they are different addresses. The first write misses the cache, is fetched
+from DDR3, and lands in the cache's RAM. The very next cycle, the second
+write misses the same line. To make room, the cache must evict the first
+line, which means writing it back to DDR3.
 
 ![Cycle diagram of the cache write-back bug. In cycle N the first write lands in the data RAM. In cycle N+1 the second write to the same line misses and the cache issues the write-back using data_rdata_raw, which is the RAM's output from before the cycle-N write landed. The forwarded signal data_rdata already had the correct value and was the fix.](../img/writeback_bug.svg)
 
 What happens, cycle by cycle:
 
-1. **Cycle N — write A lands.** A write to a line already in the cache (or
-   just missed in) updates the cache's data RAM. From this cycle on, the RAM
-   holds A's new value.
-2. **Cycle N+1 — write B misses the same line.** B's address maps to the
-   same cache slot as A but is a different address, so it's a miss: the
-   line must be evicted to make room, and since it was written it's dirty —
-   its contents have to go back to DDR3 first.
-3. **The eviction reads the wrong copy.** The cache's write-back logic reads
-   the line's contents from `data_rdata_raw`, the RAM's registered output
-   from *before* cycle N's write is visible on that signal — one cycle too
-   early. It sends that stale, pre-A value to DDR3 instead of A's actual
-   data.
-4. **A is gone.** DDR3 now holds A's old value where it should hold A's new
-   value, and nothing else will ever rewrite it — the loss is silent and
+1. **Cycle N: write A lands.** A write updates the cache's data RAM. From
+   this cycle on, the RAM holds A's new value.
+2. **Cycle N+1: write B misses the same line.** B's address maps to the
+   same cache slot as A, but is a different address. This is a miss. The
+   line must be evicted to make room. Since the line was just written, it
+   is dirty, so its contents must go back to DDR3 first.
+3. **The eviction reads the wrong copy.** The write-back logic reads the
+   line from a signal called `data_rdata_raw`. This signal is the RAM's
+   output from before cycle N's write became visible, one cycle too early.
+   It sends A's old value to DDR3 instead of A's new value.
+4. **A's data is lost.** DDR3 now holds A's old value where it should hold
+   A's new value. Nothing else will rewrite it. The loss is silent and
    permanent.
-5. **The fix.** A signal called `data_rdata` already existed alongside
-   `data_rdata_raw` — the same read, but forwarded so it reflects a
-   same-cycle write. Using it for the write-back instead closes the gap.
+5. **The fix.** A second signal, `data_rdata`, already existed. It is the
+   same read, but forwarded so it reflects a same-cycle write. Using this
+   signal for the write-back closes the gap.
 
-*Every lost word on the board was a tile's final write, because that write
-is always immediately followed by the next tile's first access missing the
-same cache line — exactly the two-cycle pattern above.*
+*Every lost word on the board was a tile's final write. That write is
+always followed immediately by the next tile's first access, which misses
+the same cache line. This is exactly the two-cycle pattern above.*
 
-Why it hid so long:
+This is why the bug was hard to find:
 
-- The accelerator's own counters said every write was issued and
-  acknowledged — which was true. The cache acknowledges a write the moment
-  it lands in the *cache*, before the write-back happens. The
-  acknowledgement was honest; the write-back was wrong.
-- It only shows up on two misses to the same line on *consecutive* cycles. A
+- The accelerator's own counters showed that every write was issued and
+  acknowledged, and this was true. The cache acknowledges a write as soon as
+  it lands in the cache, before the write-back happens. The acknowledgement
+  was correct. The write-back was wrong.
+- The bug needs two misses to the same line on consecutive cycles. A
   testbench driver that waits for each response before sending the next
-  request can never produce that pattern. The bug only appeared once the
-  driver was rewritten to present its next request the moment the previous
-  one was accepted — the way a real CPU, or the accelerator, actually
-  behaves.
-- Reading the word back after the cache had evicted it (so the read had to
-  go to DDR3) showed the loss was permanent. That ruled out "written but
-  briefly read stale" and pointed straight at the write-back path rather
-  than the read path.
+  request cannot produce this pattern. The bug only appeared once the
+  driver was rewritten to send its next request the moment the previous one
+  was accepted, the way the accelerator actually behaves.
+- Reading the word back after the cache had evicted it showed that the loss
+  was permanent. This ruled out a briefly stale read, and pointed to the
+  write-back path instead.
 
 ---
 
 ## 5. How a stalled bus was diagnosed without halting the CPU
 
-Not a timing diagram but a data-flow one, because the mechanism is the
-point: when the CPU is wedged on a bus access it can never retire, the
-debugger cannot halt it, so the usual "read the program counter" is
-impossible. A hardware register that watches the bus was the way in.
+This section is not a timing diagram. It shows data flow, because the
+mechanism is the point. When the CPU is stuck on a bus access it can never
+finish, the debugger cannot halt it. The usual method, reading the program
+counter, does not work. A hardware register that watches the bus solved
+this.
 
 ![Data flow of the watchdog diagnosis: the CPU is wedged and cannot be halted, but the debug module reads memory over the bus directly; the watchdog register on the DDR3 port has latched the oldest unanswered request, and reading it over JTAG names the stalled address, opcode and master.](../img/watchdog_probe.svg)
 
-*The CPU's stalled access blocks the CPU, not the bus. The debug module's own bus port still works, so a register that has been watching the DDR3 port can be read out and says which request never came back — from which master, to which address, for how long.*
+*The CPU's stalled access blocks the CPU, not the bus. The debug module's
+own bus port still works. A register that watches the DDR3 port can be read
+out. It reports which request never came back: from which master, to which
+address, and for how long.*
 
-
-This is the diagnostic that broke the longest impasse in the project. The
-register (`student_tl_watch.sv`, exposed at `DDR_CTRL0 + 0x4/0x8`) reported
-in a single line an accelerator write, thirty transactions outstanding on the
-port, and a saturated stall counter — enough to go straight to the request
-mux and find bug 1.
+This diagnostic broke the longest impasse in the project. The register
+(`student_tl_watch.sv`, exposed at `DDR_CTRL0 + 0x4/0x8`) reported, in a
+single line, an accelerator write, thirty transactions outstanding on the
+port, and a saturated stall counter. This was enough to go straight to the
+request mux and find bug 1.

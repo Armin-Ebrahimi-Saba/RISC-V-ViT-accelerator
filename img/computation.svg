@@ -4,7 +4,7 @@
 <text x="20" y="30" font-size="16" font-weight="700">One frame of Depth-Anything V2 on the board: every computation, in order</text>
 <text x="20" y="48" font-size="11">Shapes are [rows × columns] of the matrix the operation sees; int16 activations, int8 weights, int32 sums, f32 = 32-bit float. 82 tokens = 81 patches + 1 class token; 384 = the model width.</text>
 <rect x="20" y="66" width="14" height="14" rx="3" fill="#fff" stroke="#1c7ed6" stroke-width="1.6"/><text x="40" y="77" font-size="10.5">runs on the CPU</text>
-<rect x="150" y="66" width="14" height="14" rx="3" fill="#fff" stroke="#e8590c" stroke-width="1.6"/><text x="170" y="77" font-size="10.5">runs on the accelerator (inside every such job: read engine ∥ 64 multipliers ∥ write engine, see 3)</text>
+<rect x="150" y="66" width="14" height="14" rx="3" fill="#fff" stroke="#e8590c" stroke-width="1.6"/><text x="170" y="77" font-size="10.5">runs on the accelerator (inside every such job: read engine ∥ 128 multipliers ∥ write engine, see 3)</text>
 <rect x="700" y="66" width="14" height="14" rx="3" fill="#fff" stroke="#868e96" stroke-width="1.6"/><text x="720" y="77" font-size="10.5">runs on the PC</text>
 <line x1="20" y1="95" x2="60" y2="95" stroke="#e8590c" stroke-width="4"/><text x="66" y="99" font-size="10.5">fork / join: truly concurrent</text>
 <line x1="260" y1="95" x2="300" y2="95" stroke="#495057" stroke-width="4" stroke-dasharray="6 3"/><text x="306" y="99" font-size="10.5">fork / join: independent work, executed one after another today (could be parallel)</text>
@@ -25,7 +25,7 @@
 <text x="74.6" y="135" font-size="9.5">on-chip scratch, 40 kB BRAM</text>
 <rect x="231.7" y="126.5" width="31" height="12" rx="3" fill="#ffd8a8" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="235.7" y="136" font-size="9">tile</text>
-<text x="268.9" y="135" font-size="9.5">accelerator tile RAM, 256 kB</text>
+<text x="268.9" y="135" font-size="9.5">accelerator tile RAM, 512 kB</text>
 <rect x="431.3" y="126.5" width="20" height="12" rx="3" fill="#e9ecef" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="435.3" y="136" font-size="9">pc</text>
 <text x="456.90000000000003" y="135" font-size="9.5">PC file system</text>
@@ -64,7 +64,7 @@
 <text x="85.2" y="361" font-size="10">R  patch_embed.w [384 × 588] int8, streamed once per tile</text>
 <rect x="50" y="365.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="375" font-size="9">arena</text>
-<text x="91.0" y="374" font-size="10">W  acc [384 × 81] int32   and   stats [2 tiles × 384 × {max,min}] int32</text>
+<text x="91.0" y="374" font-size="10">W  acc [384 × 81] int32   and   stats [1 tile × 384 × {max,min}] int32</text>
 <line x1="60" y1="390" x2="700" y2="390" stroke="#e8590c" stroke-width="4"/>
 <rect x="60" y="398" width="210" height="44" rx="4" fill="#fff5f0" stroke="#e8590c" stroke-width="1"/>
 <text x="165" y="413" text-anchor="middle" font-weight="600" font-size="10">read engine</text>
@@ -72,7 +72,7 @@
 <text x="165" y="437" text-anchor="middle" font-size="9">er buffer; lost response re-issued</text>
 <rect x="280" y="398" width="210" height="44" rx="4" fill="#fff5f0" stroke="#e8590c" stroke-width="1"/>
 <text x="385" y="413" text-anchor="middle" font-weight="600" font-size="10">128 multiply-accumulate units</text>
-<text x="385" y="426" text-anchor="middle" font-size="9">one int8 weight × 64 int16 activations</text>
+<text x="385" y="426" text-anchor="middle" font-size="9">one int8 weight × 128 int16 activations</text>
 <text x="385" y="437" text-anchor="middle" font-size="9"> per cycle</text>
 <rect x="500" y="398" width="210" height="44" rx="4" fill="#fff5f0" stroke="#e8590c" stroke-width="1"/>
 <text x="605" y="413" text-anchor="middle" font-weight="600" font-size="10">write engine</text>
@@ -87,7 +87,7 @@
 <text x="56" y="496" font-weight="600" font-size="11">requantisation parameters (per output channel)</text>
 <rect x="50" y="503.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="513" font-size="9">arena</text>
-<text x="91.0" y="512" font-size="10">R  stats [2 × 384 × {max,min}]</text>
+<text x="91.0" y="512" font-size="10">R  stats [1 × 384 × {max,min}]</text>
 <rect x="50" y="516.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="526" font-size="9">blob</text>
 <text x="85.2" y="525" font-size="10">R  patch_embed scale [384] f32, bias [384] f32</text>
@@ -147,7 +147,7 @@
 <text x="56" y="902" font-weight="600" font-size="11">qkv GEMM + requant:  qkv = n · Wqkvᵀ</text>
 <rect x="50" y="909.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="919" font-size="9">arena</text>
-<text x="91.0" y="918" font-size="10">R  n [82 × 384] (2 tiles)</text>
+<text x="91.0" y="918" font-size="10">R  n [82 × 384] (1 tile)</text>
 <rect x="50" y="922.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="932" font-size="9">blob</text>
 <text x="85.2" y="931" font-size="10">R  Wqkv [1152 × 384] int8</text>
@@ -292,18 +292,18 @@
 <text x="85.2" y="1627" font-size="10">R  Wproj [384 × 384] int8</text>
 <rect x="50" y="1631.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="1641" font-size="9">arena</text>
-<text x="91.0" y="1640" font-size="10">W  attn [82 × 384] int16</text>
+<text x="91.0" y="1640" font-size="10">W  → 15 (attn is not stored)</text>
 <line x1="320.0" y1="1655" x2="320.0" y2="1669" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
-<rect x="40" y="1669" width="560" height="60" rx="6" fill="#fff" stroke="#1c7ed6" stroke-width="1.6"/>
-<circle cx="40" cy="1681" r="11" fill="#1c7ed6"/>
+<rect x="40" y="1669" width="560" height="60" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
+<circle cx="40" cy="1681" r="11" fill="#e8590c"/>
 <text x="40" y="1685" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">15</text>
-<text x="56" y="1685" font-weight="600" font-size="11">residual:  x = x + attn   (both rescaled to a common scale, saturated to 14 bits)</text>
+<text x="56" y="1685" font-weight="600" font-size="11">residual:  x = x + attn  — in 14's requantisation job (epilogue), rescaled + saturated</text>
 <rect x="50" y="1692.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="1702" font-size="9">arena</text>
-<text x="91.0" y="1701" font-size="10">R  x, attn [82 × 384]</text>
+<text x="91.0" y="1701" font-size="10">R  x [82 × 384] (the residual)</text>
 <rect x="50" y="1705.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="1715" font-size="9">arena</text>
-<text x="91.0" y="1714" font-size="10">W  x [82 × 384]</text>
+<text x="91.0" y="1714" font-size="10">W  x [82 × 384], in place</text>
 <line x1="320.0" y1="1729" x2="320.0" y2="1743" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
 <rect x="40" y="1743" width="560" height="73" rx="6" fill="#fff" stroke="#1c7ed6" stroke-width="1.6"/>
 <circle cx="40" cy="1755" r="11" fill="#1c7ed6"/>
@@ -356,15 +356,15 @@
 <text x="85.2" y="2036" font-size="10">R  Wfc2 [384 × 1536] int8</text>
 <rect x="50" y="2040.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="2050" font-size="9">arena</text>
-<text x="91.0" y="2049" font-size="10">W  h2 [82 × 384] int16</text>
+<text x="91.0" y="2049" font-size="10">W  → 20 (h2 is not stored)</text>
 <line x1="320.0" y1="2064" x2="320.0" y2="2078" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
-<rect x="40" y="2078" width="560" height="60" rx="6" fill="#fff" stroke="#1c7ed6" stroke-width="1.6"/>
-<circle cx="40" cy="2090" r="11" fill="#1c7ed6"/>
+<rect x="40" y="2078" width="560" height="60" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
+<circle cx="40" cy="2090" r="11" fill="#e8590c"/>
 <text x="40" y="2094" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">20</text>
-<text x="56" y="2094" font-weight="600" font-size="11">residual:  x = x + h2</text>
+<text x="56" y="2094" font-weight="600" font-size="11">residual:  x = x + h2   — the epilogue of 19's requantisation job</text>
 <rect x="50" y="2101.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="2111" font-size="9">arena</text>
-<text x="91.0" y="2110" font-size="10">R  x, h2 [82 × 384]</text>
+<text x="91.0" y="2110" font-size="10">R  x [82 × 384] (the residual)</text>
 <rect x="50" y="2114.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="2124" font-size="9">arena</text>
 <text x="91.0" y="2123" font-size="10">W  x [82 × 384]  → next block (7)</text>
@@ -528,7 +528,7 @@
 <circle cx="826" cy="2434" r="11" fill="#e8590c"/>
 <text x="826" y="2438" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">25b</text>
 <text x="842" y="2438" font-weight="600" font-size="11">downsample: 3×3 conv stride 2 =</text>
-<text x="842" y="2452" font-weight="600" font-size="11">im2col + GEMM in 2 K-chunks (1920 +</text>
+<text x="842" y="2452" font-weight="600" font-size="11">gathered GEMM in 2 K-chunks (1920 +</text>
 <text x="842" y="2466" font-weight="600" font-size="11">1536, partial sums added on the CPU)</text>
 <text x="842" y="2480" font-weight="600" font-size="11">+ requant</text>
 <rect x="836" y="2487.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
@@ -544,7 +544,7 @@
 <rect x="826" y="2547" width="250" height="87" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
 <circle cx="826" cy="2559" r="11" fill="#e8590c"/>
 <text x="826" y="2563" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">25c</text>
-<text x="842" y="2563" font-weight="600" font-size="11">3×3 conv: im2col + GEMM (2 chunks) +</text>
+<text x="842" y="2563" font-weight="600" font-size="11">3×3 conv: gathered GEMM (2 chunks) +</text>
 <text x="842" y="2577" font-weight="600" font-size="11">requant</text>
 <rect x="836" y="2584.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="840" y="2594" font-size="9">arena</text>
@@ -557,10 +557,10 @@
 <text x="877.0" y="2619" font-size="10">W  rn4 [5×5 × 64]</text>
 <line x1="40" y1="2646" x2="1076" y2="2646" stroke="#495057" stroke-width="4" stroke-dasharray="6 3"/>
 <text x="40" y="2660" font-size="10">Result of 22–25: four 64-channel feature maps at 36×36, 18×18, 9×9 and 5×5 — the same content at four resolutions.</text>
-<text x="40" y="2673" font-size="10">Every 3×3 convolution above is: the CPU gathers each pixel’s 3×3 neighbourhood into one row (im2col), the accelerator multiplies, the accelerator requantises.</text>
+<text x="40" y="2673" font-size="10">Every 3×3 convolution above is: the accelerator gathers each pixel’s 3×3 neighbourhood itself (gather mode), multiplies, and requantises.</text>
 <text x="20" y="2695" font-size="13" font-weight="700">Fusion — coarse to fine; each step needs the previous one (strictly sequential)</text>
 <line x1="20" y1="2701" x2="1100" y2="2701" stroke="#adb5bd" stroke-width="1"/>
-<text x="40" y="2717" font-size="10">RCU(t) = t + conv3×3(relu(conv3×3(relu(t))))  — two 3×3 convolutions (im2col + GEMM + requant, weights rf·.u·c1/c2 [64 × 576]) with ReLUs on the CPU, plus the input.</text>
+<text x="40" y="2717" font-size="10">RCU(t) = t + conv3×3(relu(conv3×3(relu(t))))  — two 3×3 convolutions (gathered GEMM + requant, weights rf·.u·c1/c2 [64 × 576]); the first ReLU on the CPU, the second ReLU and the add in the requant jobs.</text>
 <rect x="40" y="2729" width="760" height="85" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
 <circle cx="40" cy="2741" r="11" fill="#e8590c"/>
 <text x="40" y="2745" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">26</text>
@@ -626,7 +626,7 @@
 <rect x="40" y="3143" width="760" height="73" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
 <circle cx="40" cy="3155" r="11" fill="#e8590c"/>
 <text x="40" y="3159" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">30</text>
-<text x="56" y="3159" font-weight="600" font-size="11">3×3 conv, 64 → 32:  im2col (CPU) + GEMM + requant</text>
+<text x="56" y="3159" font-weight="600" font-size="11">3×3 conv, 64 → 32:  gathered GEMM + requant</text>
 <rect x="50" y="3166.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="3176" font-size="9">arena</text>
 <text x="91.0" y="3175" font-size="10">R  path1 as cols [5184 × 576]</text>
@@ -651,7 +651,7 @@
 <rect x="40" y="3300" width="760" height="73" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
 <circle cx="40" cy="3312" r="11" fill="#e8590c"/>
 <text x="40" y="3316" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">32</text>
-<text x="56" y="3316" font-weight="600" font-size="11">3×3 conv, 32 → 32:  im2col (CPU, 15 876 rows) + GEMM + requant, then ReLU (CPU)</text>
+<text x="56" y="3316" font-weight="600" font-size="11">3×3 conv, 32 → 32:  gathered GEMM (15 876 rows) + requant with ReLU</text>
 <rect x="50" y="3323.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="3333" font-size="9">arena</text>
 <text x="91.0" y="3332" font-size="10">R  u as cols [15876 × 288]</text>
@@ -665,7 +665,7 @@
 <rect x="40" y="3385" width="760" height="73" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
 <circle cx="40" cy="3397" r="11" fill="#e8590c"/>
 <text x="40" y="3401" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">33</text>
-<text x="56" y="3401" font-weight="600" font-size="11">1×1 conv, 32 → 1:  GEMM + requant, then ReLU (CPU)</text>
+<text x="56" y="3401" font-weight="600" font-size="11">1×1 conv, 32 → 1:  GEMM + requant with ReLU</text>
 <rect x="50" y="3408.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="3418" font-size="9">arena</text>
 <text x="91.0" y="3417" font-size="10">R  o2 [15876 × 32]</text>
@@ -697,5 +697,5 @@
 <rect x="50" y="3578.5" width="20" height="12" rx="3" fill="#e9ecef" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="3588" font-size="9">pc</text>
 <text x="73.6" y="3587" font-size="10">W  fpga_depth_&lt;name&gt;.npy, PNG</text>
-<text x="40" y="3618" font-size="10" fill="#495057">Totals per frame: 2 275 accelerator jobs (GEMM and requantisation), 25 MB of weights read from DDR3 twice (once per tile), 15 MB peak of arena in use, 14.2 s at 50 MHz.</text>
+<text x="40" y="3618" font-size="10" fill="#495057">Totals per frame: 1 268 accelerator jobs (GEMM and requantisation), 25 MB of weights read from DDR3 once, ~6 MB peak of arena in use; 14.2 s at 50 MHz last measured.</text>
 </svg>

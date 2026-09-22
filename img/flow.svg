@@ -32,7 +32,7 @@
 <text x="907" y="411" text-anchor="middle" font-size="10">0x8200_0000</text>
 <rect x="845" y="470" width="125" height="40" rx="5" fill="#ffd8a8" stroke="#2b8a3e" stroke-width="1"/>
 <text x="907" y="486" text-anchor="middle" font-size="10">accelerator tile RAM</text>
-<text x="907" y="501" text-anchor="middle" font-size="10">(256 kB)</text>
+<text x="907" y="501" text-anchor="middle" font-size="10">(512 kB)</text>
 <text x="907" y="540" text-anchor="middle" font-size="10" font-style="italic">tags on each step:</text>
 <text x="907" y="554" text-anchor="middle" font-size="10" font-style="italic">R = reads, W = writes</text>
 <text x="907" y="580" text-anchor="middle" font-size="10">weights: 25 MB int8</text>
@@ -40,7 +40,7 @@
 <text x="907" y="608" text-anchor="middle" font-size="10">result: 63 kB float32</text>
 <text x="907" y="622" text-anchor="middle" font-size="10">arena: activations,</text>
 <text x="907" y="636" text-anchor="middle" font-size="10">accumulators, tables</text>
-<text x="907" y="650" text-anchor="middle" font-size="10">(peak 15 MB of 64)</text>
+<text x="907" y="650" text-anchor="middle" font-size="10">(peak ~6 MB of 64)</text>
 <rect x="30" y="70" width="130" height="83" rx="6" fill="#fff" stroke="#868e96" stroke-width="1.6"/>
 <circle cx="30" cy="70" r="11" fill="#868e96"/>
 <text x="30" y="74" text-anchor="middle" fill="#fff" font-weight="700" font-size="11">1</text>
@@ -55,7 +55,7 @@
 <text x="195" y="74" text-anchor="middle" fill="#fff" font-weight="700" font-size="11">2</text>
 <text x="209" y="86" font-weight="600" font-size="11.5">boot, self-test</text>
 <text x="205" y="100" font-size="10.5">DDR3 init; accelerator</text>
-<text x="205" y="113" font-size="10.5">self-test 130×64×6 vs CPU;</text>
+<text x="205" y="113" font-size="10.5">self-tests: GEMM, gather, add/ReLU;</text>
 <text x="205" y="126" font-size="10.5">wait for the go flag</text>
 <rect x="205" y="132" width="46" height="13" rx="3" fill="#ffc9c9" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="209" y="142" font-size="9.5">R flag</text>
@@ -64,7 +64,7 @@
 <text x="383" y="92" text-anchor="middle" font-size="10" fill="#222">GO_MAGIC</text>
 <text x="410" y="104" font-size="10">→ prints DAV2_READY</text>
 <rect x="25" y="162" width="800" height="1011" rx="10" fill="none" stroke="#222" stroke-width="1" stroke-dasharray="8 4"/>
-<text x="35" y="178" font-size="11" font-weight="600">per frame (14.2 s on the board)</text>
+<text x="35" y="178" font-size="11" font-weight="600">per frame (14.2 s last measured)</text>
 <rect x="30" y="195" width="130" height="83" rx="6" fill="#fff" stroke="#868e96" stroke-width="1.6"/>
 <circle cx="30" cy="195" r="11" fill="#868e96"/>
 <text x="30" y="199" text-anchor="middle" fill="#fff" font-weight="700" font-size="11">3</text>
@@ -189,12 +189,12 @@
 <text x="270.4" y="743" font-size="9.5">R blob</text>
 <rect x="316.59999999999997" y="733" width="52" height="13" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="320.59999999999997" y="743" font-size="9.5">W arena</text>
-<rect x="405" y="684" width="190" height="70" rx="6" fill="#fff" stroke="#1c7ed6" stroke-width="1.6"/>
-<circle cx="405" cy="684" r="11" fill="#1c7ed6"/>
+<rect x="405" y="684" width="190" height="70" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
+<circle cx="405" cy="684" r="11" fill="#e8590c"/>
 <text x="405" y="688" text-anchor="middle" fill="#fff" font-weight="700" font-size="11">5e</text>
-<text x="419" y="700" font-weight="600" font-size="11.5">x = x + attn  (CPU)</text>
-<text x="415" y="714" font-size="10.5">range scan, two multipliers,</text>
-<text x="415" y="727" font-size="10.5">two int16 per word</text>
+<text x="419" y="700" font-weight="600" font-size="11.5">x = x + attn  (fused)</text>
+<text x="415" y="714" font-size="10.5">epilogue of attn's requant (B):</text>
+<text x="415" y="727" font-size="10.5">x rescaled + added, in place</text>
 <rect x="415" y="733" width="52" height="13" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="419" y="743" font-size="9.5">R arena</text>
 <rect x="471.4" y="733" width="52" height="13" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
@@ -242,10 +242,10 @@
 <text x="270.4" y="895" font-size="9.5">R blob</text>
 <rect x="316.59999999999997" y="885" width="52" height="13" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="320.59999999999997" y="895" font-size="9.5">W arena</text>
-<rect x="405" y="836" width="190" height="57" rx="6" fill="#fff" stroke="#1c7ed6" stroke-width="1.6"/>
-<circle cx="405" cy="836" r="11" fill="#1c7ed6"/>
+<rect x="405" y="836" width="190" height="57" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
+<circle cx="405" cy="836" r="11" fill="#e8590c"/>
 <text x="405" y="840" text-anchor="middle" fill="#fff" font-weight="700" font-size="11">5j</text>
-<text x="419" y="852" font-weight="600" font-size="11.5">x = x + h2  (CPU)</text>
+<text x="419" y="852" font-weight="600" font-size="11.5">x = x + h2  (fused)</text>
 <text x="415" y="866" font-size="10.5">as 5e</text>
 <rect x="415" y="872" width="52" height="13" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="419" y="882" font-size="9.5">R arena</text>
@@ -261,16 +261,16 @@
 <text x="624" y="895" font-size="9.5">R arena</text>
 <rect x="676.4" y="885" width="52" height="13" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="680.4" y="895" font-size="9.5">W arena</text>
-<text x="200" y="922" font-size="10" fill="#1c7ed6">order: 5a → 5b → 5c → 5d → 5e → 5f → 5g → 5h → 5i → 5j (→ 5k). The CPU polls STATUS during every accelerator job.</text>
+<text x="200" y="922" font-size="10" fill="#1c7ed6">order: 5a → 5b → 5c → 5d → 5e → 5f → 5g → 5h → 5i → 5j (→ 5k). The CPU works on during the last job of each operation (see A).</text>
 <rect x="195" y="954" width="610" height="100" rx="6" fill="#fff" stroke="#1c7ed6" stroke-width="1.6"/>
 <circle cx="195" cy="954" r="11" fill="#1c7ed6"/>
 <text x="195" y="958" text-anchor="middle" fill="#fff" font-weight="700" font-size="11">6</text>
 <text x="209" y="970" font-weight="600" font-size="11.5">DPT head  (5 s) — the decoder, four feature levels → one depth map</text>
-<text x="205" y="984" font-size="10.5">6a  per level: 1×1 conv (GEMM) → resize: conv-transpose ×4 / ×2 (GEMM + scatter), identity, or 3×3 stride-2 conv (K = 3456: two</text>
-<text x="205" y="997" font-size="10.5">      column-slice GEMMs, partial sums added on the CPU) → 3×3 conv (patches gathered by the accelerator, then GEMM)</text>
+<text x="205" y="984" font-size="10.5">6a  per level: 1×1 conv (GEMM) → resize: conv-transpose ×4 / ×2 (GEMM + scatter), identity, or 3×3 stride-2 conv (K = 3456:</text>
+<text x="205" y="997" font-size="10.5">      gathered in 5 + 4 kernel positions, partial sums added on the CPU) → 3×3 conv (patches gathered by the accelerator, then GEMM)</text>
 <text x="205" y="1010" font-size="10.5">6b  fusion, coarse to fine: ResidualConvUnit = ReLU → 3×3 conv → ReLU → 3×3 conv → add; bilinear ×2 (CPU); 1×1 conv</text>
 <text x="205" y="1023" font-size="10.5">6c  output: 3×3 conv → bilinear to 126×126 (CPU) → 3×3 conv → ReLU → 1×1 conv → ReLU → float depth</text>
-<text x="205" y="1046" font-size="10">every 3×3 conv is a GEMM whose patches the accelerator gathers from the image (gather mode) + requant (→ A, B); 2 275 accelerator jobs per frame in total</text>
+<text x="205" y="1046" font-size="10">every 3×3 conv: GEMM on patches the accelerator gathers (gather mode) + requant (→ A, B), which also does ReLU/add; 1 268 jobs per frame</text>
 <rect x="195" y="1071" width="210" height="83" rx="6" fill="#fff" stroke="#1c7ed6" stroke-width="1.6"/>
 <circle cx="195" cy="1071" r="11" fill="#1c7ed6"/>
 <text x="195" y="1075" text-anchor="middle" fill="#fff" font-weight="700" font-size="11">7</text>
@@ -304,12 +304,12 @@
 <text x="214" y="1230" font-weight="600" font-size="11.5">CPU programs the job</text>
 <text x="210" y="1244" font-size="10.5">A, W, C addresses + strides;</text>
 <text x="210" y="1257" font-size="10.5">K, M, rows; S_ADDR for stats;</text>
-<text x="210" y="1270" font-size="10.5">CTRL.start — then polls STATUS</text>
+<text x="210" y="1270" font-size="10.5">CTRL.start; CPU carries on</text>
 <rect x="405" y="1214" width="190" height="83" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
 <circle cx="405" cy="1214" r="11" fill="#e8590c"/>
 <text x="405" y="1218" text-anchor="middle" fill="#fff" font-weight="700" font-size="11">A2</text>
 <text x="419" y="1230" font-weight="600" font-size="11.5">load A tile</text>
-<text x="415" y="1244" font-size="10.5">64 rows × K int16 → tile RAM;</text>
+<text x="415" y="1244" font-size="10.5">128 rows × K int16 → tile RAM;</text>
 <text x="415" y="1257" font-size="10.5">8 reads in flight, reorder buffer;</text>
 <text x="415" y="1270" font-size="10.5">a lost response is re-issued</text>
 <rect x="415" y="1276" width="52" height="13" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
@@ -321,7 +321,7 @@
 <text x="610" y="1218" text-anchor="middle" fill="#fff" font-weight="700" font-size="11">A3</text>
 <text x="624" y="1230" font-weight="600" font-size="11.5">stream W, MAC</text>
 <text x="620" y="1244" font-size="10.5">each word = 4 int8 weights,</text>
-<text x="620" y="1257" font-size="10.5">broadcast to 64 multipliers;</text>
+<text x="620" y="1257" font-size="10.5">broadcast to 128 multipliers;</text>
 <text x="620" y="1270" font-size="10.5">128 MACs per cycle, K cycles per row</text>
 <rect x="620" y="1276" width="46" height="13" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="624" y="1286" font-size="9.5">R blob</text>
@@ -333,7 +333,7 @@
 <circle cx="405" cy="1300" r="11" fill="#e8590c"/>
 <text x="405" y="1304" text-anchor="middle" fill="#fff" font-weight="700" font-size="11">A4</text>
 <text x="419" y="1316" font-weight="600" font-size="11.5">drain row m</text>
-<text x="415" y="1330" font-size="10.5">64 int32 → C column m;</text>
+<text x="415" y="1330" font-size="10.5">128 int32 → C column m;</text>
 <text x="415" y="1343" font-size="10.5">then {max, min} of the row</text>
 <text x="415" y="1356" font-size="10.5">→ S_ADDR + 8m</text>
 <rect x="415" y="1362" width="52" height="13" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
@@ -350,9 +350,9 @@
 <path d="M805 1320 L815 1320 L815 1240 L805 1240" fill="none" stroke="#222" stroke-width="1.4" stroke-dasharray="5 3" marker-end="url(#fa)"/>
 <path d="M392 1370 h6 v48 h-6" fill="none" stroke="#e8590c" stroke-width="1.6"/>
 <text x="402" y="1398.0" font-size="10" fill="#e8590c">concurrent inside the block: read requests in flight ∥ multiply-accumulate ∥ up to 8 writes awaiting ack</text>
-<text x="200" y="1310" font-size="10" fill="#1c7ed6">meanwhile the CPU only</text>
-<text x="200" y="1323" font-size="10" fill="#1c7ed6">polls STATUS (nothing</text>
-<text x="200" y="1336" font-size="10" fill="#1c7ed6">is overlapped with it yet)</text>
+<text x="200" y="1310" font-size="10" fill="#1c7ed6">meanwhile the CPU reads</text>
+<text x="200" y="1323" font-size="10" fill="#1c7ed6">each finished row's range</text>
+<text x="200" y="1336" font-size="10" fill="#1c7ed6">and prepares the next step</text>
 <text x="200" y="1440" font-size="11" font-weight="600" fill="#e8590c">B  requantisation — int32 sums back to int16 activations, after every GEMM</text>
 <rect x="200" y="1452" width="180" height="83" rx="6" fill="#fff" stroke="#1c7ed6" stroke-width="1.6"/>
 <circle cx="200" cy="1452" r="11" fill="#1c7ed6"/>
@@ -369,7 +369,7 @@
 <circle cx="405" cy="1452" r="11" fill="#e8590c"/>
 <text x="405" y="1456" text-anchor="middle" fill="#fff" font-weight="700" font-size="11">B2</text>
 <text x="419" y="1468" font-weight="600" font-size="11.5">load chunk, transposed</text>
-<text x="415" y="1482" font-size="10.5">≤1024 rows × 64 cols of acc[m][n]</text>
+<text x="415" y="1482" font-size="10.5">≤1024 rows × 128 cols of acc[m][n]</text>
 <text x="415" y="1495" font-size="10.5">→ tile RAM row n, word m;</text>
 <text x="415" y="1508" font-size="10.5">parameter table → param RAM</text>
 <rect x="415" y="1514" width="52" height="13" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
@@ -380,9 +380,9 @@
 <circle cx="610" cy="1452" r="11" fill="#e8590c"/>
 <text x="610" y="1456" text-anchor="middle" fill="#fff" font-weight="700" font-size="11">B3</text>
 <text x="624" y="1468" font-weight="600" font-size="11.5">stream out</text>
-<text x="620" y="1482" font-size="10.5">7-stage pipeline: ×mult, round,</text>
+<text x="620" y="1482" font-size="10.5">12-stage pipeline: ×mult, round,</text>
 <text x="620" y="1495" font-size="10.5">>>shift, +bias, saturate ±8191;</text>
-<text x="620" y="1508" font-size="10.5">2 int16 per word → out[n][m]</text>
+<text x="620" y="1508" font-size="10.5">(+ residual, ReLU) → out[n][m]</text>
 <rect x="620" y="1514" width="46" height="13" rx="3" fill="#ffd8a8" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="624" y="1524" font-size="9.5">R tile</text>
 <rect x="670.2" y="1514" width="52" height="13" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
@@ -390,5 +390,5 @@
 <line x1="380" y1="1487" x2="405" y2="1487" stroke="#222" stroke-width="1.4" marker-end="url(#fa)"/>
 <line x1="595" y1="1487" x2="610" y2="1487" stroke="#222" stroke-width="1.4" marker-end="url(#fa)"/>
 <path d="M392 1532 h6 v20 h-6" fill="none" stroke="#e8590c" stroke-width="1.6"/>
-<text x="402" y="1546.0" font-size="10" fill="#e8590c">B3: element pipeline ∥ 16-entry FIFO ∥ write engine</text>
+<text x="402" y="1546.0" font-size="10" fill="#e8590c">B3: element pipeline ∥ 32-entry FIFO ∥ write engine; next chunk's parameters on the CPU</text>
 </svg>
