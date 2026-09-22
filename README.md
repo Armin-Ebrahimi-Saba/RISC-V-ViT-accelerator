@@ -76,10 +76,10 @@ Every matmul in the network — patch embedding, attention projections, MLPs,
 the DPT head — funnels through one function, `dav2_qgemm()`. That single choke
 point is why the accelerator needed exactly one attachment point.
 
-**Hardware** (`src/rtl/student/student_gemm.sv`) — a 64-wide
+**Hardware** (`src/rtl/student/student_gemm.sv`) — a 128-wide
 int8×int16 → int32 MAC array with its own TL-UL host port and eight reads in
 flight. A tile of 64 activation rows loads into on-chip BRAM once, then the
-weight matrix streams past, each weight broadcasting to all 64 multipliers.
+weight matrix streams past, each weight broadcasting to all 128 multipliers.
 Rows of either operand may be read at a stride, so a job can take a column
 slice of a wider matrix — that is how attention's Q·Kᵀ reads a head out of
 the qkv tensor, and how a reduction longer than the tile is split. While it
@@ -128,7 +128,7 @@ exceptions marked *(platform file, fixed)*.
 
 | File | What it is, in plain words |
 |---|---|
-| `student/student_gemm.sv` | **The accelerator.** 64 multipliers that compute a matrix product against 64 rows of activations held on-chip while the weights stream past once; it also reports the per-row range of its results and, as a second job type, requantises them back to int16. The CPU programs it through registers (`student_gemm.hjson`). |
+| `student/student_gemm.sv` | **The accelerator.** 128 multipliers that compute a matrix product against 128 rows of activations held on-chip while the weights stream past once; it also reports the per-row range of its results and, as a second job type, requantises them back to int16. The CPU programs it through registers (`student_gemm.hjson`). |
 | `student/student.sv` | **Wiring.** Connects the accelerator (and a small DMA block) to the system bus, both as something the CPU can program and as something that can read and write memory on its own. |
 | `student/student_tl_watch.sv` | **A debugging register.** Sits beside the memory port and remembers the last request that never got an answer — which address, from which block, for how long. Readable over the debug cable even when the CPU is frozen and cannot be stopped. This is what found the hang. |
 | `student/student_tl_rsp_hold.sv` | **A small buffer** that holds a memory reply until the receiver is ready for it, working around a cache that would otherwise drop it. Currently switched off — the real cause was fixed elsewhere — but kept and tested. |
@@ -164,6 +164,7 @@ also compiles on a PC (see "the oracle" below), which is how it is checked.
 | File | What it does |
 |---|---|
 | `host_main.c` | Compiles the *same* engine for the PC and runs it in about four seconds on a blob plus a `.dav2img` — the identical bytes the board receives. Its output is the reference every board result must match bit for bit, and it does, on every image tried. |
+| `accel_emu.c`, `accel_emu.h` | A **stand-in for the accelerator** on the PC: a C model of its registers. `make dav2_host_emu` builds the engine with the real accelerator driver talking to this model, so everything the board does with the accelerator can be checked on the PC — the output must be identical to `dav2_host`'s. |
 | `host_stubs.c`, `selftest_main.c`, `Makefile` | Glue: a stub for the board-only progress print, the self-test entry point, and the build. |
 
 ### Python tools — `src/sw/project/tools/`
@@ -223,7 +224,7 @@ The same engine sources build natively, which is the fast way to check any
 change and the reference every board result must match bit for bit:
 
     make -C src/sw/project/host
-    ./src/sw/project/host/dav2_host build/dav2/dav2_weights.bin out.bin
+    ./src/sw/project/host/dav2_host build/dav2/dav2_weights.bin build/dav2/demo.dav2img out.bin
 
 `src/sw/project/tools/dav2_image.py` does the preprocessing — resize,
 ImageNet normalisation, quantisation — byte-identically to the exporter, and

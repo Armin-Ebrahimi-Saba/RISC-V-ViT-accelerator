@@ -14,9 +14,24 @@
  */
 
 #include "../dav2.h"
+#include "../dav2_accel.h"
 
 #include <stdio.h>
 #include <time.h>
+
+#ifdef DAV2_ACCEL_EMU
+#include <sys/mman.h>
+/* The accelerator model is handed 32-bit addresses, as the real block is:
+ * everything it may touch must live below 4 GB. */
+static void *host_alloc(size_t n)
+{
+    void *p = mmap(0, n, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
+    return p == MAP_FAILED ? 0 : p;
+}
+#else
+#define host_alloc malloc
+#endif
 #include <stdlib.h>
 #include <string.h>
 
@@ -52,12 +67,12 @@ int main(int argc, char **argv)
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
     fseek(f, 0, SEEK_SET);
-    void *blob = malloc((size_t)n);
+    void *blob = host_alloc((size_t)n);
     if (fread(blob, 1, (size_t)n, f) != (size_t)n) { perror("read"); return 1; }
     fclose(f);
     printf("loaded %ld bytes of weights\n", n);
 
-    void *arena = malloc(arena_mb << 20);
+    void *arena = host_alloc(arena_mb << 20);
     if (!arena) { fprintf(stderr, "arena alloc failed\n"); return 1; }
 
     dav2_blob_init(blob);
@@ -72,7 +87,7 @@ int main(int argc, char **argv)
         fseek(fi, 0, SEEK_END);
         long ni = ftell(fi);
         fseek(fi, 0, SEEK_SET);
-        uint8_t *img = malloc((size_t)ni);
+        uint8_t *img = host_alloc((size_t)ni);
         if (fread(img, 1, (size_t)ni, fi) != (size_t)ni) { perror("read image"); return 1; }
         fclose(fi);
         float scale;
@@ -88,11 +103,19 @@ int main(int argc, char **argv)
     const int out_size = cfg.grid * DAV2_PATCH;
     float *depth = (float *)malloc((size_t)out_size * out_size * sizeof(float));
 
+#ifdef DAV2_ACCEL_EMU
+    /* the board's boot sequence: probe, then the GEMM and gather self-tests */
+    dav2_accel_report();
+    dav2_accel_check();
+#endif
     printf("running inference at %dx%d (%d patches)\n",
            cfg.size, cfg.size, cfg.grid * cfg.grid);
     dav2_infer(&cfg, depth);
 
     printf("arena peak: %.2f MB\n", (double)dav2_arena_peak() / 1e6);
+#ifdef DAV2_ACCEL_EMU
+    dav2_accel_report();
+#endif
 #ifdef DAV2_TRACE
     {
         extern double dav2_mac_count, dav2_elem_count;

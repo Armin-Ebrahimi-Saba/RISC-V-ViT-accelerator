@@ -1,0 +1,205 @@
+/* SPDX-License-Identifier: CC0-1.0
+ * SPDX-FileCopyrightText: 2026 RVLab Student Project
+ *
+ * Register-level C model of student_gemm -- see accel_emu.h.
+ *
+ * Timing is not modelled, but *progress* is: a GEMM job completes a few
+ * weight rows each time STATUS is read, writing each row's accumulators and
+ * then its {max, min} statistics exactly as the hardware's drain does. The
+ * driver's streaming consumers therefore really do see a job half done.
+ * A job is latched from the registers at the CTRL write, as in the RTL
+ * (detected on the next register access of any kind, before that access
+ * takes effect).
+ */
+#include "accel_emu.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#define STUDENT_GEMM0_BASE_ADDR 0x20010000u
+#include <reggen/student_gemm.h>
+
+enum { NROWS = 128, KMAX = 2048, ROWS_PER_POLL = 5, NREGS = 64 };
+
+static uint32_t regs[NREGS];
+#define R(name) regs[(STUDENT_GEMM_##name##_OFFSET) >> 2]
+
+/* the latched job */
+static struct {
+    int      busy, requant, gather;
+    uint32_t a_addr, a_stride, w_addr, w_stride, c_addr, c_stride, s_addr, p_addr;
+    uint32_t k, m, n;
+    uint32_t g_addr, g_geom, g_chan, g_conv, g_start;
+    uint32_t m_done;                 /* GEMM: weight rows finished */
+    uint32_t writes;                 /* for DBG2 */
+} job;
+
+static void *ptr(uint32_t a) { return (void *)(uintptr_t)a; }
+
+static void fail(const char *what)
+{
+    fprintf(stderr, "accel_emu: %s\n", what);
+    exit(3);
+}
+
+/* A-tile element (row t, column k) of the current GEMM job. */
+static int32_t a_elem(uint32_t t, uint32_t kk)
+{
+    if (!job.gather) {
+        uint32_t stride = job.a_stride ? job.a_stride : job.k * 2u;
+        return ((const int16_t *)ptr(job.a_addr + t * stride))[kk];
+    }
+    /* gather: row t is output pixel g_start + t, column kk = pos*C + c */
+    uint32_t h = job.g_geom >> 16, w = job.g_geom & 0xffffu;
+    uint32_t ow = job.g_chan >> 16, C = job.g_chan & 0xffffu;
+    uint32_t ks = job.g_conv & 15u, st = (job.g_conv >> 4) & 15u, pad = (job.g_conv >> 8) & 15u;
+    uint32_t ky0 = (job.g_conv >> 12) & 15u, kx0 = (job.g_conv >> 16) & 15u;
+    uint32_t pix = (job.g_start >> 16) * ow + (job.g_start & 0xffffu) + t;
+    uint32_t oy = pix / ow, ox = pix % ow;
+    uint32_t pos = kk / C, c = kk % C;
+    uint32_t lin = ky0 * ks + kx0 + pos;          /* kernel positions row-major */
+    int32_t ky = (int32_t)(lin / ks), kx = (int32_t)(lin % ks);
+    int32_t iy = (int32_t)(oy * st) + ky - (int32_t)pad;
+    int32_t ix = (int32_t)(ox * st) + kx - (int32_t)pad;
+    if (iy < 0 || iy >= (int32_t)h || ix < 0 || ix >= (int32_t)w)
+        return 0;
+    return ((const int16_t *)ptr(job.g_addr))[((uint32_t)iy * w + (uint32_t)ix) * C + c];
+}
+
+static void gemm_row(uint32_t m)
+{
+    uint32_t wstride = job.w_stride ? job.w_stride : job.k;
+    const int8_t *wr = (const int8_t *)ptr(job.w_addr + m * wstride);
+    int32_t *cr = (int32_t *)ptr(job.c_addr + m * job.c_stride);
+    int32_t mx = 0, mn = 0;
+    for (uint32_t t = 0; t < job.n; t++) {
+        int32_t s = 0;
+        for (uint32_t kk = 0; kk < job.k; kk++)
+            s += a_elem(t, kk) * (int32_t)wr[kk];
+        cr[t] = s;
+        if (t == 0 || s > mx) mx = s;
+        if (t == 0 || s < mn) mn = s;
+    }
+    job.writes += job.n;
+    if (job.s_addr) {
+        int32_t *sv = (int32_t *)ptr(job.s_addr + m * 8u);
+        sv[0] = mx;
+        sv[1] = mn;
+        job.writes += 2;
+    }
+}
+
+static void requant_all(void)
+{
+    const int32_t *par = (const int32_t *)ptr(job.p_addr);
+    int32_t amax = 0;
+    for (uint32_t n = 0; n < job.n; n++) {
+        int16_t *orow = (int16_t *)ptr(job.c_addr + n * job.c_stride);
+        for (uint32_t m = 0; m < job.m; m++) {
+            int64_t acc = ((const int32_t *)ptr(job.a_addr + m * job.a_stride))[n];
+            int64_t mult = par[3 * m];
+            int     sh   = par[3 * m + 1];
+            int64_t r = acc * mult;
+            if (sh > 0) r += (int64_t)1 << (sh - 1);
+            r = (r >> sh) + par[3 * m + 2];
+            if (r >  8191) r =  8191;
+            if (r < -8191) r = -8191;
+            orow[m] = (int16_t)r;
+            int32_t a = r < 0 ? (int32_t)-r : (int32_t)r;
+            if (a > amax) amax = a;
+        }
+    }
+    R(RQ_AMAX) = (uint32_t)amax;
+}
+
+static void latch(void)
+{
+    uint32_t ctrl = R(CTRL);
+    R(CTRL) = 0;
+    if (!(ctrl & 1u))
+        return;
+    if (job.busy)
+        fail("CTRL.start written while a job is running");
+    memset(&job, 0, sizeof job);
+    job.busy     = 1;
+    job.requant  = (ctrl >> 1) & 1u;
+    job.gather   = ((ctrl >> 2) & 1u) && !job.requant;
+    job.a_addr   = R(A_ADDR);   job.a_stride = R(A_STRIDE);
+    job.w_addr   = R(W_ADDR);   job.w_stride = R(W_STRIDE);
+    job.c_addr   = R(C_ADDR);   job.c_stride = R(C_STRIDE);
+    job.s_addr   = R(S_ADDR);   job.p_addr   = R(P_ADDR);
+    job.k        = R(K_LEN);    job.m        = R(M_LEN);   job.n = R(N_ROWS);
+    job.g_addr   = R(G_ADDR);   job.g_geom   = R(G_GEOM);  job.g_chan = R(G_CHAN);
+    job.g_conv   = R(G_CONV);   job.g_start  = R(G_START);
+
+    /* the contract, as student_gemm.hjson states it */
+    if (job.n < 1 || job.n > NROWS) fail("N_ROWS out of range");
+    if (job.requant) {
+        if (job.m < 2 || (job.m & 1u) || job.m > KMAX / 2) fail("requant M_LEN out of range");
+        if (job.a_stride & 3u) fail("requant A_STRIDE not word aligned");
+    } else {
+        if (job.k < 4 || (job.k & 3u) || job.k > KMAX) fail("K_LEN out of range");
+        if (job.gather && job.k != ((job.g_conv >> 20) & 255u) * (job.g_chan & 0xffffu))
+            fail("gather: K_LEN != kernel positions * C");
+        if (job.gather && (job.g_chan & 1u)) fail("gather: C odd");
+    }
+    if ((job.a_addr | job.w_addr | job.c_addr | job.s_addr | job.p_addr | job.g_addr) & 3u)
+        fail("unaligned address");
+}
+
+/* Advance the running job; called on every STATUS read. */
+static void step(void)
+{
+    if (!job.busy)
+        return;
+    if (job.requant) {
+        requant_all();
+        job.writes = job.n * job.m / 2u;
+        job.busy = 0;
+    } else {
+        for (int i = 0; i < ROWS_PER_POLL && job.m_done < job.m; i++)
+            gemm_row(job.m_done++);
+        if (job.m_done == job.m)
+            job.busy = 0;
+    }
+    if (!job.busy) {
+        /* DAV2_EMU_FAIL_JOB=n: report a bus error on the n-th job, to
+         * exercise the driver's and the engine's recovery paths */
+        static long jobs_done, fail_at = -1;
+        if (fail_at < 0) {
+            const char *e = getenv("DAV2_EMU_FAIL_JOB");
+            fail_at = e ? atol(e) : 0;
+        }
+        jobs_done++;
+        R(STATUS) = (fail_at && jobs_done == fail_at) ? 6u : 2u;   /* done (+ error) */
+        R(DBG2)   = ((job.writes & 0xffffu) << 16) | (job.writes & 0xffffu);
+        R(CYCLES) = job.m * (job.k / 4u + 1u) * 3u;       /* plausible, unmodelled */
+    }
+}
+
+volatile uint32_t *dav2_emu_reg(uint32_t addr)
+{
+    static int init;
+    if (!init) {
+        init = 1;
+        R(CAPS) = ((uint32_t)KMAX << 8) | NROWS;
+    }
+    if (addr < STUDENT_GEMM0_BASE_ADDR || addr >= STUDENT_GEMM0_BASE_ADDR + NREGS * 4u)
+        fail("register access outside the block");
+    latch();                               /* a CTRL write since the last access */
+    uint32_t off = addr - STUDENT_GEMM0_BASE_ADDR;
+    if (off == STUDENT_GEMM_STATUS_OFFSET) {
+        step();
+        R(STATUS) = job.busy ? 1u : (R(STATUS) & ~1u);   /* keeps done/error */
+    }
+    return &regs[off >> 2];
+}
+
+uint32_t dav2_emu_mcycle(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)((uint64_t)ts.tv_sec * 50000000ull + (uint64_t)ts.tv_nsec / 20u);
+}

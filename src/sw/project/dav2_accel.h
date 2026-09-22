@@ -41,6 +41,10 @@ typedef struct {
     int            tiles;
 } dav2_accel_stats_t;
 
+/* A statistics slot not yet written by a running job (see *_async below). */
+#define DAV2_STATS_EMPTY_MAX ((int32_t)0x80000000)
+#define DAV2_STATS_EMPTY_MIN ((int32_t)0x7fffffff)
+
 int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc,
                      dav2_accel_stats_t *st);
 
@@ -80,5 +84,31 @@ void dav2_qgemm_cpu(const int16_t *av, const int8_t *w, int32_t *acc,
  * start-up so a broken accelerator is caught before the model runs, rather
  * than showing up as a subtly wrong depth map. */
 int dav2_accel_check(void);
+
+/* ---- asynchronous use ---------------------------------------------------
+ *
+ * The *_async variants behave like their synchronous twins, except that the
+ * LAST job of the operation may be left running: they then return 2
+ * instead of 1. Until dav2_accel_finish() has returned 1, the outputs of
+ * that last job are not all there -- but a GEMM job writes each weight
+ * row's accumulators and then its {max, min} statistics in row order, so a
+ * caller may consume rows whose statistics have appeared (see dav2_qgemm).
+ * dav2_accel_finish() returns 0 if the job failed; the caller then redoes
+ * the work on the CPU. Starting any other accelerator operation settles a
+ * pending job first, so at most one is ever outstanding. */
+int dav2_accel_qgemm_async(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc,
+                           dav2_accel_stats_t *st);
+int dav2_accel_conv_async(const int16_t *img, int h, int w, int C, int k, int stride,
+                          int pad, const int8_t *wt, int M, int32_t *acc,
+                          dav2_accel_stats_t *st);
+int dav2_accel_gemm_raw_async(const int16_t *a, uint32_t a_stride,
+                              const int8_t *w, uint32_t w_stride,
+                              int32_t *acc, int N, int K, int M);
+/* Rows m0..m0+mc of a requantisation (mc even, <= CAPS.KMAX/2); *amax is
+ * raised to the largest |out| once the job has been collected. */
+int dav2_accel_requant_rows_async(const int32_t *acc, int N, int M, int m0, int mc,
+                                  const int32_t *params, int16_t *out, int32_t *amax);
+int dav2_accel_finish(void);
+int dav2_accel_busy(void);      /* a job is pending and still running */
 
 #endif /* DAV2_ACCEL_H */

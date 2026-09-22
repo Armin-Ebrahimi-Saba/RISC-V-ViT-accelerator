@@ -102,13 +102,15 @@ work.
   (`dav2_image.from_file` accepts anything PIL opens; feed it a frame). A
   camera on the board itself is an RTL project — see the options recorded in
   `DEBUGGING.md` § 11.
-- **Rounds two and three of the speed-up are not measured on the board.**
+- **Rounds two to four of the speed-up are not measured on the board.**
   Round two: LayerNorm, the adds, attention's arithmetic, `make_multiplier`,
   and the accelerator's gather mode and `RQ_AMAX` register. Round three: a
-  128-row tile and the repaired prefetcher. All of it is bit-exact on the
-  host, passes `student_gemm_tb`, `student_gemm_ddrpath_tb` and
-  `rvlab_ddr_alias_tb`, and the bitstream is built. First thing with the
-  board:
+  128-row tile and the repaired prefetcher. Round four: the CPU working
+  while the accelerator runs (`PERFORMANCE.md` §5). All of it is
+  bit-exact on the host, and bit-exact through the accelerator emulator
+  (`dav2_host_emu`, including injected failures). The RTL passes
+  `student_gemm_tb`, `student_gemm_ddrpath_tb` and `rvlab_ddr_alias_tb`,
+  and the bitstream is built. First thing with the board:
   1. `flow rvlab_fpga_top.program`
   2. run the demo image
   3. check the boot lines `self-test ok (130x64x6)` and
@@ -117,7 +119,7 @@ work.
   5. put the measured frame time into `PERFORMANCE.md` §5.
   If anything is wrong, the two new risks are the prefetcher
   (`USE_PREFETCH`) and gather mode (the self-test disables it by itself).
-- **Requant job constraints.** M must be even and a chunk is at most 64
+- **Requant job constraints.** M must be even and a chunk is at most 128
   columns × 1024 rows (the driver chunks). All shapes in this model comply;
   `dav2_qgemm` falls back to the CPU path for odd M.
 

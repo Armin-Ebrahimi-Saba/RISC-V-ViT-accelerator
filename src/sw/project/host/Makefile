@@ -20,10 +20,22 @@ dav2_host: $(SRCS) ../dav2.h ../dav2_blob_config.h
 run: dav2_host
 	./dav2_host $(BUILD)/dav2_weights.bin $(BUILD)/host_depth.bin
 
-clean:
-	rm -f dav2_host dav2_selftest
+# The same engine with the accelerator driver compiled in, programming a
+# register-level C model of student_gemm (accel_emu.c) instead of hardware.
+# Its output must be bit-identical to dav2_host's: that checks the driver and
+# every accelerated code path without a board. Non-PIE, and the big buffers
+# come from MAP_32BIT, because the block's registers hold 32-bit addresses.
+REGGEN ?= ../../../../build/reggen/generate/include
+dav2_host_emu: $(SRCS) accel_emu.c accel_emu.h ../dav2.h ../dav2_accel.h
+	$(CC) $(CFLAGS) -DDAV2_ACCEL_EMU -no-pie -fno-pie -I.. -I$(REGGEN) \
+	    -o $@ $(SRCS) accel_emu.c -lm
 
-.PHONY: all run clean
+emu: dav2_host_emu
+
+clean:
+	rm -f dav2_host dav2_host_emu dav2_selftest
+
+.PHONY: all run clean emu
 
 selftest:
 	$(CC) $(CFLAGS) -I.. -o dav2_selftest \

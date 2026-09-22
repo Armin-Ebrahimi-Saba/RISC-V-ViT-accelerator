@@ -249,3 +249,18 @@ counter wrap, then the two statistics words per row). Keep expected-value
 checks next to the change that alters what is expected — and remember that
 each console line costs the frame ~15 ms.
 
+**Estimate overlap from the dependency chain, not from the idle time.** "The
+accelerator is busy 130 Mcycles a frame, so overlapping it with the CPU saves
+most of that" was wrong. In a model that is one long chain of operators, only
+work that does not need the running job's result can overlap: the rows it has
+already finished, and the next chunk's parameters. Draw what depends on what
+before promising a number.
+
+**When the hardware is away, model it at the register level.** A C model of
+the accelerator, written from the register description rather than the RTL
+and driven by the real driver, turned "verified in simulation, driver never
+run" into "the whole accelerated path runs on the PC and is bit-exact". It
+also made failure paths testable: inject a bus error on job *n* and check
+that the output is still right. Half a day of work, and it retroactively
+checked two rounds of driver code.
+

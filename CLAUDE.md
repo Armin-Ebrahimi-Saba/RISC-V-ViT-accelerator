@@ -17,7 +17,11 @@ dependencies (needed whenever RTL changed but the flow thinks it is current).
 
     # 1. reference — whole model natively, ~4 s, the golden output
     make -C src/sw/project/host
-    ./src/sw/project/host/dav2_host build/dav2/dav2_weights.bin out.bin
+    ./src/sw/project/host/dav2_host build/dav2/dav2_weights.bin build/dav2/demo.dav2img out.bin
+    # the same, with the accelerator driver programming a C model of the
+    # block; output must be identical to dav2_host's (no board needed)
+    make -C src/sw/project/host dav2_host_emu
+    ./src/sw/project/host/dav2_host_emu build/dav2/dav2_weights.bin build/dav2/demo.dav2img out_emu.bin
 
     # 2. simulation — module testbenches (seconds to minutes)
     flow <tb_name>.sim_rtl_xsim            # e.g. rvlab_ddr_dready_tb

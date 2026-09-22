@@ -44,26 +44,6 @@ static const int INTERMEDIATE[4] = {2, 5, 8, 11};
 /* Scores for one head, then softmax, then the context vector. Q/K are
  * requantised to 11 bits so that the K=64 dot product cannot overflow int32:
  * 64 * 2047^2 = 2.7e8. */
-/* acc[m*N + n] = sum_k a[n*a_stride + k] * w[m*w_stride + k], strides in
- * elements. The accelerator when there is one, otherwise the same sum on the
- * CPU -- integer either way, so host and board agree to the bit. */
-static void gemm_i32(const int16_t *a, int a_stride, const int8_t *w, int w_stride,
-                     int32_t *acc, int N, int K, int M)
-{
-    if (dav2_accel_gemm_raw(a, (uint32_t)a_stride * 2u, w, (uint32_t)w_stride,
-                            acc, N, K, M))
-        return;
-    for (int m = 0; m < M; m++) {
-        const int8_t *wr = w + (size_t)m * w_stride;
-        for (int n = 0; n < N; n++) {
-            const int16_t *ar = a + (size_t)n * a_stride;
-            int32_t s = 0;
-            for (int k = 0; k < K; k++)
-                s += (int32_t)ar[k] * (int32_t)wr[k];
-            acc[(size_t)m * N + n] = s;
-        }
-    }
-}
 
 /* floor(a * b / 2^s) for a, b < 2^32 and 1 <= s <= 63, as two 32x32->64
  * halves and 32-bit shifts: mulhu + mul instead of a 64-bit library shift.
@@ -102,29 +82,82 @@ static inline uint32_t mul_shr_floor(uint32_t a, uint32_t b, int s)
  *
  * Operands are built in the DDR3 arena, packed four int8 per word, since a
  * byte store costs the CPU the same bus transaction as a word store. */
-static void attention_head(const dav2_tensor_t *qkv, int head, int n_tokens,
-                           dav2_tensor_t *ctx)
+typedef struct {
+    int16_t *k16;  int8_t *q_hi, *q_lo;
+    int32_t *s_hi, *s_lo;
+    int16_t *p16;  int8_t *vt_hi, *vt_lo;
+    int32_t *c_hi, *c_lo;
+    int64_t *pinv; int32_t *psum;
+    int      q_sh, k_sh;
+} attn_bufs_t;
+
+/* A GEMM that may be left running on the accelerator (see dav2_accel.h):
+ * gemm_i32_start issues it -- or, without an accelerator, simply computes it
+ * -- and gemm_i32_finish makes its result available, redoing it on the CPU
+ * if the block failed. One at a time: starting a new one finishes the old.
+ * acc[m*N + n] = sum_k a[n*a_stride + k] * w[m*w_stride + k], strides in
+ * elements; integer either way, so host and board agree to the bit. */
+static struct {
+    int pending;
+    const int16_t *a; int a_stride; const int8_t *w; int w_stride;
+    int32_t *acc; int N, K, M;
+} g_pend;
+
+static void gemm_i32_cpu(const int16_t *a, int a_stride, const int8_t *w, int w_stride,
+                         int32_t *acc, int N, int K, int M)
+{
+    for (int m = 0; m < M; m++) {
+        const int8_t *wr = w + (size_t)m * w_stride;
+        for (int n = 0; n < N; n++) {
+            const int16_t *ar = a + (size_t)n * a_stride;
+            int32_t s = 0;
+            for (int k = 0; k < K; k++)
+                s += (int32_t)ar[k] * (int32_t)wr[k];
+            acc[(size_t)m * N + n] = s;
+        }
+    }
+}
+
+static void gemm_i32_finish(void)
+{
+    if (!g_pend.pending)
+        return;
+    g_pend.pending = 0;
+    if (!dav2_accel_finish())
+        gemm_i32_cpu(g_pend.a, g_pend.a_stride, g_pend.w, g_pend.w_stride,
+                     g_pend.acc, g_pend.N, g_pend.K, g_pend.M);
+}
+
+static void gemm_i32_start(const int16_t *a, int a_stride, const int8_t *w, int w_stride,
+                           int32_t *acc, int N, int K, int M)
+{
+    gemm_i32_finish();
+    int r = dav2_accel_gemm_raw_async(a, (uint32_t)a_stride * 2u, w, (uint32_t)w_stride,
+                                      acc, N, K, M);
+    if (r == 2) {
+        g_pend.pending = 1;
+        g_pend.a = a; g_pend.a_stride = a_stride; g_pend.w = w; g_pend.w_stride = w_stride;
+        g_pend.acc = acc; g_pend.N = N; g_pend.K = K; g_pend.M = M;
+    } else if (r == 0) {
+        gemm_i32_cpu(a, a_stride, w, w_stride, acc, N, K, M);
+    }
+}
+
+/* ---- the phases of one head (the code of the former attention_head) */
+
+/* q and k of a head, shifted to 11 bits: k as the int16 operand, q split
+ * into two int8 halves. Uses dav2_scratch as a temporary. */
+static void attn_prep_qk(const dav2_tensor_t *qkv, int head, int n, attn_bufs_t *b)
 {
     const int HD = DAV2_HEAD_DIM;
     const int ED = DAV2_EMBED_DIM;
-    const int n  = n_tokens;
-    const int Kp = (n + 3) & ~3;                 /* K must be a multiple of 4 */
-    const size_t mark = dav2_arena_mark();
-
-    int16_t *k16   = (int16_t *)dav2_arena_alloc((size_t)n * HD * sizeof(int16_t));
-    int8_t  *q_hi  = (int8_t  *)dav2_arena_alloc((size_t)n * HD);
-    int8_t  *q_lo  = (int8_t  *)dav2_arena_alloc((size_t)n * HD);
-    int32_t *s_hi  = (int32_t *)dav2_arena_alloc((size_t)n * n * sizeof(int32_t));
-    int32_t *s_lo  = (int32_t *)dav2_arena_alloc((size_t)n * n * sizeof(int32_t));
-    int16_t *p16   = (int16_t *)dav2_arena_alloc((size_t)n * Kp * sizeof(int16_t));
-    int8_t  *vt_hi = (int8_t  *)dav2_arena_alloc((size_t)HD * Kp);
-    int8_t  *vt_lo = (int8_t  *)dav2_arena_alloc((size_t)HD * Kp);
-    int32_t *c_hi  = (int32_t *)dav2_arena_alloc((size_t)HD * n * sizeof(int32_t));
-    int32_t *c_lo  = (int32_t *)dav2_arena_alloc((size_t)HD * n * sizeof(int32_t));
-    int64_t *pinv  = (int64_t *)dav2_arena_alloc((size_t)n * sizeof(int64_t));
-    int32_t *psum  = (int32_t *)dav2_arena_alloc((size_t)n * sizeof(int32_t));
-    if (dav2_arena_failed) { dav2_arena_release(mark); return; }
-
+    const int Kp = (n + 3) & ~3;
+    int16_t *k16 = b->k16; int8_t *q_hi = b->q_hi, *q_lo = b->q_lo;
+    int32_t *s_hi = b->s_hi, *s_lo = b->s_lo; int16_t *p16 = b->p16;
+    int8_t *vt_hi = b->vt_hi, *vt_lo = b->vt_lo;
+    int32_t *c_hi = b->c_hi, *c_lo = b->c_lo; int64_t *pinv = b->pinv; int32_t *psum = b->psum;
+    (void)HD; (void)ED; (void)Kp; (void)k16; (void)q_hi; (void)q_lo; (void)s_hi; (void)s_lo;
+    (void)p16; (void)vt_hi; (void)vt_lo; (void)c_hi; (void)c_lo; (void)pinv; (void)psum;
     /* q and k of this head into on-chip scratch, with their ranges. */
     int16_t *q = dav2_scratch;
     int16_t *k = q + (size_t)n * HD;
@@ -170,11 +203,22 @@ static void attention_head(const dav2_tensor_t *qkv, int head, int n_tokens,
             ql[d >> 2] = wl;
         }
     }
+    b->q_sh = q_sh;
+    b->k_sh = k_sh;
+}
 
-    /* S = k . q_hi, k . q_lo  ->  s[t][m] (W rows are t, A rows are m) */
-    gemm_i32(k16, HD, q_hi, HD, s_hi, n, HD, n);
-    gemm_i32(k16, HD, q_lo, HD, s_lo, n, HD, n);
-
+/* v^T of a head, split into int8 halves */
+static void attn_prep_v(const dav2_tensor_t *qkv, int head, int n, attn_bufs_t *b)
+{
+    const int HD = DAV2_HEAD_DIM;
+    const int ED = DAV2_EMBED_DIM;
+    const int Kp = (n + 3) & ~3;
+    int16_t *k16 = b->k16; int8_t *q_hi = b->q_hi, *q_lo = b->q_lo;
+    int32_t *s_hi = b->s_hi, *s_lo = b->s_lo; int16_t *p16 = b->p16;
+    int8_t *vt_hi = b->vt_hi, *vt_lo = b->vt_lo;
+    int32_t *c_hi = b->c_hi, *c_lo = b->c_lo; int64_t *pinv = b->pinv; int32_t *psum = b->psum;
+    (void)HD; (void)ED; (void)Kp; (void)k16; (void)q_hi; (void)q_lo; (void)s_hi; (void)s_lo;
+    (void)p16; (void)vt_hi; (void)vt_lo; (void)c_hi; (void)c_lo; (void)pinv; (void)psum;
     /* v^T, split, padded with zero columns up to Kp. Four tokens at a time so
      * that each store is a whole word. */
     for (int m0 = 0; m0 < Kp; m0 += 4) {
@@ -196,13 +240,28 @@ static void attention_head(const dav2_tensor_t *qkv, int head, int n_tokens,
         }
     }
 
+}
+
+/* scores -> Q15 probabilities, with each token's sum and reciprocal.
+ * Uses dav2_scratch for the score row. */
+static void attn_softmax(const dav2_tensor_t *qkv, int n, attn_bufs_t *b)
+{
+    const int HD = DAV2_HEAD_DIM;
+    const int ED = DAV2_EMBED_DIM;
+    const int Kp = (n + 3) & ~3;
+    int16_t *k16 = b->k16; int8_t *q_hi = b->q_hi, *q_lo = b->q_lo;
+    int32_t *s_hi = b->s_hi, *s_lo = b->s_lo; int16_t *p16 = b->p16;
+    int8_t *vt_hi = b->vt_hi, *vt_lo = b->vt_lo;
+    int32_t *c_hi = b->c_hi, *c_lo = b->c_lo; int64_t *pinv = b->pinv; int32_t *psum = b->psum;
+    (void)HD; (void)ED; (void)Kp; (void)k16; (void)q_hi; (void)q_lo; (void)s_hi; (void)s_lo;
+    (void)p16; (void)vt_hi; (void)vt_lo; (void)c_hi; (void)c_lo; (void)pinv; (void)psum;
     /* Softmax per query token, in fixed point: p = 2^(-(smax - s) * scale *
      * log2e) in Q15. kf is typically far below 1 (score_scale is ~1e-5), so
      * it must be carried as a (mult, shift) pair rather than a plain Q16
      * integer -- rounding it into a Q16 constant collapses it to 0 or 1 and
      * flattens the whole distribution. */
     float score_scale = qkv->scale * qkv->scale
-                      * (float)(1 << q_sh) * (float)(1 << k_sh);
+                      * (float)(1 << b->q_sh) * (float)(1 << b->k_sh);
     float kf = score_scale * 1.4426950408889634f;   /* -> exponent base 2 */
     int32_t kmult; int kshift;
     dav2_make_multiplier(kf, &kmult, &kshift);
@@ -258,10 +317,20 @@ static void attention_head(const dav2_tensor_t *qkv, int head, int n_tokens,
         pinv[t] = ((int64_t)1 << 40) / sum;
     }
 
-    /* C = P . v^T_hi, P . v^T_lo  ->  c[d][t] */
-    gemm_i32(p16, Kp, vt_hi, Kp, c_hi, n, Kp, HD);
-    gemm_i32(p16, Kp, vt_lo, Kp, c_lo, n, Kp, HD);
+}
 
+/* context -> ctx columns of this head. Uses dav2_scratch. */
+static void attn_normalise(int head, int n, attn_bufs_t *b, dav2_tensor_t *ctx)
+{
+    const int HD = DAV2_HEAD_DIM;
+    const int ED = DAV2_EMBED_DIM;
+    const int Kp = (n + 3) & ~3;
+    int16_t *k16 = b->k16; int8_t *q_hi = b->q_hi, *q_lo = b->q_lo;
+    int32_t *s_hi = b->s_hi, *s_lo = b->s_lo; int16_t *p16 = b->p16;
+    int8_t *vt_hi = b->vt_hi, *vt_lo = b->vt_lo;
+    int32_t *c_hi = b->c_hi, *c_lo = b->c_lo; int64_t *pinv = b->pinv; int32_t *psum = b->psum;
+    (void)HD; (void)ED; (void)Kp; (void)k16; (void)q_hi; (void)q_lo; (void)s_hi; (void)s_lo;
+    (void)p16; (void)vt_hi; (void)vt_lo; (void)c_hi; (void)c_lo; (void)pinv; (void)psum;
     /* ctx[t][d] = (64 c_hi + c_lo) / sum_t, kept at the v scale, and exactly
      * the truncated quotient -- but without a 64-bit division per element
      * (5248 per head, hundreds of cycles each on this core). One reciprocal
@@ -297,6 +366,59 @@ static void attention_head(const dav2_tensor_t *qkv, int head, int n_tokens,
     for (int t = 0; t < n; t++)
         dav2_copy16(ctx->v + (size_t)t * ED + head * HD, cbuf + (size_t)t * HD, (size_t)HD);
 
+}
+
+/* All heads, with the CPU's work overlapped with the accelerator's:
+ *
+ *   on the block     on the CPU meanwhile
+ *   S_hi(h)          v^T of head h split
+ *   S_lo(h)          --  (the softmax needs S_lo)
+ *   C_hi(h), C_lo(h) q, k of head h+1 prepared (during C_lo)
+ *   --               head h normalised
+ *
+ * The buffers are allocated once for all heads: head h+1's q/k go into the
+ * same k16/q_hi/q_lo as head h's, which is safe because both S jobs of head
+ * h have completed by then (one job at a time, and C_hi has run since).
+ * Without an accelerator every GEMM is computed at its start, in the same
+ * order, so the result is bit-identical. */
+static void attention_all(const dav2_tensor_t *qkv, int n_tokens, dav2_tensor_t *ctx)
+{
+    const int HD = DAV2_HEAD_DIM;
+    const int n  = n_tokens;
+    const int Kp = (n + 3) & ~3;                 /* K must be a multiple of 4 */
+    const size_t mark = dav2_arena_mark();
+    attn_bufs_t b;
+
+    b.k16   = (int16_t *)dav2_arena_alloc((size_t)n * HD * sizeof(int16_t));
+    b.q_hi  = (int8_t  *)dav2_arena_alloc((size_t)n * HD);
+    b.q_lo  = (int8_t  *)dav2_arena_alloc((size_t)n * HD);
+    b.s_hi  = (int32_t *)dav2_arena_alloc((size_t)n * n * sizeof(int32_t));
+    b.s_lo  = (int32_t *)dav2_arena_alloc((size_t)n * n * sizeof(int32_t));
+    b.p16   = (int16_t *)dav2_arena_alloc((size_t)n * Kp * sizeof(int16_t));
+    b.vt_hi = (int8_t  *)dav2_arena_alloc((size_t)HD * Kp);
+    b.vt_lo = (int8_t  *)dav2_arena_alloc((size_t)HD * Kp);
+    b.c_hi  = (int32_t *)dav2_arena_alloc((size_t)HD * n * sizeof(int32_t));
+    b.c_lo  = (int32_t *)dav2_arena_alloc((size_t)HD * n * sizeof(int32_t));
+    b.pinv  = (int64_t *)dav2_arena_alloc((size_t)n * sizeof(int64_t));
+    b.psum  = (int32_t *)dav2_arena_alloc((size_t)n * sizeof(int32_t));
+    if (dav2_arena_failed) { dav2_arena_release(mark); return; }
+
+    attn_prep_qk(qkv, 0, n, &b);
+    for (int h = 0; h < DAV2_N_HEADS; h++) {
+        /* S = k . q_hi, k . q_lo  ->  s[t][m] (W rows are t, A rows are m) */
+        gemm_i32_start(b.k16, HD, b.q_hi, HD, b.s_hi, n, HD, n);
+        attn_prep_v(qkv, h, n, &b);
+        gemm_i32_start(b.k16, HD, b.q_lo, HD, b.s_lo, n, HD, n);
+        gemm_i32_finish();
+        attn_softmax(qkv, n, &b);
+        /* C = P . v^T_hi, P . v^T_lo  ->  c[d][t] */
+        gemm_i32_start(b.p16, Kp, b.vt_hi, Kp, b.c_hi, n, Kp, HD);
+        gemm_i32_start(b.p16, Kp, b.vt_lo, Kp, b.c_lo, n, Kp, HD);
+        if (h + 1 < DAV2_N_HEADS)
+            attn_prep_qk(qkv, h + 1, n, &b);
+        gemm_i32_finish();
+        attn_normalise(h, n, &b, ctx);
+    }
     dav2_arena_release(mark);
 }
 
@@ -349,8 +471,7 @@ static void run_block(dav2_tensor_t *x, int i, int n_tokens)
     ctx.scale = qkv.scale;              /* context inherits the v scale */
     {
         uint64_t t0 = dav2_cycles();
-        for (int h = 0; h < DAV2_N_HEADS; h++)
-            attention_head(&qkv, h, n_tokens, &ctx);
+        attention_all(&qkv, n_tokens, &ctx);
         dav2_prof_add(DAV2_PROF_ATTENTION, dav2_cycles() - t0);
     }
 

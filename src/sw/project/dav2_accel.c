@@ -23,6 +23,10 @@
 
 #if defined(__riscv) && !defined(DAV2_NO_ACCEL)
 #define DAV2_ACCEL 1
+#elif defined(DAV2_ACCEL_EMU)
+/* Host build against the register-level model in host/accel_emu.c: the
+ * whole driver runs, bit-exactness with the plain host build checks it. */
+#define DAV2_ACCEL 1
 #else
 #define DAV2_ACCEL 0
 #endif
@@ -30,7 +34,11 @@
 #if DAV2_ACCEL
 
 #include <stdio.h>
+#ifdef DAV2_ACCEL_EMU
+#include "host/accel_emu.h"
+#else
 #include <rvlab.h>
+#endif
 
 /* The fast device window is split by address inside student.sv:
  *   0x2000_0000 student_dma, 0x2001_0000 student_gemm. */
@@ -72,9 +80,13 @@
 
 static uint32_t accel_mcycle(void)
 {
+#ifdef DAV2_ACCEL_EMU
+    return dav2_emu_mcycle();
+#else
     uint32_t v;
     __asm__ volatile ("csrr %0, mcycle" : "=r"(v));
     return v;
+#endif
 }
 
 /* Deliberately huge. An earlier 200M-cycle bound disabled a perfectly correct
@@ -94,7 +106,8 @@ static unsigned accel_kmax;
 static unsigned long accel_cycles;
 static unsigned long accel_jobs;
 static unsigned long accel_beats;     /* words read + written by the block  */
-static unsigned long accel_retries;   /* lost responses re-issued (dbg4 hi) */
+static unsigned long accel_retries;
+static unsigned long accel_overlapped;  /* jobs left running while the CPU worked */   /* lost responses re-issued (dbg4 hi) */
 
 int dav2_accel_init(void)
 {
@@ -126,13 +139,79 @@ void dav2_accel_report(void)
     }
     printf("GEMM accelerator: %u rows/pass, K<=%u\n", accel_nrows, accel_kmax);
     if (accel_jobs)
-        printf("  %lu jobs, %lu kcycles, %lu kbeats (%lu.%lu cycles/beat), "
-               "%lu lost-response retries\n",
-               accel_jobs, accel_cycles / 1000u, accel_beats / 1000u,
+        printf("  %lu jobs (%lu overlapped with CPU work), %lu kcycles, %lu kbeats "
+               "(%lu.%lu cycles/beat), %lu lost-response retries\n",
+               accel_jobs, accel_overlapped, accel_cycles / 1000u, accel_beats / 1000u,
                accel_cycles / (accel_beats ? accel_beats : 1),
                (accel_cycles * 10u / (accel_beats ? accel_beats : 1)) % 10u,
                accel_retries);
     accel_jobs = 0; accel_cycles = 0; accel_beats = 0; accel_retries = 0;
+    accel_overlapped = 0;
+}
+
+/* ------------------------------------------------------------ async jobs
+ *
+ * An operation may leave its LAST job running and return, so the CPU can do
+ * work that does not depend on that job's result meanwhile (see
+ * dav2_qgemm's streaming range scan and chunked requantisation, and
+ * attention in dav2_engine.c). At most one job is ever outstanding: every
+ * entry point first settles a pending one, and dav2_accel_finish() collects
+ * it. accel_defer is set only for the duration of an *_async call. */
+static int accel_defer;
+static struct {
+    int            active;
+    unsigned long  beats;
+    int32_t       *amax;         /* requant job: fold RQ_AMAX in here */
+} pend;
+
+static int accel_wait_simple(const char *what);
+
+int dav2_accel_busy(void)
+{
+    return pend.active && (REG32(GEMM_STATUS) & STATUS_BUSY);
+}
+
+int dav2_accel_finish(void)
+{
+    if (!pend.active)
+        return 1;
+    pend.active = 0;
+    if (!accel_wait_simple("async job"))
+        return 0;
+    accel_cycles  += REG32(GEMM_CYCLES);
+    accel_jobs++;
+    accel_beats   += pend.beats;
+    accel_retries += REG32(GEMM_DBG4) >> 16;
+    if (pend.amax) {
+        int32_t a = (int32_t)REG32(GEMM_RQ_AMAX);
+        if (a > *pend.amax) *pend.amax = a;
+        pend.amax = 0;
+    }
+    return 1;
+}
+
+/* Before a job whose statistics the caller will stream: mark its {max, min}
+ * slots with a pair no real row can produce (max < min). A slot that still
+ * holds it has not been drained yet. */
+static void accel_prefill_stats(int32_t *sv, int M)
+{
+    for (int m = 0; m < M; m++) {
+        sv[2 * m]     = DAV2_STATS_EMPTY_MAX;
+        sv[2 * m + 1] = DAV2_STATS_EMPTY_MIN;
+    }
+}
+
+/* Leave the job just started running if the caller asked for that and it
+ * is the operation's last one. Returns 1 when deferred. */
+static int accel_maybe_defer(int last, unsigned long beats, int32_t *amax)
+{
+    if (!accel_defer || !last)
+        return 0;
+    accel_overlapped++;
+    pend.active = 1;
+    pend.beats  = beats;
+    pend.amax   = amax;
+    return 1;
 }
 
 /* One accelerator pass over all N rows: acc[m][n] = sum_k A[n][k] W[m][k]
@@ -146,6 +225,8 @@ static int accel_run(const int16_t *av, uint32_t a_stride,
     const int nrows = (int)accel_nrows;
     const size_t a_row = a_stride ? a_stride / 2 : (size_t)K;   /* int16 elements */
     int tile = 0;
+    if (!dav2_accel_finish())
+        return 0;
 
     REG32(GEMM_W_ADDR)   = (uint32_t)(uintptr_t)w;
     REG32(GEMM_A_STRIDE) = a_stride;
@@ -164,8 +245,14 @@ static int accel_run(const int16_t *av, uint32_t a_stride,
         REG32(GEMM_N_ROWS) = (uint32_t)nt;
         /* per-row {max, min} of this tile, 2 words per weight row */
         REG32(GEMM_S_ADDR) = stats ? (uint32_t)(uintptr_t)(stats + (size_t)tile * M * 2) : 0u;
+        if (stats && accel_defer && n0 + nt >= N)
+            accel_prefill_stats(stats + (size_t)tile * M * 2, M);
         REG32(GEMM_CTRL)   = CTRL_START;
         tile++;
+        if (accel_maybe_defer(n0 + nt >= N,
+                              (unsigned long)M * (K / 4) + (unsigned long)nt * (K / 2)
+                              + (unsigned long)nt * M, 0))
+            return 2;
 
         /* Bounded wait. The block has only ever been exercised against BRAM
          * (dav2_accel_check runs from .bss); the model's tensors live in the
@@ -313,51 +400,82 @@ static int accel_wait_simple(const char *what)
     return 1;
 }
 
+/* Requantise rows m0..m0+mc of acc (all N columns) into out; *amax is
+ * raised to the largest |out| written (directly, or when a deferred last job
+ * is collected by dav2_accel_finish). mc even, at most KMAX/2. */
+static int accel_requant_rows(const int32_t *acc, int N, int M, int m0, int mc,
+                              const int32_t *params, int16_t *out, int32_t *amax)
+{
+    const int nc_max = (int)accel_nrows;
+    if (!dav2_accel_finish())
+        return 0;
+    REG32(GEMM_A_STRIDE) = (uint32_t)N * 4u;
+    REG32(GEMM_C_STRIDE) = (uint32_t)M * 2u;
+    REG32(GEMM_S_ADDR)   = 0u;
+    REG32(GEMM_P_ADDR)   = (uint32_t)(uintptr_t)(params + (size_t)m0 * 3);
+    REG32(GEMM_M_LEN)    = (uint32_t)mc;
+    for (int n0 = 0; n0 < N; n0 += nc_max) {
+        int nc = N - n0;
+        if (nc > nc_max) nc = nc_max;
+        unsigned long beats = (unsigned long)mc * 3u + (unsigned long)mc * nc
+                            + (unsigned long)mc * nc / 2u;
+        REG32(GEMM_A_ADDR) = (uint32_t)(uintptr_t)(acc + (size_t)m0 * N + n0);
+        REG32(GEMM_C_ADDR) = (uint32_t)(uintptr_t)(out + (size_t)n0 * M + m0);
+        REG32(GEMM_N_ROWS) = (uint32_t)nc;
+        REG32(GEMM_CTRL)   = CTRL_START | CTRL_REQUANT;
+        if (accel_maybe_defer(n0 + nc >= N, beats, amax))
+            return 2;
+        if (!accel_wait_simple("requant"))
+            return 0;
+        accel_cycles += REG32(GEMM_CYCLES);
+        accel_jobs++;
+        accel_beats += beats;
+        {
+            int32_t a = (int32_t)REG32(GEMM_RQ_AMAX);
+            if (a > *amax) *amax = a;
+        }
+    }
+    return 1;
+}
+
+static int requant_ok(const int32_t *acc, int N, int M, const int32_t *params,
+                      const int16_t *out)
+{
+    /* Contract: M even (pairs of int16 per word), everything word aligned. */
+    if (N < 1 || M < 2 || (M & 1))
+        return 0;
+    return ((((uintptr_t)acc) | ((uintptr_t)params) | ((uintptr_t)out)) & 3u) == 0;
+}
+
 int dav2_accel_requant(const int32_t *acc, int N, int M, const int32_t *params,
                        int16_t *out, int32_t *amax_out)
 {
     if (amax_out) *amax_out = -1;
-    if (!dav2_accel_init())
+    if (!dav2_accel_init() || !requant_ok(acc, N, M, params, out))
         return 0;
-    /* Contract: M even (pairs of int16 per word), everything word aligned,
-     * a chunk at most CAPS.NROWS columns by KMAX/2 rows. */
-    if (N < 1 || M < 2 || (M & 1))
-        return 0;
-    if ((((uintptr_t)acc) | ((uintptr_t)params) | ((uintptr_t)out)) & 3u)
-        return 0;
-    const int nc_max = (int)accel_nrows;
     const int mc_max = (int)(accel_kmax / 2u) & ~1;
-
     int32_t amax = 0;
-    REG32(GEMM_A_STRIDE) = (uint32_t)N * 4u;
-    REG32(GEMM_C_STRIDE) = (uint32_t)M * 2u;
-    REG32(GEMM_S_ADDR)   = 0u;
-    for (int n0 = 0; n0 < N; n0 += nc_max) {
-        int nc = N - n0;
-        if (nc > nc_max) nc = nc_max;
-        for (int m0 = 0; m0 < M; m0 += mc_max) {
-            int mc = M - m0;
-            if (mc > mc_max) mc = mc_max;
-            REG32(GEMM_A_ADDR) = (uint32_t)(uintptr_t)(acc + (size_t)m0 * N + n0);
-            REG32(GEMM_P_ADDR) = (uint32_t)(uintptr_t)(params + (size_t)m0 * 3);
-            REG32(GEMM_C_ADDR) = (uint32_t)(uintptr_t)(out + (size_t)n0 * M + m0);
-            REG32(GEMM_M_LEN)  = (uint32_t)mc;
-            REG32(GEMM_N_ROWS) = (uint32_t)nc;
-            REG32(GEMM_CTRL)   = CTRL_START | CTRL_REQUANT;
-            if (!accel_wait_simple("requant"))
-                return 0;
-            accel_cycles += REG32(GEMM_CYCLES);
-            accel_jobs++;
-            accel_beats += (unsigned long)mc * 3u + (unsigned long)mc * nc
-                         + (unsigned long)mc * nc / 2u;
-            {
-                int32_t a = (int32_t)REG32(GEMM_RQ_AMAX);
-                if (a > amax) amax = a;
-            }
-        }
+    for (int m0 = 0; m0 < M; m0 += mc_max) {
+        int mc = M - m0;
+        if (mc > mc_max) mc = mc_max;
+        if (!accel_requant_rows(acc, N, M, m0, mc, params, out, &amax))
+            return 0;
     }
     if (amax_out) *amax_out = amax;
     return 1;
+}
+
+int dav2_accel_requant_rows_async(const int32_t *acc, int N, int M, int m0, int mc,
+                                  const int32_t *params, int16_t *out, int32_t *amax)
+{
+    if (!dav2_accel_init() || !requant_ok(acc, N, M, params, out))
+        return 0;
+    if (m0 < 0 || mc < 2 || (mc & 1) || m0 + mc > M || mc > (int)(accel_kmax / 2u))
+        return 0;
+    accel_defer = 1;
+    int r = accel_requant_rows(acc, N, M, m0, mc, params, out, amax);
+    accel_defer = 0;
+    return r;
 }
 
 /* Convolution GEMM with the A tile gathered by the block from the NHWC image
@@ -387,6 +505,8 @@ int dav2_accel_conv(const int16_t *img, int h, int w, int C, int k, int stride,
     if (pc_max < 1) return 0;
     if (pc_max > k * k) pc_max = k * k;
     if (pc_max > 255) pc_max = 255;
+    if (!dav2_accel_finish())
+        return 0;
 
     const int nrows = (int)accel_nrows;
     const int tiles = (N + nrows - 1) / nrows;
@@ -426,7 +546,17 @@ int dav2_accel_conv(const int16_t *img, int h, int w, int C, int k, int stride,
             REG32(GEMM_C_ADDR)  = (uint32_t)(uintptr_t)(dst + n0);
             REG32(GEMM_N_ROWS)  = (uint32_t)nt;
             REG32(GEMM_S_ADDR)  = stats ? (uint32_t)(uintptr_t)(stats + (size_t)t * M * 2) : 0u;
+            if (stats && accel_defer && single && n0 + nt >= N)
+                accel_prefill_stats(stats + (size_t)t * M * 2, M);
             REG32(GEMM_CTRL)    = CTRL_START | CTRL_GATHER;
+            {
+                unsigned long beats = (unsigned long)M * (pc * C / 4)
+                                    + (unsigned long)nt * (pc * C / 2) + (unsigned long)nt * M;
+                /* only a single-chunk conv may leave its last job running:
+                 * a split one adds partial sums right after each chunk */
+                if (accel_maybe_defer(single && n0 + nt >= N, beats, 0))
+                    return 2;       /* single chunk: nothing to release but stats */
+            }
             if (!accel_wait_simple("gather")) {
                 dav2_arena_release(mark);
                 if (st) { st->v = 0; st->tiles = 0; }
@@ -447,6 +577,35 @@ int dav2_accel_conv(const int16_t *img, int h, int w, int C, int k, int stride,
     /* stats (if any) must outlive this call: keep them, drop only part */
     if (!stats) dav2_arena_release(mark);
     return 1;
+}
+
+int dav2_accel_gemm_raw_async(const int16_t *a, uint32_t a_stride,
+                              const int8_t *w, uint32_t w_stride,
+                              int32_t *acc, int N, int K, int M)
+{
+    accel_defer = 1;
+    int r = dav2_accel_gemm_raw(a, a_stride, w, w_stride, acc, N, K, M);
+    accel_defer = 0;
+    return r;
+}
+
+int dav2_accel_qgemm_async(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc,
+                           dav2_accel_stats_t *st)
+{
+    accel_defer = 1;
+    int r = dav2_accel_qgemm(a, wt, acc, st);
+    accel_defer = 0;
+    return r;
+}
+
+int dav2_accel_conv_async(const int16_t *img, int h, int w, int C, int k, int stride,
+                          int pad, const int8_t *wt, int M, int32_t *acc,
+                          dav2_accel_stats_t *st)
+{
+    accel_defer = 1;
+    int r = dav2_accel_conv(img, h, w, C, k, stride, pad, wt, M, acc, st);
+    accel_defer = 0;
+    return r;
 }
 
 int dav2_accel_gemm_raw(const int16_t *a, uint32_t a_stride,
@@ -504,6 +663,8 @@ int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc,
     }
     const int kc_max = (int)(accel_kmax & ~3u);
     int ok = 1;
+    const int defer_saved = accel_defer;
+    accel_defer = 0;         /* partial sums are added right after each chunk */
     for (int k0 = 0; k0 < K && ok; k0 += kc_max) {
         int kc = K - k0;
         if (kc > kc_max) kc = kc_max;
@@ -519,6 +680,7 @@ int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc,
                 acc[i] += part[i];
         }
     }
+    accel_defer = defer_saved;
     dav2_arena_release(mark);
     return ok;
 }
@@ -765,5 +927,35 @@ int dav2_accel_gemm_raw(const int16_t *a, uint32_t a_stride,
     (void)N; (void)K; (void)M;
     return 0;
 }
+
+int dav2_accel_qgemm_async(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc,
+                           dav2_accel_stats_t *st)
+{
+    return dav2_accel_qgemm(a, wt, acc, st);
+}
+
+int dav2_accel_conv_async(const int16_t *img, int h, int w, int C, int k, int stride,
+                          int pad, const int8_t *wt, int M, int32_t *acc,
+                          dav2_accel_stats_t *st)
+{
+    return dav2_accel_conv(img, h, w, C, k, stride, pad, wt, M, acc, st);
+}
+
+int dav2_accel_gemm_raw_async(const int16_t *a, uint32_t a_stride,
+                              const int8_t *w, uint32_t w_stride,
+                              int32_t *acc, int N, int K, int M)
+{
+    return dav2_accel_gemm_raw(a, a_stride, w, w_stride, acc, N, K, M);
+}
+
+int dav2_accel_requant_rows_async(const int32_t *acc, int N, int M, int m0, int mc,
+                                  const int32_t *params, int16_t *out, int32_t *amax)
+{
+    (void)acc; (void)N; (void)M; (void)m0; (void)mc; (void)params; (void)out; (void)amax;
+    return 0;
+}
+
+int dav2_accel_finish(void) { return 1; }
+int dav2_accel_busy(void)   { return 0; }
 
 #endif /* DAV2_ACCEL */

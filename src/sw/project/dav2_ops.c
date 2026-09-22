@@ -394,26 +394,41 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
         return;
     }
 
-    PROF_START();
+    /* ---- the product ------------------------------------------------------
+     *
+     * On the accelerator the operation's last job is left running (run == 2)
+     * and the per-row range below is computed while it drains: the block
+     * writes each weight row's {max, min} as it finishes the row, so the CPU
+     * takes row m's range -- a dozen soft-float operations -- while rows
+     * m+1.. are still being computed. Profile: "gemm (accelerator)" counts
+     * only the time the CPU actually waits for the block. */
+    uint64_t t_start = dav2_cycles(), waited = 0;
     dav2_accel_stats_t st;
-    if (cv && dav2_accel_conv(a->v, cv->h, cv->w, a->c, cv->k, cv->stride, cv->pad,
-                              wt->w, M, acc, &st)) {
-        /* the block gathered the patches itself: no im2col matrix */
-        PROF_LAP(DAV2_PROF_GEMM_ACCEL);
+    int run;
+    if (cv && (run = dav2_accel_conv_async(a->v, cv->h, cv->w, a->c, cv->k, cv->stride,
+                                           cv->pad, wt->w, M, acc, &st)) != 0) {
+        /* the block gathers the patches itself: no im2col matrix */
     } else {
         dav2_tensor_t cols = *a;
         if (cv) {
             cols = dav2_tensor_new(N, K);
             if (!cols.v) { dav2_arena_release(mark); return; }
             dav2_im2col(a, cv->h, cv->w, cv->k, cv->k, cv->stride, cv->pad, &cols);
-            prof_t0 = dav2_cycles();          /* im2col counted in its own bucket */
+            t_start = dav2_cycles();          /* im2col counted in its own bucket */
         }
-        if (dav2_accel_qgemm(&cols, wt, acc, &st)) {
-            PROF_LAP(DAV2_PROF_GEMM_ACCEL);
-        } else {
+        run = dav2_accel_qgemm_async(&cols, wt, acc, &st);
+        if (!run) {
             dav2_qgemm_cpu(cols.v, wt->w, acc, N, K, M);
-            PROF_LAP(DAV2_PROF_GEMM_CPU);
+            dav2_prof_add(DAV2_PROF_GEMM_CPU, dav2_cycles() - t_start);
+            t_start = dav2_cycles();
         }
+    }
+    if (run == 2 && !st.tiles) {
+        /* running, but without statistics to stream: acc is scanned below */
+        uint64_t w0 = dav2_cycles();
+        if (!dav2_accel_finish()) goto redo_on_cpu;
+        waited += dav2_cycles() - w0;
+        run = 1;
     }
 
     /* Exact output range, including bias, so nothing clips. The per-row
@@ -423,10 +438,21 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
     for (int m = 0; m < M; m++) {
         int32_t cmax, cmin;
         if (st.tiles) {
-            const int32_t *sv = st.v + (size_t)m * 2;
+            const volatile int32_t *sv = st.v + (size_t)m * 2;
+            if (run == 2) {
+                /* the last tile's slot, filled while the job runs */
+                const volatile int32_t *lv = sv + (size_t)(st.tiles - 1) * M * 2;
+                if (lv[0] == DAV2_STATS_EMPTY_MAX && lv[1] == DAV2_STATS_EMPTY_MIN) {
+                    uint64_t w0 = dav2_cycles();
+                    while (lv[0] == DAV2_STATS_EMPTY_MAX && lv[1] == DAV2_STATS_EMPTY_MIN
+                           && dav2_accel_busy())
+                        ;
+                    waited += dav2_cycles() - w0;
+                }
+            }
             cmax = sv[0]; cmin = sv[1];
             for (int t = 1; t < st.tiles; t++) {
-                const int32_t *tv = sv + (size_t)t * M * 2;
+                const volatile int32_t *tv = sv + (size_t)t * M * 2;
                 if (tv[0] > cmax) cmax = tv[0];
                 if (tv[1] < cmin) cmin = tv[1];
             }
@@ -446,25 +472,67 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
         if (ah > amax) amax = ah;
         if (al > amax) amax = al;
     }
+    if (run == 2) {
+        /* every row's statistics have been read, so the job is done or
+         * failed; collect it (and learn which) */
+        uint64_t w0 = dav2_cycles();
+        if (!dav2_accel_finish()) goto redo_on_cpu;
+        waited += dav2_cycles() - w0;
+    }
     float out_scale = (amax > 0.0f) ? amax * (1.0f / (float)DAV2_ACT_QMAX) : 1.0f;
     float inv_out = 1.0f / out_scale;
 
-    for (int m = 0; m < M; m++) {
-        int sh;
-        dav2_make_multiplier(a->scale * wt->s[m] * inv_out, &par[3 * m], &sh);
-        par[3 * m + 1] = sh;
-        par[3 * m + 2] = wt->b ? iround(wt->b[m] * inv_out) : 0;
-    }
+    /* ---- requantisation ---------------------------------------------------
+     *
+     * Per-row parameters, then the int32 -> int16 conversion. On the
+     * accelerator this runs in chunks of RQ_CHUNK rows, and the parameters
+     * of chunk c+1 are computed while the block converts chunk c. The
+     * parameters are the same numbers in any order, so the result is too. */
+    int par_done = 0;
+#define PAR_UPTO(end_m) do {                                                  \
+        for (; par_done < (end_m); par_done++) {                              \
+            int m_ = par_done, sh_;                                           \
+            dav2_make_multiplier(a->scale * wt->s[m_] * inv_out,              \
+                                 &par[3 * m_], &sh_);                         \
+            par[3 * m_ + 1] = sh_;                                            \
+            par[3 * m_ + 2] = wt->b ? iround(wt->b[m_] * inv_out) : 0;        \
+        }                                                                     \
+    } while (0)
 
-    if ((M & 1) == 0 && dav2_accel_requant(acc, N, M, par, out->v, &out->amax_q)) {
-        PROF_STOP(DAV2_PROF_REQUANT);
-        out->n = N;
-        out->c = M;
-        out->scale = out_scale;
-        trace_tensor("qgemm", out);
-        dav2_arena_release(mark);
-        return;
+    if ((M & 1) == 0 && run) {
+        enum { RQ_CHUNK = 256 };
+        int32_t rq_amax = 0;
+        int ok = 1;
+        for (int m0 = 0; m0 < M && ok; m0 += RQ_CHUNK) {
+            int mc = M - m0 < RQ_CHUNK ? M - m0 : RQ_CHUNK;
+            PAR_UPTO(m0 + mc);                    /* overlaps the previous chunk */
+            uint64_t w0 = dav2_cycles();
+            ok = dav2_accel_requant_rows_async(acc, N, M, m0, mc, par, out->v, &rq_amax) != 0;
+            waited += dav2_cycles() - w0;         /* includes settling the previous */
+        }
+        if (ok) {
+            uint64_t w0 = dav2_cycles();
+            ok = dav2_accel_finish();
+            waited += dav2_cycles() - w0;
+        }
+        if (ok) {
+            uint64_t now = dav2_cycles();
+            dav2_prof_add(DAV2_PROF_GEMM_ACCEL, waited);
+            dav2_prof_add(DAV2_PROF_REQUANT, (now - t_start) - waited);
+            out->n = N;
+            out->c = M;
+            out->scale = out_scale;
+            out->amax_q = rq_amax;
+            trace_tensor("qgemm", out);
+            dav2_arena_release(mark);
+            return;
+        }
+        /* declined or failed: the CPU path below does the whole conversion */
     }
+    PAR_UPTO(M);
+#undef PAR_UPTO
+    dav2_prof_add(DAV2_PROF_GEMM_ACCEL, waited);
+    uint64_t prof_t0 = t_start + waited;
 
     /* acc is [m][n]; out is [n][m]. Either loop order strides one side by
      * hundreds of bytes and misses the 16 kB direct-mapped DDR3 cache on
@@ -527,6 +595,14 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
     out->amax_q = omax;
     trace_tensor("qgemm", out);
     dav2_arena_release(mark);
+    return;
+
+redo_on_cpu:
+    /* The accelerator failed mid-operation (it has disabled itself and
+     * printed why); acc is incomplete. Start over -- every path is now the
+     * CPU's. */
+    dav2_arena_release(mark);
+    qgemm_impl(a, cv, wt, out);
 }
 
 /* -------------------------------------------------------------- LayerNorm */

@@ -231,6 +231,7 @@ last write of a tile followed by the next tile's first access produces.
 | Level | What runs | Where the DDR3 is | Time |
 |---|---|---|---|
 | Host reference | the C engine natively on the PC | `malloc` | ~4 s |
+| Host + accelerator emulator | the same engine with the real driver, programming a register-level C model of `student_gemm` (`host/accel_emu.c`); must match the host reference bit for bit | `mmap` below 4 GB | ~3 s |
 | Module testbench | one RTL block against a behavioural memory (`student_gemm_tb`: GEMM shapes, strided operands, row statistics, the requantisation job against a bit-level model; `student_gemm_ddrpath_tb`: the same block through the real cache with eight reads in flight) | `ddr3_blk_model.sv` | seconds–minutes |
 | System testbench | the whole SoC, no DDR3 | none | ~17 min for 4 M cycles |
 | System + behavioural DDR3 | the whole SoC, cache and block manager real | `ddr3_blk_model.sv` | same rate |
@@ -243,6 +244,12 @@ precision on both sides, the board's output is required to be bit-identical
 to it — and is, on every image tried. That equality was also the regression
 test for the speed-up work: every change was checked against the previous
 host output byte for byte (`PERFORMANCE.md`).
+
+The emulator sits between the two. It runs the driver's register
+programming and its asynchronous paths (a job left running while the CPU
+works, statistics read while the job is half done, recovery from an
+injected bus error) on the PC. What it cannot check is the RTL itself;
+that is the testbenches' job.
 
 The program also measures the board itself: a per-operator cycle profile
 printed after every frame, and a microbenchmark at boot giving cycles per

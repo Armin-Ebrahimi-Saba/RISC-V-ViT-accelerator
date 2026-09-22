@@ -187,7 +187,11 @@ goes*, laid out in four lanes — PC, CPU, accelerator, and memory.
 ![One frame, start to finish: PC, CPU, accelerator and memory lanes, steps numbered 1–8, the transformer block and attention expanded, GEMM and requantisation expanded underneath](../img/flow.svg)
 
 Steps 1–2 happen once per session (boot and weight load); 3–8 repeat once
-per image. Step 5 (one transformer block) and its sub-step 5c (one attention
+per image. The lanes run partly in parallel: while the accelerator drains
+a GEMM's last job, the CPU is already reading each finished row's range; it
+computes the next chunk's requantisation parameters while the current chunk
+converts; and in attention it prepares the next head while the current one
+multiplies (`PERFORMANCE.md` §5, round four). Step 5 (one transformer block) and its sub-step 5c (one attention
 head) are expanded into their own numbered rows; "GEMM" and "requant" boxes
 everywhere point to the A and B expansions at the bottom, which are what
 every such box in the rest of the diagram stands for.

@@ -261,6 +261,62 @@ per-row *and* per-column parameters plus a float square root per row: a
 new datapath, not a mode of the existing one, and not something to add
 without the board to test it on.
 
+### Round four — the CPU and the accelerator working at the same time
+
+Also not yet on the board. Software only, so the round-three bitstream still
+applies.
+
+**What overlaps.** Almost every piece of CPU work needs the result of the
+job before it, so the overlap is narrower than it sounds. There are three
+places where independent work exists:
+
+| Where | On the accelerator | On the CPU meanwhile |
+|---|---|---|
+| every GEMM | the last job, draining weight row after weight row | the output range, row by row, from each row's statistics as they appear — about a dozen soft-float operations per row, ~45 000 rows per frame |
+| every requantisation | chunk *c* of 256 rows being converted | the multiplier, shift and bias of chunk *c+1* |
+| attention, per head | the score multiply, then the context multiply | splitting vᵀ; preparing the next head's q and k |
+
+The driver can leave an operation's **last** job running (`*_async` in
+`dav2_accel.h`, collected by `dav2_accel_finish()`); at most one job is ever
+outstanding. To stream a GEMM's statistics, the driver first fills the last
+job's statistics slots with a pair no real row can produce (max < min). The
+CPU then takes each row's range once its slot changes. If a job fails, the
+accelerator disables itself and the operation is redone on the CPU.
+
+**Expected gain: small.** About 5–10 % of the frame, mostly from the
+per-row range and parameter work. Attention's multiplies are too short
+(~130 k cycles per head) for its overlap to be worth more than ~1 %. My
+first estimate — "most of the ~130 Mcycles the accelerator is busy" — was
+wrong; the dependency chain does not allow it.
+
+The per-frame accelerator report now prints how many jobs overlapped with
+CPU work (585 of 1 268 on the emulator), and the profile's
+`gemm (accelerator)` line now counts only the time the CPU actually waited.
+
+### Verifying without the board: the accelerator emulator
+
+`src/sw/project/host/accel_emu.c` is a register-level C model of
+`student_gemm`, written from the register descriptions in
+`student_gemm.hjson` rather than from the RTL. `make -C src/sw/project/host
+dav2_host_emu` builds the engine with the real driver compiled in, programming
+this model instead of hardware. Its output must be bit-identical to
+`dav2_host`'s, which checks:
+
+- the driver's register programming: gather-mode field packing, strides,
+  statistics, requant chunking, `RQ_AMAX`;
+- the asynchronous paths. The model finishes a GEMM job a few rows per
+  `STATUS` read, so the CPU really does read statistics while the job is
+  half done. In one frame 45 137 rows were read that way, 9 058 of them
+  after waiting for their slot to fill;
+- recovery: `DAV2_EMU_FAIL_JOB=n` reports a bus error on the *n*-th job.
+  Failing a GEMM, an attention multiply or a requant job (jobs 10–1 100)
+  still gives a bit-identical depth map.
+
+Results: bit-identical on the demo image and three example photographs.
+This also verified the round-two and round-three driver code, which until
+then had never run anywhere; the RTL itself stays covered by the module
+testbenches.
+
 ## 6. What is left, in order of expected gain
 | Item | Now | Estimate | How |
 |---|---|---|---|
