@@ -55,7 +55,7 @@
 <text x="195" y="74" text-anchor="middle" fill="#fff" font-weight="700" font-size="11">2</text>
 <text x="209" y="86" font-weight="600" font-size="11.5">boot, self-test</text>
 <text x="205" y="100" font-size="10.5">DDR3 init; accelerator</text>
-<text x="205" y="113" font-size="10.5">self-test 70×64×6 vs CPU;</text>
+<text x="205" y="113" font-size="10.5">self-test 130×64×6 vs CPU;</text>
 <text x="205" y="126" font-size="10.5">wait for the go flag</text>
 <rect x="205" y="132" width="46" height="13" rx="3" fill="#ffc9c9" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="209" y="142" font-size="9.5">R flag</text>
@@ -267,10 +267,10 @@
 <text x="195" y="958" text-anchor="middle" fill="#fff" font-weight="700" font-size="11">6</text>
 <text x="209" y="970" font-weight="600" font-size="11.5">DPT head  (5 s) — the decoder, four feature levels → one depth map</text>
 <text x="205" y="984" font-size="10.5">6a  per level: 1×1 conv (GEMM) → resize: conv-transpose ×4 / ×2 (GEMM + scatter), identity, or 3×3 stride-2 conv (K = 3456: two</text>
-<text x="205" y="997" font-size="10.5">      column-slice GEMMs, partial sums added on the CPU) → 3×3 conv (im2col on the CPU, then GEMM)</text>
+<text x="205" y="997" font-size="10.5">      column-slice GEMMs, partial sums added on the CPU) → 3×3 conv (patches gathered by the accelerator, then GEMM)</text>
 <text x="205" y="1010" font-size="10.5">6b  fusion, coarse to fine: ResidualConvUnit = ReLU → 3×3 conv → ReLU → 3×3 conv → add; bilinear ×2 (CPU); 1×1 conv</text>
 <text x="205" y="1023" font-size="10.5">6c  output: 3×3 conv → bilinear to 126×126 (CPU) → 3×3 conv → ReLU → 1×1 conv → ReLU → float depth</text>
-<text x="205" y="1046" font-size="10">every conv is im2col (CPU, gathers patches) + GEMM + requant (→ A, B); 2 275 accelerator jobs per frame in total</text>
+<text x="205" y="1046" font-size="10">every 3×3 conv is a GEMM whose patches the accelerator gathers from the image (gather mode) + requant (→ A, B); 2 275 accelerator jobs per frame in total</text>
 <rect x="195" y="1071" width="210" height="83" rx="6" fill="#fff" stroke="#1c7ed6" stroke-width="1.6"/>
 <circle cx="195" cy="1071" r="11" fill="#1c7ed6"/>
 <text x="195" y="1075" text-anchor="middle" fill="#fff" font-weight="700" font-size="11">7</text>
@@ -322,7 +322,7 @@
 <text x="624" y="1230" font-weight="600" font-size="11.5">stream W, MAC</text>
 <text x="620" y="1244" font-size="10.5">each word = 4 int8 weights,</text>
 <text x="620" y="1257" font-size="10.5">broadcast to 64 multipliers;</text>
-<text x="620" y="1270" font-size="10.5">64 MACs per cycle, K cycles per row</text>
+<text x="620" y="1270" font-size="10.5">128 MACs per cycle, K cycles per row</text>
 <rect x="620" y="1276" width="46" height="13" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="624" y="1286" font-size="9.5">R blob</text>
 <rect x="670.2" y="1276" width="46" height="13" rx="3" fill="#ffd8a8" stroke="#2b8a3e" stroke-width="0.6"/>
@@ -344,7 +344,7 @@
 <text x="624" y="1316" font-weight="600" font-size="11.5">next row / next tile</text>
 <text x="620" y="1330" font-size="10.5">m + 1 → A3 (accumulators clear)</text>
 <text x="620" y="1343" font-size="10.5">all M rows done → status DONE;</text>
-<text x="620" y="1356" font-size="10.5">CPU starts the next 64-row tile → A2</text>
+<text x="620" y="1356" font-size="10.5">CPU starts the next 128-row tile → A2</text>
 <path d="M707 1284 L707 1300" fill="none" stroke="#222" stroke-width="1.4" marker-end="url(#fa)"/>
 <line x1="595" y1="1331" x2="610" y2="1331" stroke="#222" stroke-width="1.4" marker-end="url(#fa)"/>
 <path d="M805 1320 L815 1320 L815 1240 L805 1240" fill="none" stroke="#222" stroke-width="1.4" stroke-dasharray="5 3" marker-end="url(#fa)"/>

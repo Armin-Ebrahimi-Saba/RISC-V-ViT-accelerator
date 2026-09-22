@@ -525,8 +525,8 @@ int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc,
 
 /* Small fixed test case run once at start-up. Kept in .bss so it works before
  * the DDR3 arena exists, and deliberately sized so that N straddles a tile
- * boundary (70 = 64 + 6 for the board's 64-row array). */
-#define CHK_N 70
+ * boundary (130 = 128 + 2 for the board's 128-row array). */
+#define CHK_N 130
 #define CHK_K 64
 #define CHK_M 6
 

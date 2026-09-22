@@ -120,18 +120,18 @@ result (M × N). *int8/int16/int32* are 8-, 16- and 32-bit integers; the
 network was quantised so all the arithmetic is integer, because the CPU has
 no floating-point hardware.
 
-![Accelerator dataflow: A tile of 64 rows is loaded once into on-chip memory, then weight rows stream through 64 multiply-accumulate units in parallel, and each completed weight row's 64 results are drained to DDR3 together with their max and min](../img/accelerator_dataflow.svg)
+![Accelerator dataflow: A tile of 128 rows is loaded once into on-chip memory, then weight rows stream through 128 multiply-accumulate units in parallel, and each completed weight row's 128 results are drained to DDR3 together with their max and min](../img/accelerator_dataflow.svg)
 
-*Reuse is the whole idea: 64 rows of A are loaded once and held on-chip, then every weight row streams past all 64 at once. Each int8 weight is multiplied against 64 activations the cycle it arrives, so the weight — the dominant memory traffic — crosses the bus once per tile: twice for the encoder's 82 tokens.*
+*Reuse is the whole idea: 128 rows of A are loaded once and held on-chip, then every weight row streams past all 128 at once. Each int8 weight is multiplied against 128 activations the cycle it arrives, so the weight — the dominant memory traffic — crosses the bus once per tile: once for the encoder's 82 tokens.*
 
 
-The execution of one *GEMM job* (one 64-row tile of A against all of W):
+The execution of one *GEMM job* (one 128-row tile of A against all of W):
 
-1. **Load** the A tile — up to 64 rows × K int16 — from DDR3 into on-chip
-   BRAM (256 kB, 64 block RAMs). Rows may lie `A_STRIDE` bytes apart, so
+1. **Load** the A tile — up to 128 rows × K int16 — from DDR3 into on-chip
+   BRAM (512 kB, 128 block RAMs). Rows may lie `A_STRIDE` bytes apart, so
    the tile can be a column slice of a wider matrix.
 2. **Stream** W: each 32-bit word carries four int8 weights. As each arrives
-   it is broadcast to all 64 MAC units, each of which multiplies it against
+   it is broadcast to all 128 MAC units, each of which multiplies it against
    its own row of A and accumulates. W rows may also be strided.
 3. **Drain**: when a weight row `m` is finished, the accumulated results
    are written to DDR3 as column `m` of C. With `S_ADDR` set, the row's max
@@ -139,7 +139,7 @@ The execution of one *GEMM job* (one 64-row tile of A against all of W):
    CPU never reads C back for it.
 4. Repeat 2–3 for every row of W. Then the CPU starts the next tile.
 
-A matrix with N=82 rows needs two jobs: one full tile and one of 18 rows.
+A matrix with N=82 rows is one job; the DPT head's 15 876-pixel convolutions are 125.
 A reduction longer than the tile RAM (K = 3456 in the 384-channel 3×3
 convolutions, against KMAX = 2048) is run as two column-slice jobs whose
 partial sums the CPU adds.
@@ -147,7 +147,7 @@ partial sums the CPU adds.
 The block reads with **eight requests in flight** through a reorder buffer
 indexed by the bus source ID, which is what brought it from 8.3 to 3.2
 cycles per beat. It measures 3.2 because a 32-byte cache line is filled from
-DRAM once per eight beats; the bypassed prefetcher (§5) would hide that.
+DRAM once per eight beats. The prefetcher (§5), repaired and back in the path, fetches the next line ahead; its effect on the board is not yet measured.
 
 ### The requantisation job
 
@@ -159,7 +159,7 @@ frame — and is now the block's second job type (`CTRL.requant`):
 
 1. Read the per-row `{mult, shift, bias}` table (`P_ADDR`) into a small
    parameter RAM.
-2. Read a chunk of C — up to 1024 rows × 64 columns — into the A-tile RAM
+2. Read a chunk of C — up to 1024 rows × 128 columns — into the A-tile RAM
    **transposed**: RAM row = n, word = m. This is what turns the m-major
    result into n-major output for free.
 3. Stream out: one element per cycle through a seven-stage pipeline
@@ -172,7 +172,7 @@ against a bit-level model and the board against the host build.
 The block has a register interface the CPU programs (addresses and strides
 of A, W and C; K, M and the tile row count; `S_ADDR`, `P_ADDR`; a control
 word with start and requant bits; status) and four debug registers that
-expose internal counters. Peak is 64 multiply-accumulates per cycle; the
+expose internal counters. Peak is 128 multiply-accumulates per cycle; the
 block is memory-bound, not compute-bound, so the tile width buys fewer
 passes over the weights rather than more arithmetic per pass.
 
@@ -192,7 +192,7 @@ retries per frame.
 Between the crossbar and the memory chip sit four blocks. All three defects
 fixed in this project were in this path, so it is worth seeing in full.
 
-![The DDR3 path: crossbar port feeds a request mux, then a write-back cache, then (bypassed) prefetcher, then clock-domain crossing FIFO, block manager, and the UberDDR3 controller and PHY driving the DDR3 chip. Three defects are marked.](../img/ddr3_path.svg)
+![The DDR3 path: crossbar port feeds a request mux, then a write-back cache, then prefetcher (repaired), then clock-domain crossing FIFO, block manager, and the UberDDR3 controller and PHY driving the DDR3 chip. Three defects are marked.](../img/ddr3_path.svg)
 
 *The dashed vertical line is a clock-domain crossing: the controller runs at 100 MHz, the rest at 50 MHz. All three fixed defects (orange) sit on the 50 MHz side, in platform RTL rather than the accelerator.*
 
@@ -258,7 +258,7 @@ guessing where the time went was wrong twice.
 | `src/rtl/student/student_gemm.sv` | the accelerator |
 | `src/rtl/student/student_tl_watch.sv` | stalled-transaction watchdog register |
 | `src/rtl/student/student_tl_rsp_hold.sv` | response skid buffer (currently bypassed) |
-| `src/rtl/ddr3/rvlab_tlul_ddr.sv` | the DDR3 path top; request mux fix; prefetch bypass |
+| `src/rtl/ddr3/rvlab_tlul_ddr.sv` | the DDR3 path top; request mux fix; prefetcher enabled |
 | `src/rtl/ddr3/rvlab_ddr_block_cache.sv` | the cache; write-back fix |
 | `src/sw/project/` | the C inference engine; `dav2_accel.c` is the accelerator driver, `dav2_ops.c` the kernels, `main.c` the frame server, profiler hooks and microbenchmark |
 | `src/sw/project/tools/` | exporter, board runner, image preprocessing (`dav2_image.py`) |

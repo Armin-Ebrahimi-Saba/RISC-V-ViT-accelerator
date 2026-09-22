@@ -266,9 +266,12 @@ module rvlab_tlul_ddr (
    * verified byte for byte in DDR3 over JTAG -- are reported "not found":
    * the directory scan reads a line belonging to the accelerator's arena.
    *
-   * Bypassing costs read bandwidth. Correctness first; the prefetcher needs
-   * repairing before it is switched back on. */
-  localparam bit USE_PREFETCH = 1'b0;
+   * Repaired since: the prefetcher reused a slot whose DRAM response was
+   * still in flight (a Stale entry, or a Pending one it had wrongly marked
+   * Invalid), so the late response landed as another address's data. With
+   * both fixed in rvlab_ddr_prefetch.sv the aliasing test passes 256/256
+   * with the prefetcher in the path, and it is back on. */
+  localparam bit USE_PREFETCH = 1'b1;
 
   if (USE_PREFETCH) begin : gen_prefetch
     rvlab_ddr_prefetch prefetcher_i (

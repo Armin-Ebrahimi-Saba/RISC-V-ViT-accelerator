@@ -14,8 +14,7 @@
 <line x1="560" y1="150" x2="600" y2="150" marker-end="url(#ah3)"/>
 <line x1="680" y1="150" x2="720" y2="150" marker-end="url(#ah3)"/>
 <line x1="800" y1="150" x2="830" y2="150" marker-end="url(#ah3)"/>
-<!-- bypass around prefetch -->
-<path d="M420 130 Q 510 70 600 130" stroke-dasharray="6 3"/>
+
 <!-- clock boundary -->
 <line x1="590" y1="60" x2="590" y2="225" stroke-dasharray="3 4"/>
 <!-- defect markers -->
@@ -33,8 +32,7 @@
 <text x="355" y="165" text-anchor="middle" font-size="11">direct-mapped</text>
 <text x="355" y="185" text-anchor="middle" font-size="11">512 × 32-byte lines</text>
 <text x="510" y="145" text-anchor="middle" font-size="11">prefetcher</text>
-<text x="510" y="78" text-anchor="middle" font-size="11">bypass (in use)</text>
-<text x="510" y="160" text-anchor="middle" font-size="11">(bypassed)</text>
+<text x="510" y="160" text-anchor="middle" font-size="11">(repaired)</text>
 <text x="640" y="145" text-anchor="middle" font-size="11">CDC</text>
 <text x="640" y="160" text-anchor="middle" font-size="11">FIFO</text>
 <text x="760" y="145" text-anchor="middle" font-size="11">block</text>
@@ -51,7 +49,7 @@
 <text x="20" y="290" font-weight="600" fill="#d9480f">2</text>
 <text x="40" y="290" font-size="12">Cache wrote back a line's stale contents when that line had been written the cycle before. One word lost per tile.</text>
 <text x="20" y="320" font-weight="600" fill="#d9480f">3</text>
-<text x="40" y="320" font-size="12">Prefetcher returned another address's data when two regions collided in the cache. Bypassed rather than repaired.</text>
+<text x="40" y="320" font-size="12">Prefetcher reused a slot whose DRAM response was still in flight, so it returned another address's data. Repaired.</text>
 <text x="20" y="360" font-size="12">Also in the cache: it ignores the bus "ready" on responses, so a busy receiver can lose one. Covered by the accelerator's retry timer.</text>
 </g>
 </svg>

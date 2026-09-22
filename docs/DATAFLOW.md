@@ -83,7 +83,7 @@ before it:
 - **Solid orange bars** mark work that genuinely happens at the same time.
   This occurs in exactly one place: inside every accelerator job (detailed
   once, in step 3), where three engines run concurrently — a read engine
-  with up to eight requests in flight, the 64 multiply-accumulate units, and
+  with up to eight requests in flight, the 128 multiply-accumulate units, and
   a write engine with up to eight writes awaiting acknowledgement. That
   overlap is the whole reason the block moves one word every 3.2 cycles
   instead of every 8.3.
@@ -208,10 +208,10 @@ every such box in the rest of the diagram stands for.
 | # | What happens |
 |---|---|
 | A1 | The CPU programs the job's registers — A/W/C addresses and strides, K, M, row count, `S_ADDR` for stats — and sets `CTRL.start`, then polls `STATUS`. |
-| A2 | The accelerator loads a 64-row tile of A into on-chip RAM, up to 8 reads in flight through a reorder buffer; a lost response is automatically re-issued. |
-| A3 | It streams W a word at a time (4 packed int8 weights each), broadcasting each to all 64 multiply-accumulate units — 64 MACs per cycle, K cycles per weight row. |
+| A2 | The accelerator loads a 128-row tile of A into on-chip RAM, up to 8 reads in flight through a reorder buffer; a lost response is automatically re-issued. |
+| A3 | It streams W a word at a time (4 packed int8 weights each), broadcasting each to all 128 multiply-accumulate units — 128 MACs per cycle, K cycles per weight row. |
 | A4 | It drains that row's 64 int32 sums to column m of C, then (if stats are on) that row's max and min. |
-| A5 | It moves to the next row, or — once all M rows are done — reports `STATUS.done`; the CPU then starts the next 64-row tile back at A2. |
+| A5 | It moves to the next row, or — once all M rows are done — reports `STATUS.done`; the CPU then starts the next 128-row tile back at A2. |
 
 Everything above A3 runs concurrently inside the block, as noted in §3.
 

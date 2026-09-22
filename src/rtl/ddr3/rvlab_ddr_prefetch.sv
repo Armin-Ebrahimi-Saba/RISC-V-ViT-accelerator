@@ -67,7 +67,13 @@ module rvlab_ddr_prefetch #(
             assign addr_le_mask[i]     = entry_addrs[i] <= fe_req_i.a_address;
             assign valid_mask[i]       = addr_match_mask[i] && entry_states[i] == Valid;
             assign pending_mask[i]     = addr_match_mask[i] && entry_states[i] == Pending;
-            assign non_pending_mask[i] = entry_states[i] != Pending;
+            // An entry is free only when no DRAM response can still arrive
+            // for it. A Stale entry has one in flight: reusing its slot
+            // let that old response land as Valid data for the new address
+            // (the cache then read the aliasing region's line -- see
+            // docs/DEBUGGING.md, the prefetcher defect).
+            assign non_pending_mask[i] = entry_states[i] != Pending
+                                      && entry_states[i] != Stale;
             assign invalid_mask[i]     = entry_states[i] == Invalid;
         end : gen_masks
     endgenerate
@@ -156,8 +162,14 @@ module rvlab_ddr_prefetch #(
             // FRONTEND DATA RESPONSE
             if (fe_rsp_xchg && fe_rsp_o.d_opcode == AccessAckData) begin
                 // Invalidate all entries with address <= ack'd address
+                // pending_mask only covers entries whose address equals the
+                // request; a lower-addressed entry can be Pending too, and
+                // marking it Invalid would free its slot while its response
+                // is still on the way. Decide by the entry's own state.
                 for (int i = 0; i < SIZE; i++) begin
-                    if (addr_le_mask[i]) entry_states[i] <= (pending_mask[i] ? Stale : Invalid);
+                    if (addr_le_mask[i] && entry_states[i] != Invalid)
+                        entry_states[i] <= (entry_states[i] == Pending ||
+                                            entry_states[i] == Stale) ? Stale : Invalid;
                 end
             end
         end

@@ -23,7 +23,7 @@
 
 module student_gemm_tb;
 
-  localparam int unsigned NROWS       = 64;   // the board setting (student.sv)
+  localparam int unsigned NROWS       = 128;   // the board setting (student.sv)
   localparam int unsigned KMAX        = 2048;
   localparam int unsigned OUTSTANDING = 8;
 
@@ -543,6 +543,8 @@ module student_gemm_tb;
     // full tile plus a partial one of 18.
     run_gemm(64, 128, 8);
     run_gemm(82, 384, 12);
+    run_gemm(130, 64, 8);    // NROWS = 128: a full tile plus 2
+    run_gemm(128, 32, 4);    //                 exactly one tile
 
     // Strided rows. First a reduction split in two halves (rows 192 wide,
     // columns 96..191); then the attention shape: a 64-wide head out of
@@ -563,7 +565,8 @@ module student_gemm_tb;
     run_conv(9, 9, 64, 3, 1, 1, 12, 9);        // 3x3 pad 1: N=81, K=576
     run_conv(9, 9, 32, 3, 2, 1, 8, 9);         // stride 2: N=25
     run_conv(9, 9, 384, 3, 2, 1, 6, 5);        // K=3456 split 5+4 positions
-    run_conv(10, 7, 16, 3, 1, 1, 4, 9);        // non-square, N=70 -> two tiles
+    run_conv(10, 7, 16, 3, 1, 1, 4, 9);        // non-square, N=70
+    run_conv(12, 12, 16, 3, 1, 1, 4, 9);       // N=144: a full 128-row tile + 16
 
     if (x_errors) begin
       $display("X on the host A channel in %0d cycles", x_errors);

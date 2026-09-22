@@ -246,6 +246,21 @@ Build: LUT 15.2 %, BRAM 36.9 %, DSP 10.8 %, WNS +0.395 ns, WHS +0.015 ns.
 Expected on the board: roughly 14.2 → 9–10 s. To be replaced with the
 measurement.
 
+### Round three — also not yet on the board
+
+| Change | Why | Verified by |
+|---|---|---|
+| **Tile width 64 → 128 rows** (`NROWS`, `student.sv`) | The encoder's 82 tokens fit one tile, so every encoder weight matrix crosses DDR3 once instead of twice; the DPT head's convolutions need 125 passes instead of 249. Costs 64 more BRAMs and DSPs. | `student_gemm_tb`, `student_gemm_ddrpath_tb` with shapes of exactly one tile and one tile plus a remainder, and a 144-pixel gather convolution |
+| **Prefetcher repaired and back on** (`rvlab_ddr_prefetch.sv`, `USE_PREFETCH = 1`) | The accelerator measured 3.2 cycles per beat. That is one 32-byte DRAM line fill per eight beats, and the prefetcher exists to hide it. It had been bypassed for returning aliased data. The cause was a table slot reused while its DRAM response was still in flight; see `DEBUGGING.md` §5. | `rvlab_ddr_alias_tb` fails 65/256 on the old code and passes 256/256 on the new; `student_gemm_ddrpath_tb` passes with the prefetcher in the path |
+
+Build: LUT 17.6 %, BRAM 54.4 %, DSP 19.5 %, WNS +0.371 ns, WHS +0.012 ns,
+0 failing endpoints.
+
+LayerNorm as an accelerator job was considered and left out. It needs
+per-row *and* per-column parameters plus a float square root per row: a
+new datapath, not a mode of the existing one, and not something to add
+without the board to test it on.
+
 ## 6. What is left, in order of expected gain
 | Item | Now | Estimate | How |
 |---|---|---|---|
@@ -255,7 +270,7 @@ measurement.
 | residual adds | 92 | −40 | fuse the range scan into the previous operator's output pass |
 | im2col | 67 | −60 | a gather mode in the accelerator's A-load (read rows at a stride with a window) |
 | GELU | 51 | −30 | unroll; LUT index arithmetic on packed pairs |
-| GEMM | 93 | −40 | repair or replace the bypassed prefetcher; larger cache lines |
+| GEMM | 93 | −40 | prefetcher repaired and 128-row tile (round three, unmeasured); larger cache lines |
 
 All of these together would land around 6–7 s per frame. Beyond that the
 weights themselves — 25 MB crossing DDR3 twice per frame at ~3 cycles per

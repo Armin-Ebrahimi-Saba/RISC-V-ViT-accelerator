@@ -38,7 +38,7 @@ JPEG/PNG works — PIL, numpy and torch are installed in the venv.
 | Frames per second | 0.070 |
 | Weight load (once per session, JTAG) | ~66 s at 0.37 MB/s |
 | Image in / result out | 0.3 s / 0.7 s over the JTAG system bus |
-| Accelerator | 64 rows per tile, 8 reads in flight, 3.2 cycles/beat, 0 retries per frame |
+| Accelerator | 128 rows per tile (64 in the last measured build), 8 reads in flight, 3.2 cycles/beat, 0 retries per frame |
 | Timing, last build | pnr WNS +0.121 ns, WHS +0.030 ns, 0 failing |
 | Resources | LUT 14.8 %, BRAM 36.9 %, DSP 10.4 % |
 
@@ -51,7 +51,9 @@ the accelerator or the model code. They are described fully in
 2. **Cache write-back** (`rvlab_ddr_block_cache.sv`) — a line evicted the
    cycle after it was written was written back with stale contents.
 3. **Prefetcher** (`rvlab_ddr_prefetch.sv`) — returned another address's
-   data when regions collided in the cache. **Bypassed, not repaired.**
+   data when regions collided in the cache. **Repaired** later (a slot was
+   reused while its DRAM response was in flight) and back on; not yet run
+   on the board.
 
 ---
 
@@ -60,9 +62,11 @@ the accelerator or the model code. They are described fully in
 These are deliberate and documented in the RTL, but they are not finished
 work.
 
-- **Prefetcher bypassed** — `USE_PREFETCH = 0` in `rvlab_tlul_ddr.sv`. Costs
-  read bandwidth. Repairing it needs the aliasing test
-  (`rvlab_ddr_alias_tb.sv`) to pass with it in the path.
+- **Prefetcher** — repaired and switched back on (`USE_PREFETCH = 1`).
+  Verified by `rvlab_ddr_alias_tb` (fails 65/256 on the old code, passes
+  256/256 now) and `student_gemm_ddrpath_tb`; **not yet on the board**. If
+  blob lookups start failing on the board ("tensor not found"), set it back
+  to 0 first.
 - **Response skid buffer bypassed** — `USE_RSP_HOLD = 0` in the same file.
   `student_tl_rsp_hold.sv` is correct and was verified, but once the request
   mux was fixed it was no longer needed for the CPU path, and it changes
@@ -98,14 +102,21 @@ work.
   (`dav2_image.from_file` accepts anything PIL opens; feed it a frame). A
   camera on the board itself is an RTL project — see the options recorded in
   `DEBUGGING.md` § 11.
-- **Round two of the speed-up is not measured on the board.** LayerNorm,
-  the adds, attention's arithmetic, `make_multiplier` and the accelerator's
-  gather mode and `RQ_AMAX` register were done while the board was away:
-  bit-exact on the host, passing in `student_gemm_tb`, bitstream built.
-  First thing with the board: `flow rvlab_fpga_top.program`, run the demo,
-  check the boot line `gather self-test ok`, compare the output with
-  `build/dav2/host_depth.bin`, and put the measured frame time into
-  `PERFORMANCE.md` §5.
+- **Rounds two and three of the speed-up are not measured on the board.**
+  Round two: LayerNorm, the adds, attention's arithmetic, `make_multiplier`,
+  and the accelerator's gather mode and `RQ_AMAX` register. Round three: a
+  128-row tile and the repaired prefetcher. All of it is bit-exact on the
+  host, passes `student_gemm_tb`, `student_gemm_ddrpath_tb` and
+  `rvlab_ddr_alias_tb`, and the bitstream is built. First thing with the
+  board:
+  1. `flow rvlab_fpga_top.program`
+  2. run the demo image
+  3. check the boot lines `self-test ok (130x64x6)` and
+     `gather self-test ok`
+  4. compare the result with `build/dav2/host_depth.bin`
+  5. put the measured frame time into `PERFORMANCE.md` §5.
+  If anything is wrong, the two new risks are the prefetcher
+  (`USE_PREFETCH`) and gather mode (the self-test disables it by itself).
 - **Requant job constraints.** M must be even and a chunk is at most 64
   columns × 1024 rows (the driver chunks). All shapes in this model comply;
   `dav2_qgemm` falls back to the CPU path for odd M.

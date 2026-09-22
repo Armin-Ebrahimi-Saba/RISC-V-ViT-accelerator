@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 400" role="img" aria-label="Accelerator dataflow: A tile of 64 rows is loaded once into on-chip memory, then weight rows stream through 64 multiply-accumulate units in parallel, and each completed weight row's 64 results are drained to DDR3 together with their max and min" style="font-family:system-ui,sans-serif;font-size:12px">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 400" role="img" aria-label="Accelerator dataflow: A tile of 128 rows is loaded once into on-chip memory, then weight rows stream through 128 multiply-accumulate units in parallel, and each completed weight row's 128 results are drained to DDR3 together with their max and min" style="font-family:system-ui,sans-serif;font-size:12px">
 <rect width="100%" height="100%" fill="#fff"/><defs><marker id="ah2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#222"/></marker></defs>
 <g fill="none" stroke="#222" stroke-width="1.4">
 <rect x="20" y="40" width="130" height="320" rx="6"/>
@@ -27,25 +27,25 @@
 <text x="195" y="90" text-anchor="middle" font-size="11">load once</text>
 <text x="195" y="245" text-anchor="middle" font-size="11">stream</text>
 <text x="315" y="65" text-anchor="middle" font-weight="600">A tile</text>
-<text x="315" y="85" text-anchor="middle" font-size="11">64 rows × K</text>
+<text x="315" y="85" text-anchor="middle" font-size="11">128 rows × K</text>
 <text x="315" y="103" text-anchor="middle" font-size="11">on-chip BRAM</text>
 <text x="315" y="130" text-anchor="middle" font-size="11">read every cycle</text>
 <text x="315" y="145" text-anchor="middle" font-size="11">for each W row</text>
 <text x="315" y="245" text-anchor="middle" font-weight="600">W beat</text>
 <text x="315" y="265" text-anchor="middle" font-size="11">4 × int8 per word</text>
 <text x="435" y="245" text-anchor="middle" font-size="11">broadcast</text>
-<text x="580" y="65" text-anchor="middle" font-weight="600">64 MAC units</text>
+<text x="580" y="65" text-anchor="middle" font-weight="600">128 MAC units</text>
 <text x="580" y="107" text-anchor="middle" font-size="11">row 0: acc += A[0][k]·W[m][k]</text>
 <text x="580" y="141" text-anchor="middle" font-size="11">row 1: acc += A[1][k]·W[m][k]</text>
 <text x="580" y="175" text-anchor="middle" font-size="11">row 2: acc += A[2][k]·W[m][k]</text>
 <text x="580" y="230" text-anchor="middle">⋮</text>
-<text x="580" y="307" text-anchor="middle" font-size="11">row 63</text>
-<text x="580" y="345" text-anchor="middle" font-size="11">all 64 in parallel, one k per cycle</text>
+<text x="580" y="307" text-anchor="middle" font-size="11">row 127</text>
+<text x="580" y="345" text-anchor="middle" font-size="11">all 128 in parallel, one k per cycle</text>
 <text x="785" y="175" text-anchor="middle" font-weight="600">drain</text>
-<text x="785" y="200" text-anchor="middle" font-size="11">64 results</text>
+<text x="785" y="200" text-anchor="middle" font-size="11">128 results</text>
 <text x="785" y="215" text-anchor="middle" font-size="11">per W row</text>
 <text x="785" y="230" text-anchor="middle" font-size="11">→ C column</text>
 <text x="785" y="244" text-anchor="middle" font-size="11">+ {max, min}</text>
-<text x="480" y="378" text-anchor="middle" font-size="11">write C[m][0..63] (and {max,min}) back to DDR3</text>
+<text x="480" y="378" text-anchor="middle" font-size="11">write C[m][0..127] (and {max,min}) back to DDR3</text>
 </g>
 </svg>

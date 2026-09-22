@@ -246,10 +246,36 @@ the prefetcher in the path: 65 of 256 reads wrong, e.g.
 `got 820100a5 want 800100a5 <-- ARENA'S DATA`. With it bypassed: 256/256
 correct. So the cache was fine and the prefetcher was not.
 
-Fix: `USE_PREFETCH = 1'b0`. This is a **bypass, not a repair** — it costs
-read bandwidth, and the prefetcher's logic looked correct on inspection, so the
-fault was never localised inside it. On hardware, lookup failures went from 61
-per run to 0.
+Fix at the time: `USE_PREFETCH = 1'b0`, a **bypass, not a repair**. It cost
+read bandwidth, and the fault was never localised inside the prefetcher. On
+hardware, lookup failures went from 61 per run to 0.
+
+### The repair, later
+
+A second reading of `rvlab_ddr_prefetch.sv` found the fault. Each table
+entry is `Invalid`, `Pending` (DRAM read in flight), `Valid` or `Stale`
+(read in flight, but the data is already known to be out of date). The
+allocator treated every non-`Pending` entry as free, `Stale` included.
+So a new miss could take a slot whose old DRAM response had not yet
+arrived. When that response came, it carried the slot number, marked the
+slot `Valid`, and its data was served for the *new* address. The alias
+test reads exactly that: the other region's line.
+
+A second route led to the same failure. When the cache is answered for
+address A, every entry at or below A is dropped. The code chose between
+`Stale` and `Invalid` with a mask that only matches entries whose address
+*equals* A. A lower-addressed entry still `Pending` was therefore set
+`Invalid` with its response in flight, and `Invalid` slots are the first
+ones reused.
+
+Both fixed: a slot is free only when no response can still arrive for it,
+and the drop decides from each entry's own state. The alias test fails
+65/256 with the old code (negative control, re-run) and passes 256/256
+with the repair and the prefetcher in the path. The GEMM-through-cache
+testbench passes with it too. Only the first route was shown to fail
+before its fix; the second was found by reading and has no failing test.
+The prefetcher is back on (`USE_PREFETCH = 1'b1`). **Not yet run on the
+board.**
 
 ---
 
@@ -444,14 +470,14 @@ not testing what you think.
 |---|---|---|
 | `a_ready` from the idle error responder; requests accepted by nobody | `rvlab_tlul_ddr.sv` | source `a_ready` from the module that will accept |
 | write-back uses stale RAM output for a line written the previous cycle | `rvlab_ddr_block_cache.sv` | `a_data: data_rdata` |
-| prefetcher returns aliased lines | `rvlab_ddr_prefetch.sv` | **bypassed**, not repaired |
+| prefetcher returns aliased lines | `rvlab_ddr_prefetch.sv` | slot reused while its response was in flight; **repaired** (not yet on the board) |
 
 Plus the cache's `d_ready` defect, **worked around** by the skid buffer and
 the accelerator's retry rather than fixed at source.
 
 **Not done.**
 
-- The prefetcher is bypassed; read bandwidth is lower than it could be.
+- ~~The prefetcher is bypassed~~ Repaired and back on; see §5. Board run owed.
 - `student_gemm`'s retry covers reads only; a lost write ack would still
   wedge it. Unlikely now that requests are never swallowed, but real. The
   retry is per reorder slot since the block runs with eight reads in flight;

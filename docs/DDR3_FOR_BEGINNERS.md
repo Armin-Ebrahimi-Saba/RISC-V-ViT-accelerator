@@ -172,8 +172,16 @@ the prefetcher and not the cache.
 
 ### The fix
 
-The prefetcher is switched off. It costs some speed (nothing is fetched
-early), but every read is now correct. Repairing it properly is future work.
+At first the prefetcher was simply switched off. That cost some speed
+(nothing was fetched early), but every read was correct.
+
+Later the real cause was found. The prefetcher keeps a few numbered trays
+for lines it has asked the warehouse for. When it decided a tray's order was
+no longer wanted, it handed the tray to a new order *while the old delivery
+was still on the truck*. The old delivery then arrived, went onto the tray,
+and was handed out as the new order. Now a tray is only reused once its
+delivery has arrived. With that fix the same test passes 256 of 256 with the
+prefetcher switched back on. It has not yet been run on the board.
 
 ---
 

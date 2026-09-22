@@ -26,7 +26,7 @@
 
 module student_gemm_ddrpath_tb;
 
-  localparam int unsigned NROWS = 64;   // the board setting (student.sv)
+  localparam int unsigned NROWS = 128;   // the board setting (student.sv)
   localparam int unsigned KMAX  = 2048;
   // Reads in flight. 1 is the board setting; the tb takes it as a plusarg so
   // a deeper pipeline can be tried against the cache without editing RTL:
@@ -115,7 +115,7 @@ module student_gemm_ddrpath_tb;
   // returns aliased lines (see rvlab_ddr_alias_tb) and is bypassed on the
   // board, so simulating with it in the path tests a configuration that
   // no longer ships.
-  localparam bit BYPASS_PREFETCH = 1'b1;
+  localparam bit BYPASS_PREFETCH = 1'b0;   // matches rvlab_tlul_ddr.sv
 
   if (BYPASS_PREFETCH) begin : gen_bypass
     assign pf_req  = llc_req;
@@ -240,7 +240,7 @@ module student_gemm_ddrpath_tb;
   // come back as DataKnown_A assertion failures and rows of zeros -- a
   // testbench fault that looks exactly like a DUT fault. The bounds are
   // asserted in run_gemm so this cannot happen silently again.
-  localparam int MAXN = 96;
+  localparam int MAXN = 136;
   localparam int MAXK = 640;
   localparam int MAXM = 384;
 
@@ -423,7 +423,8 @@ module student_gemm_ddrpath_tb;
     run_gemm(20, 64,  6);    // two tiles, second partial
     run_gemm(17, 128, 4);    // final tile of a single row
     run_gemm(16, 384, 12);   // a shape the model issues
-    run_gemm(82, 384, 12);   // 82 tokens: one full 64-row tile plus 18
+    run_gemm(82, 384, 12);   // 82 tokens: one partial 128-row tile
+    run_gemm(130, 64, 6);    // a full 128-row tile plus 2
 
     // Patch embedding. On hardware this shape loses exactly one accumulator
     // word of 31104, deterministically, and the lost word is always a tile's

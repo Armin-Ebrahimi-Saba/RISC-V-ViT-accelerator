@@ -81,7 +81,7 @@ module rvlab_ddr_alias_tb;
 
   // Set BYPASS_PREFETCH to wire the cache straight to the backend, which
   // says whether the wrong-line reads come from the cache or the prefetcher.
-  localparam bit BYPASS_PREFETCH = 1'b1;
+  localparam bit BYPASS_PREFETCH = 1'b0;   // the repaired prefetcher is in the path
 
   if (BYPASS_PREFETCH) begin : gen_bypass
     assign pf_req  = llc_req;

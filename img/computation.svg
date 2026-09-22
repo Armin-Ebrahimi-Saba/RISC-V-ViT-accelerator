@@ -55,10 +55,10 @@
 <line x1="320.0" y1="302" x2="320.0" y2="316" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
 <rect x="40" y="316" width="680" height="150" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
 <circle cx="40" cy="328" r="11" fill="#e8590c"/><text x="40" y="332" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">3</text>
-<text x="56" y="332" font-weight="600" font-size="11">patch-embedding GEMM:  acc = W · colsᵀ   — one accelerator job per 64-row tile (2 tiles: 64 + 17 rows)</text>
+<text x="56" y="332" font-weight="600" font-size="11">patch-embedding GEMM:  acc = W · colsᵀ   — one accelerator job per 128-row tile (1 tile: 81 rows)</text>
 <rect x="50" y="339.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="349" font-size="9">arena</text>
-<text x="91.0" y="348" font-size="10">R  cols [81 × 588] int16, 64 rows per tile → tile RAM</text>
+<text x="91.0" y="348" font-size="10">R  cols [81 × 588] int16, 128 rows per tile → tile RAM</text>
 <rect x="50" y="352.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="362" font-size="9">blob</text>
 <text x="85.2" y="361" font-size="10">R  patch_embed.w [384 × 588] int8, streamed once per tile</text>
@@ -71,12 +71,12 @@
 <text x="165" y="426" text-anchor="middle" font-size="9">up to 8 word requests in flight; reord</text>
 <text x="165" y="437" text-anchor="middle" font-size="9">er buffer; lost response re-issued</text>
 <rect x="280" y="398" width="210" height="44" rx="4" fill="#fff5f0" stroke="#e8590c" stroke-width="1"/>
-<text x="385" y="413" text-anchor="middle" font-weight="600" font-size="10">64 multiply-accumulate units</text>
+<text x="385" y="413" text-anchor="middle" font-weight="600" font-size="10">128 multiply-accumulate units</text>
 <text x="385" y="426" text-anchor="middle" font-size="9">one int8 weight × 64 int16 activations</text>
 <text x="385" y="437" text-anchor="middle" font-size="9"> per cycle</text>
 <rect x="500" y="398" width="210" height="44" rx="4" fill="#fff5f0" stroke="#e8590c" stroke-width="1"/>
 <text x="605" y="413" text-anchor="middle" font-weight="600" font-size="10">write engine</text>
-<text x="605" y="426" text-anchor="middle" font-size="9">64 sums per weight row + {max,min}; up</text>
+<text x="605" y="426" text-anchor="middle" font-size="9">128 sums per weight row + {max,min}; up</text>
 <text x="605" y="437" text-anchor="middle" font-size="9"> to 8 writes awaiting ack</text>
 <line x1="60" y1="450" x2="700" y2="450" stroke="#e8590c" stroke-width="4"/>
 <text x="60" y="463" font-size="9.5" fill="#e8590c">the three run concurrently; the block is bound by the bus (3.2 cycles per word)</text>
@@ -422,7 +422,7 @@
 <rect x="40" y="2533" width="250" height="87" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
 <circle cx="40" cy="2545" r="11" fill="#e8590c"/>
 <text x="40" y="2549" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">22c</text>
-<text x="56" y="2549" font-weight="600" font-size="11">3×3 conv: im2col (CPU) + GEMM +</text>
+<text x="56" y="2549" font-weight="600" font-size="11">3×3 conv: gathered GEMM +</text>
 <text x="56" y="2563" font-weight="600" font-size="11">requant</text>
 <rect x="50" y="2570.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="2580" font-size="9">arena</text>
@@ -466,7 +466,7 @@
 <rect x="302" y="2519" width="250" height="73" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
 <circle cx="302" cy="2531" r="11" fill="#e8590c"/>
 <text x="302" y="2535" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">23c</text>
-<text x="318" y="2535" font-weight="600" font-size="11">3×3 conv: im2col + GEMM + requant</text>
+<text x="318" y="2535" font-weight="600" font-size="11">3×3 conv: gathered GEMM + requant</text>
 <rect x="312" y="2542.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="316" y="2552" font-size="9">arena</text>
 <text x="353.0" y="2551" font-size="10">R  cols [324 × 864]</text>
@@ -499,7 +499,7 @@
 <rect x="564" y="2466" width="250" height="73" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
 <circle cx="564" cy="2478" r="11" fill="#e8590c"/>
 <text x="564" y="2482" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">24c</text>
-<text x="580" y="2482" font-weight="600" font-size="11">3×3 conv: im2col + GEMM + requant</text>
+<text x="580" y="2482" font-weight="600" font-size="11">3×3 conv: gathered GEMM + requant</text>
 <rect x="574" y="2489.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="578" y="2499" font-size="9">arena</text>
 <text x="615.0" y="2498" font-size="10">R  cols [81 × 1728]</text>

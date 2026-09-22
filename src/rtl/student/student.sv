@@ -117,6 +117,12 @@ module student (
     .tl_host_i (host_d2h[0])
   );
 
+  // NROWS(128): 128 activation rows per tile, 128 multipliers. The weight
+  // matrix streams from DDR3 once per tile, so the encoder's 82 tokens take
+  // one pass over every weight matrix (two at 64 rows, six at 16), and the
+  // DPT head's 15876-row convolutions 125 passes. Costs 128 block RAMs and
+  // 128 DSPs of the chip's 365 and 740.
+  //
   // MAX_INFLIGHT(8): eight reads in flight. The rvlab DDR3 cache pulses its
   // response for a single cycle regardless of d_ready, so a master with more
   // than one request outstanding can lose one; this used to force 1, at
@@ -126,7 +132,7 @@ module student (
   // rather than the result. The retry counter (dbg4[31:16]) says how often
   // that happens on the board.
   student_gemm #(
-    .NROWS       (64),
+    .NROWS       (128),
     .MAX_INFLIGHT(8)
   ) gemm_i (
     .clk_i,
