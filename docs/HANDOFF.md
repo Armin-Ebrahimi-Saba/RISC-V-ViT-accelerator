@@ -10,7 +10,7 @@ detail.
 | when things happen, and the complete numbered flow of a frame | `DATAFLOW.md` |
 | what went wrong and how each thing was found | `DEBUGGING.md` |
 | the memory bugs explained with no background assumed | `DDR3_FOR_BEGINNERS.md` |
-| how the frame got 6.6x faster and what is left | `PERFORMANCE.md` |
+| how the frame got 10.8x faster and what is left | `PERFORMANCE.md` |
 | rules to carry to the next project | `LESSONS.md` |
 | how to build, simulate, and run | `../CLAUDE.md` § Run |
 
@@ -34,13 +34,14 @@ JPEG/PNG works — PIL, numpy and torch are installed in the venv.
 
 | Measurement | Value |
 |---|---|
-| Frame time | 14.2 s (0.71 G cycles at 50 MHz); was 93.6 s |
-| Frames per second | 0.070 |
+| Frame time | 8.667 s (0.433 G cycles at 50 MHz); was 93.6 s |
+| Frames per second | 0.1153 |
 | Weight load (once per session, JTAG) | ~66 s at 0.37 MB/s |
-| Image in / result out | 0.3 s / 0.7 s over the JTAG system bus |
-| Accelerator | 128 rows per tile (64 in the last measured build), 8 reads in flight, 3.2 cycles/beat, 0 retries per frame |
-| Timing, last build | pnr WNS +0.121 ns, WHS +0.030 ns, 0 failing |
-| Resources | LUT 14.8 %, BRAM 36.9 %, DSP 10.4 % |
+| Image in / result out | 0.3 s / 0.74 s over the JTAG system bus |
+| Accelerator | 128 rows per tile, 8 reads in flight, 2.2 cycles/beat, 0 retries per frame |
+| Accelerator jobs | 1268 per frame, 585 overlapped with CPU work |
+| Timing, last build | pnr WNS +0.173 ns, WHS +0.044 ns, 0 failing |
+| Resources | LUT 18.9 %, BRAM 54.4 %, DSP 20.4 % |
 
 Three defects were found and fixed in the platform's DDR3 path. None was in
 the accelerator or the model code. They are described fully in
@@ -51,9 +52,9 @@ the accelerator or the model code. They are described fully in
 2. **Cache write-back** (`rvlab_ddr_block_cache.sv`) — a line evicted the
    cycle after it was written was written back with stale contents.
 3. **Prefetcher** (`rvlab_ddr_prefetch.sv`) — returned another address's
-   data when regions collided in the cache. **Repaired** later (a slot was
-   reused while its DRAM response was in flight) and back on; not yet run
-   on the board.
+   data when regions collided in the cache. **Repaired** (a slot was
+   reused while its DRAM response was in flight) and back on, confirmed
+   working on the board.
 
 ---
 
@@ -64,7 +65,8 @@ work.
 
 - **Prefetcher** — repaired and switched back on (`USE_PREFETCH = 1`).
   Verified by `rvlab_ddr_alias_tb` (fails 65/256 on the old code, passes
-  256/256 now) and `student_gemm_ddrpath_tb`; **not yet on the board**. If
+  256/256 now), `student_gemm_ddrpath_tb`, and confirmed on the board (0
+  lost-response retries per frame, 2.2 cycles/beat, bit-exact output). If
   blob lookups start failing on the board ("tensor not found"), set it back
   to 0 first.
 - **Response skid buffer bypassed** — `USE_RSP_HOLD = 0` in the same file.
@@ -102,27 +104,22 @@ work.
   (`dav2_image.from_file` accepts anything PIL opens; feed it a frame). A
   camera on the board itself is an RTL project — see the options recorded in
   `DEBUGGING.md` § 11.
-- **Rounds two to five of the speed-up are not measured on the board**
-  (round five: residual add and ReLU inside the requantisation job).
-  Round two: LayerNorm, the adds, attention's arithmetic, `make_multiplier`,
-  and the accelerator's gather mode and `RQ_AMAX` register. Round three: a
-  128-row tile and the repaired prefetcher. Round four: the CPU working
-  while the accelerator runs (`PERFORMANCE.md` §5). All of it is
-  bit-exact on the host, and bit-exact through the accelerator emulator
-  (`dav2_host_emu`, including injected failures). The RTL passes
-  `student_gemm_tb`, `student_gemm_ddrpath_tb` and `rvlab_ddr_alias_tb`,
-  and the bitstream is built. First thing with the board:
-  1. `flow rvlab_fpga_top.program`
-  2. run the demo image
-  3. check the boot lines `self-test ok (130x64x6)`,
-     `gather self-test ok` and `add/ReLU self-test ok`
-  4. compare the result with `build/dav2/host_depth.bin`
-  5. put the measured frame time into `PERFORMANCE.md` §5.
-  If anything is wrong, the two new risks are the prefetcher
-  (`USE_PREFETCH`) and gather mode (the self-test disables it by itself).
-  The fused add/ReLU (`CTRL.add`, `CTRL.relu`) has its own boot line,
-  `add/ReLU self-test ok`; like gather mode it disables itself on a
-  mismatch (checked by breaking the emulator's ReLU on purpose).
+- ~~Rounds two to five of the speed-up are not measured on the board~~
+  **Measured**: 8.667 s per frame, bit-exact output, 15876/15876 pixels
+  identical. Round two: LayerNorm, the adds, attention's arithmetic,
+  `make_multiplier`, and the accelerator's gather mode and `RQ_AMAX`
+  register. Round three: a 128-row tile and the repaired prefetcher.
+  Round four: the CPU working while the accelerator runs (585 of 1268
+  jobs overlapped). Round five: residual add and ReLU inside the
+  requantisation job. Full profile and per-round breakdown in
+  `PERFORMANCE.md` §6. One loose end: the `add/ReLU self-test ok` boot
+  line did not appear in the captured console output on this run (the
+  GEMM and gather self-tests did appear and passed); the profile's
+  add/relu bucket (12 Mcycles, versus ~92 unfused) shows the epilogue ran
+  correctly regardless, and bit-exactness is the decisive check. Worth a
+  second look if it recurs: either a console-buffer drop (the hostio ring
+  is 1 kB and drains slowly under a burst of boot text) or the self-test
+  silently not running.
 - **Failure recovery is swept, not sampled.** `DAV2_EMU_FAIL_JOB=n` makes
   the emulator report a bus error on job *n*. A sweep over every 13th job
   of a frame (100 runs) gives a bit-identical depth map every time,
@@ -132,6 +129,10 @@ work.
 - **Requant job constraints.** M must be even and a chunk is at most 128
   columns × 1024 rows (the driver chunks). All shapes in this model comply;
   `dav2_qgemm` falls back to the CPU path for odd M.
+- **Next targets, by measured share (`PERFORMANCE.md` §7):** LayerNorm
+  (98 Mcycles), requantisation setup (97), attention (89). GEMM, add/relu
+  and im2col are no longer worth optimising — gather mode and the fused
+  epilogue took them to 15, 12 and 1 Mcycles respectively.
 
 ---
 

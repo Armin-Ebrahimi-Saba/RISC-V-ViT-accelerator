@@ -1,11 +1,14 @@
-# Performance — how one frame went from 93.6 s to 14.2 s
+# Performance — how one frame went from 93.6 s to 8.7 s
 
 This is the record of the speed-up work: what was measured, what each change
 did, and what is left. Every step kept the FPGA output **bit-exact with the
 host build** of the same C engine, and the correlation with the PyTorch
 reference on the demo image went from 0.999836 to 0.999872 along the way
 (one change in LayerNorm improved the numerics slightly; nothing was traded
-for speed).
+for speed). Sections 5–7 (rounds two to five) were developed and verified in
+simulation and on the accelerator emulator while the board was unavailable;
+§6 has the measurement taken once the board came back, confirming bit-exact
+output at 8.667 s per frame.
 
 Terms used below: *frame* — one 126×126 depth map; *GEMM* — a matrix
 multiplication, the accelerator's job; *requantisation* — turning the int32
@@ -16,34 +19,40 @@ sums a GEMM produces back into int16 activations with a per-row scale;
 
 ## 1. The result
 
-| | Start of the work | Now |
-|---|---|---|
-| Frame time (inference only) | 93.6 s | **14.2 s** |
-| Frames per second | 0.0107 | **0.0704** |
-| Result readout to the PC | ~30 s (hex text over the console) | 0.7 s (JTAG system bus) |
-| Accelerator | 16 multipliers, 1 read in flight, 8.3 cycles/beat | 64 multipliers, 8 in flight, 3.2 cycles/beat |
-| FPGA output vs host build | bit-exact | bit-exact |
-| Correlation with PyTorch (demo) | 0.999836 | 0.999872 |
-| LUT / BRAM / DSP | 12.4 % / 23.0 % / 3.1 % | 14.8 % / 36.9 % / 10.4 % |
-| Timing (WNS, 50 MHz) | +0.287 ns | +0.121 ns |
-
-Where the 14.2 s goes now (cycles at 50 MHz, from the profile the program
-prints after every frame):
-
-| Operator | Mcycles | Share | Runs on |
+| | Start of the work | After round 1 (measured) | **Current (measured, §6)** |
 |---|---|---|---|
-| LayerNorm | 128 | 18 % | CPU |
-| attention (gathers, softmax, normalisation) | 114 | 16 % | CPU; the two matmuls on the accelerator |
-| requantisation (per-row parameters, job wait) | 101 | 14 % | mostly accelerator |
-| GEMM | 93 | 13 % | accelerator |
-| residual adds, ReLU | 92 | 13 % | CPU |
-| im2col (convolution patch gather) | 67 | 9 % | CPU |
-| GELU | 51 | 7 % | CPU |
-| interpolate, misc | 63 | 9 % | CPU |
+| Frame time (inference only) | 93.6 s | 14.2 s | **8.667 s** |
+| Frames per second | 0.0107 | 0.0704 | **0.1153** |
+| Result readout to the PC | ~30 s (hex text over the console) | 0.7 s (JTAG system bus) | 0.74 s |
+| Accelerator | 16 multipliers, 1 read in flight, 8.3 cycles/beat | 64 multipliers, 8 in flight, 3.2 cycles/beat | **128 multipliers, 8 in flight, 2.2 cycles/beat** |
+| FPGA output vs host build | bit-exact | bit-exact | **bit-exact (15876/15876)** |
+| Correlation with PyTorch (demo) | 0.999836 | 0.999872 | 0.999872 |
+| LUT / BRAM / DSP | 12.4 % / 23.0 % / 3.1 % | 14.8 % / 36.9 % / 10.4 % | **18.9 % / 54.4 % / 20.4 %** |
+| Timing (WNS, 50 MHz) | +0.287 ns | +0.121 ns | **+0.173 ns** |
 
-The profile is flat. No single operator is worth more than a fifth of the
-frame any more, and everything left on the CPU is instruction count, not
-memory (see §4).
+Where the 8.667 s goes now (cycles at 50 MHz, measured on the board — see
+§6 for the full profile and how it compares to the 14.2 s breakdown below):
+
+| Operator | Mcycles (14.2 s) | Mcycles (8.7 s) | Runs on |
+|---|---|---|---|
+| LayerNorm | 128 | 98 | CPU |
+| requantisation | 101 | 97 | CPU sets up, accelerator converts (+ fused add/ReLU) |
+| attention | 114 | 89 | CPU; the two matmuls on the accelerator |
+| GELU | 51 | 60 | CPU |
+| other | — | 31 | mixed |
+| interpolate | 63* | 30 | CPU |
+| GEMM | 93 | **15** | accelerator (128-row tile, repaired prefetcher) |
+| add/relu | 92 | **12** | fused into the requantisation job (accelerator) |
+| im2col | 67 | **1** | gather mode (accelerator) |
+
+*the 14.2 s column's "interpolate, misc" bucket is split into "interpolate"
+and "other" in the 8.7 s profile.
+
+GEMM, the residual add/ReLU, and im2col are no longer worth optimising —
+gather mode and the fused epilogue removed nearly all of their CPU-side and
+accelerator-side cost. LayerNorm, requantisation setup, and attention are
+now the largest shares, and all three are CPU arithmetic, not accelerator
+time (see §4 and §7).
 
 ---
 
@@ -216,14 +225,14 @@ On this core, with these numbers, the rules are:
 
 ---
 
-## 5. Round two — implemented, verified in simulation, not yet on the board
+## 5. Round two — gather mode, known ranges, cheaper CPU arithmetic
 
-The board was unavailable for this round. Everything below is verified
-**bit-exact on the host build** (the software parts) and **in the module
-testbench** (the RTL), and the bitstream is built; the frame time on the
-board has not been measured yet. The boot self-tests guard each new
-hardware path: if one fails on the board it disables itself and the frame
-falls back to the round-one code, still correct.
+Developed and verified while the board was unavailable: **bit-exact on the
+host build** (the software parts) and **in the module testbench** (the
+RTL). Confirmed on hardware in §6: bit-exact output, gather mode's boot
+self-test passing. The boot self-tests guard each new hardware path: if one
+fails on the board it disables itself and the frame falls back to the
+round-one code, still correct.
 
 | Item | Was | Change | Where |
 |---|---|---|---|
@@ -241,12 +250,10 @@ a non-square image across two tiles) and checks `RQ_AMAX` on saturated and
 unsaturated outputs. At boot the program compares gather mode with
 im2col + the CPU kernel on a 5×4×8 image covering every border case.
 
-Build: LUT 15.2 %, BRAM 36.9 %, DSP 10.8 %, WNS +0.395 ns, WHS +0.015 ns.
+Build: LUT 15.2 %, BRAM 36.9 %, DSP 10.8 %, WNS +0.395 ns, WHS +0.015 ns
+(superseded by round three's build, below).
 
-Expected on the board: roughly 14.2 → 9–10 s. To be replaced with the
-measurement.
-
-### Round three — also not yet on the board
+### Round three — a wider tile, the prefetcher repaired
 
 | Change | Why | Verified by |
 |---|---|---|
@@ -254,7 +261,12 @@ measurement.
 | **Prefetcher repaired and back on** (`rvlab_ddr_prefetch.sv`, `USE_PREFETCH = 1`) | The accelerator measured 3.2 cycles per beat. That is one 32-byte DRAM line fill per eight beats, and the prefetcher exists to hide it. It had been bypassed for returning aliased data. The cause was a table slot reused while its DRAM response was still in flight; see `DEBUGGING.md` §5. | `rvlab_ddr_alias_tb` fails 65/256 on the old code and passes 256/256 on the new; `student_gemm_ddrpath_tb` passes with the prefetcher in the path |
 
 Build: LUT 17.6 %, BRAM 54.4 %, DSP 19.5 %, WNS +0.371 ns, WHS +0.012 ns,
-0 failing endpoints.
+0 failing endpoints (superseded by round five's build, below).
+
+Confirmed on hardware in §6: with rounds two, four and five also present,
+the accelerator measured 2.2 cycles/beat (was 3.2) and zero lost-response
+retries. The two effects (tile width, prefetcher) were not isolated on the
+board; simulation attributes the gain to both as described above.
 
 LayerNorm as an accelerator job was considered and left out. It needs
 per-row *and* per-column parameters plus a float square root per row: a
@@ -263,8 +275,9 @@ without the board to test it on.
 
 ### Round four — the CPU and the accelerator working at the same time
 
-Also not yet on the board. Software only, so the round-three bitstream still
-applies.
+Software only, so the round-three bitstream still applies. Confirmed on
+hardware in §6: 585 of the frame's 1268 accelerator jobs overlapped with
+CPU work.
 
 **What overlaps.** Almost every piece of CPU work needs the result of the
 job before it, so the overlap is narrower than it sounds. There are three
@@ -319,7 +332,7 @@ testbenches.
 
 ### Round five — the residual add and ReLU inside the requantisation job
 
-Also not yet on the board (RTL change: bitstream rebuilt).
+RTL change; bitstream rebuilt. Confirmed on hardware in §6.
 
 Each transformer block ends its attention and its MLP with a residual add,
 `x = x + GEMM(...)`. Each residual conv unit in the DPT head ends with one,
@@ -357,21 +370,60 @@ So a failure leaves `x` intact for the CPU redo, at ~0.3 Mcycles per add.
 Build: LUT 18.9 %, BRAM 54.4 %, DSP 20.4 %, WNS +0.173 ns, WHS +0.044 ns,
 0 failing endpoints.
 
-Expected gain: roughly 30 Mcycles (~0.6 s) per frame. That would move the
-estimate for the next board frame from ~7.8 s to about **7.2 s, ~0.14 FPS**.
+Measured on the board (§6): the add/relu bucket fell to 12 Mcycles, from
+92 Mcycles before round five — bigger than the 30 Mcycles estimated here,
+because the CPU-side estimate did not account for the fused path also
+removing the accumulator scan that used to precede every add.
 
-## 6. What is left, in order of expected gain
-| Item | Now | Estimate | How |
+## 6. Measured on the board: 14.2 s → 8.667 s, bit-exact
+
+Rounds two to five, run on hardware together for the first time. Output is
+**bit-exact with the host build, 15876/15876 pixels**, confirming every
+round's simulation and emulator verification.
+
+| | Value |
+|---|---|
+| Frame time | 8.667 s (433.31 Mcycles at 50 MHz) |
+| Frames per second | 0.1153 |
+| Accelerator | 128 rows/pass, 2.2 cycles/beat (was 3.2), 0 lost-response retries |
+| Accelerator jobs | 1268 total, 585 overlapped with CPU work (round four) |
+| Result readout | 0.74 s |
+| Boot self-tests | GEMM and gather-mode self-tests printed and passed; the add/ReLU self-test's confirmation line did not appear in the captured console output (the hostio ring is 1 kB, drained slowly over JTAG, and can drop a line under a burst of boot text) — but the add/relu profile bucket (12 Mcycles, versus ~92 unfused) shows the fused epilogue ran on hardware; bit-exactness is the decisive check |
+
+Measured profile (433.31 Mcycles), compared to the round-one baseline:
+
+| Operator | 14.2 s (Mcycles) | 8.7 s (Mcycles) | Change |
 |---|---|---|---|
-| LayerNorm per element | 128 Mcycles | −80 | one pass storing the Q16 value instead of two computing it (memory is cheap, instructions are not); or a third accelerator job |
-| attention CPU side | 114 | −60 | gather/split loops unrolled; softmax exponent in a small LUT |
-| per-row float work in requant | ~70 | −50 | integer `make_multiplier` (frexp is a bit scan) |
-| residual adds | 92 | −40 | fuse the range scan into the previous operator's output pass |
-| im2col | 67 | −60 | a gather mode in the accelerator's A-load (read rows at a stride with a window) |
-| GELU | 51 | −30 | unroll; LUT index arithmetic on packed pairs |
-| GEMM | 93 | −40 | prefetcher repaired and 128-row tile (round three, unmeasured); larger cache lines |
+| GEMM (accelerator) | 93 | **15** | −84 %, from the 128-row tile and the repaired prefetcher |
+| add/relu | 92 | **12** | −87 %, fused into the requantisation job |
+| im2col | 67 | **1** | −99 %, gather mode built the patches in hardware |
+| LayerNorm | 128 | 98 | −23 %, single-pass fixed point |
+| requantisation | 101 | 97 | −4 %; cheaper per-row setup, but now the largest CPU-side share since GEMM shrank around it |
+| attention | 114 | 89 | −22 % |
+| GELU | 51 | 60 | +18 % relative share grew as everything around it shrank; unchanged code |
+| interpolate + other | 63 | 61 | ~flat |
 
-All of these together would land around 6–7 s per frame. Beyond that the
-weights themselves — 25 MB crossing DDR3 twice per frame at ~3 cycles per
-word — set a floor near 3 s at 50 MHz; a faster fabric clock or a wider
-bus would be the next step.
+The three items rounds two, three and five targeted directly — GEMM,
+add/relu, im2col — are no longer worth further optimisation. **LayerNorm,
+requantisation setup, and attention are now the largest shares, and all
+three are CPU arithmetic that never touches the accelerator.** This
+replaces the estimate-based priority list that follows; §7 reflects it.
+
+## 7. What is left, in order of expected gain
+
+Based on the measured 8.667 s profile (§6), not the earlier estimate.
+
+| Item | Now (measured) | Estimate | How |
+|---|---|---|---|
+| LayerNorm | 98 Mcycles | −40 | per-row `1/sqrt` still calls the soft-float library; a fixed-point Newton iteration or a small LUT plus one correction step would remove it. A third accelerator job (row and column parameters, per-row `1/sqrt`) is the alternative considered and rejected in round three: real gain, real hardware risk. |
+| requantisation setup | 97 | −40 | `make_multiplier` still runs once per weight row per GEMM (~45 000 calls/frame) on the CPU. Half of it could move into the requant job itself: the block already knows the row range from its own drain, so shift/multiplier derivation could become a small per-row hardware step instead of a CPU one, ahead of the streamed conversion. |
+| attention | 89 | −30 | the softmax's 2^-x approximation and the per-head gather/split loops are the largest remaining scalar loops on the CPU; further unrolling and moving the score-shift search into the accelerator's own row-max output (already available from `S_hi`/`S_lo`'s GEMM) would help. |
+| GELU | 60 | −15 | already unrolled and packed two elements per word (`GELU_LUT` on `lo16`/`hi16`); the per-element cost is two data-dependent loads from the 257-entry table for the interpolation, which is inherent to linear interpolation and not removable without a coarser table. The 257-entry table itself is rebuilt in float once per call (12 times/frame); a cheaper table build is the more likely gain here. |
+| interpolate + other | 61 | −15 | never profiled in detail; the bilinear resize loops in the DPT head are the largest remaining candidate. |
+| GEMM, add/relu, im2col | 28 combined | ~0 | at 2.2 cycles/beat and mostly overlapped with CPU work, these are no longer worth further hardware changes on their own. |
+
+All of these together would land around 6–6.5 s per frame. Beyond that the
+weights themselves — 25 MB crossing DDR3 once per frame at ~2.2 cycles per
+word — set a floor near 2.5–3 s at 50 MHz; a faster fabric clock or a wider
+bus would be the next step, and the one most likely to need care around the
+DDR3 path where the platform's three defects were found.
