@@ -4,10 +4,9 @@
  * Deterministic kernel self-test.
  *
  * Purpose: prove that the RISC-V build of the engine computes bit-identically
- * to the host build. Every kernel in the engine is integer, and the float
- * bookkeeping is IEEE-754 single precision on both sides (libgcc soft-float on
- * the CV32E40P), so the checksum must match exactly. A mismatch points at the
- * toolchain, the soft-float path, or a 32-bit assumption -- not at the model.
+ * to the host build. The engine is all integer, scales included (dav2_xf.h),
+ * so the checksum must match exactly. A mismatch points at the toolchain or
+ * a 32-bit assumption -- not at the model.
  *
  * It is deliberately small (a few hundred thousand cycles, a 32 KB arena in
  * BRAM) so it can run inside an RTL simulation, where a full 126x126 inference
@@ -15,7 +14,6 @@
  */
 
 #include "dav2.h"
-#include "dav2_mathf.h"
 
 #include <stdio.h>
 
@@ -52,19 +50,19 @@ static uint32_t hash_update(uint32_t h, const void *data, int nbytes)
 static uint32_t hash_tensor(uint32_t h, const dav2_tensor_t *t)
 {
     h = hash_update(h, t->v, t->n * t->c * (int)sizeof(int16_t));
-    h = hash_update(h, &t->scale, (int)sizeof(float));
+    h = hash_update(h, &t->scale, (int)sizeof(dav2_xf_t));
     return h;
 }
 
-static void fill_qw(dav2_qw_t *w, int8_t *wbuf, float *sbuf, float *bbuf,
+static void fill_qw(dav2_qw_t *w, int8_t *wbuf, dav2_xf_t *sbuf, dav2_xf_t *bbuf,
                     int m, int k, int with_bias)
 {
     for (int i = 0; i < m * k; i++)
         wbuf[i] = (int8_t)((int32_t)(rng_next() % 255u) - 127);
     for (int i = 0; i < m; i++) {
-        sbuf[i] = (float)(1 + (rng_next() % 1000u)) * 1e-5f;
+        sbuf[i] = xf_norm(1 + (rng_next() % 1000u), 17);               /* ~1e-5..1e-2 */
         if (bbuf)
-            bbuf[i] = (float)((int32_t)(rng_next() % 2000u) - 1000) * 1e-3f;
+            bbuf[i] = xf_norm((int32_t)(rng_next() % 2000u) - 1000, 10);  /* ~+-1 */
     }
     w->w = wbuf;
     w->s = sbuf;
@@ -80,13 +78,13 @@ uint32_t dav2_selftest(void)
     dav2_arena_init(selftest_arena, sizeof(selftest_arena));
 
     static int8_t wbuf[64 * 72];
-    static float  sbuf[64], bbuf[64];
+    static dav2_xf_t sbuf[64], bbuf[64];
 
     /* --- GEMM: the kernel that dominates the whole network ------------- */
     {
         dav2_tensor_t a = dav2_tensor_new(8, 32);
         for (int i = 0; i < 8 * 32; i++) a.v[i] = rng_act();
-        a.scale = 1.234e-3f;
+        a.scale = xf_norm(1294, 20);              /* ~1.234e-3 */
 
         dav2_qw_t w;
         fill_qw(&w, wbuf, sbuf, bbuf, 16, 32, 1);
@@ -101,26 +99,26 @@ uint32_t dav2_selftest(void)
         h = hash_tensor(h, &out);
     }
 
-    /* --- LayerNorm: exercises int64 accumulation and dav2_sqrtf -------- */
+    /* --- LayerNorm: exercises int64 accumulation and xf_rsqrt ---------- */
     {
         dav2_tensor_t a = dav2_tensor_new(6, 64);
         for (int i = 0; i < 6 * 64; i++) a.v[i] = rng_act();
-        a.scale = 5.5e-4f;
-        static float g[64], b[64];
+        a.scale = xf_norm(577, 20);               /* ~5.5e-4 */
+        static int32_t g[64], b[64];              /* Q15 and Q16 */
         for (int i = 0; i < 64; i++) {
-            g[i] = 0.5f + (float)(rng_next() % 100u) * 0.01f;
-            b[i] = (float)((int32_t)(rng_next() % 200u) - 100) * 0.001f;
+            g[i] = 16384 + (int32_t)(rng_next() % 100u) * 328;         /* 0.5..1.5 */
+            b[i] = ((int32_t)(rng_next() % 200u) - 100) * 66;          /* +-0.1 */
         }
         dav2_tensor_t out = dav2_tensor_new(6, 64);
         dav2_layernorm(&a, g, b, &out);
         h = hash_tensor(h, &out);
     }
 
-    /* --- GELU: exercises the LUT build (erf, exp) and interpolation ---- */
+    /* --- GELU: exercises the LUT build (Phi table) and interpolation --- */
     {
         dav2_tensor_t a = dav2_tensor_new(4, 64);
         for (int i = 0; i < 4 * 64; i++) a.v[i] = rng_act();
-        a.scale = 2.0e-3f;
+        a.scale = xf_norm(2097, 20);              /* ~2e-3 */
         dav2_gelu(&a);
         h = hash_tensor(h, &a);
     }
@@ -130,8 +128,8 @@ uint32_t dav2_selftest(void)
         dav2_tensor_t a = dav2_tensor_new(4, 32);
         dav2_tensor_t b = dav2_tensor_new(4, 32);
         for (int i = 0; i < 4 * 32; i++) { a.v[i] = rng_act(); b.v[i] = rng_act(); }
-        a.scale = 1.0e-3f;
-        b.scale = 7.3e-5f;
+        a.scale = xf_norm(1049, 20);              /* ~1e-3 */
+        b.scale = xf_norm(77, 20);                /* ~7.3e-5 */
         dav2_tensor_t out = dav2_tensor_new(4, 32);
         dav2_add(&a, &b, &out);
         h = hash_tensor(h, &out);
@@ -141,7 +139,7 @@ uint32_t dav2_selftest(void)
     {
         dav2_tensor_t in = dav2_tensor_new(6 * 6, 8);
         for (int i = 0; i < 6 * 6 * 8; i++) in.v[i] = rng_act();
-        in.scale = 9.0e-4f;
+        in.scale = xf_norm(944, 20);              /* ~9e-4 */
         dav2_qw_t w;
         fill_qw(&w, wbuf, sbuf, bbuf, 8, 9 * 8, 1);
         int oh, ow;
@@ -167,22 +165,19 @@ uint32_t dav2_selftest(void)
         dav2_arena_release(mark);
     }
 
-    /* --- float helpers, checked by bit pattern ------------------------- */
+    /* --- the integer real-number routines (dav2_xf.h) ------------------ */
     {
-        float probes[6];
-        probes[0] = dav2_sqrtf(2.0f);
-        probes[1] = dav2_expf(-3.25f);
-        probes[2] = dav2_erff(0.75f);
-        probes[3] = dav2_gelu_f(-1.5f);
-        int e;
-        probes[4] = dav2_frexpf(1234.5f, &e);
-        probes[5] = (float)e;
+        dav2_xf_t probes[6];
+        probes[0] = xf_rsqrt(xf_from_int(2));
+        probes[1] = xf_recip(xf_from_int(7));
+        probes[2] = xf_add(xf_norm(3, 5), xf_norm(-7, 9));
+        probes[3] = xf_mul(xf_norm(-12345, 20), xf_norm(6789, 3));
+        probes[4] = xf_from_f32_bits(0x3fb8aa3bu);          /* 1.4426950f */
+        probes[5] = xf_norm((int64_t)1 << 40, 0);
         h = hash_update(h, probes, (int)sizeof(probes));
 
-        int32_t mult; int shift;
-        dav2_make_multiplier(3.7e-5f, &mult, &shift);
-        h = hash_update(h, &mult, (int)sizeof(mult));
-        h = hash_update(h, &shift, (int)sizeof(shift));
+        int64_t r[2] = { xf_round(xf_norm(5, 1), 0), xf_round(xf_norm(-5, 1), 0) };
+        h = hash_update(h, r, (int)sizeof(r));             /* 2.5 -> 3, -2.5 -> -3 */
     }
 
     return h;

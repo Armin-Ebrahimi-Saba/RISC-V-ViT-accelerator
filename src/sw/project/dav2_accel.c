@@ -775,7 +775,7 @@ int dav2_accel_bigcheck(int N, int K, int M)
         w[i] = (int8_t)((int32_t)(chk_rand(&seed) % 255u) - 127);
     for (int i = 0; i < N * M; i++) { hw[i] = 0; sw[i] = 0; }
 
-    dav2_tensor_t at = { a, 1.0f, N, K, -1 };
+    dav2_tensor_t at = { a, XF_ONE, N, K, -1 };
     dav2_qw_t     wt = { w, 0, 0, M, K };
 
     dav2_qgemm_cpu(a, w, sw, N, K, M);
@@ -949,7 +949,7 @@ int dav2_accel_check(void)
     for (int i = 0; i < CHK_M * CHK_K; i++)
         chk_w[i] = (int8_t)((int32_t)(chk_rand(&seed) % 255u) - 127);
 
-    dav2_tensor_t a = { chk_a, 1.0f, CHK_N, CHK_K, -1 };
+    dav2_tensor_t a = { chk_a, XF_ONE, CHK_N, CHK_K, -1 };
     dav2_qw_t     w = { chk_w, 0, 0, CHK_M, CHK_K };
 
     dav2_qgemm_cpu(chk_a, chk_w, chk_sw, CHK_N, CHK_K, CHK_M);

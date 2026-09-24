@@ -17,7 +17,6 @@
 
 #include "dav2.h"
 #include "dav2_accel.h"
-#include "dav2_mathf.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -25,12 +24,12 @@
 /* Input image, supplied by the caller through dav2_set_image(). Kept as a
  * pointer rather than copied: on the board it is 95 kB in DDR3. */
 static const int16_t *g_image;
-static float          g_image_scale = 1.0f;
+static dav2_xf_t      g_image_scale = XF_ONE;
 
-void dav2_set_image(const int16_t *hwc, float scale)
+void dav2_set_image(const int16_t *hwc, uint32_t scale_f32_bits)
 {
     g_image = hwc;
-    g_image_scale = scale;
+    g_image_scale = xf_from_f32_bits(scale_f32_bits);
 }
 
 extern const void *dav2_find_quiet(const char *name);
@@ -260,11 +259,12 @@ static void attn_softmax(const dav2_tensor_t *qkv, int n, attn_bufs_t *b)
      * it must be carried as a (mult, shift) pair rather than a plain Q16
      * integer -- rounding it into a Q16 constant collapses it to 0 or 1 and
      * flattens the whole distribution. */
-    float score_scale = qkv->scale * qkv->scale
-                      * (float)(1 << b->q_sh) * (float)(1 << b->k_sh);
-    float kf = score_scale * 1.4426950408889634f;   /* -> exponent base 2 */
+    dav2_xf_t score_scale = xf_mul(qkv->scale, qkv->scale);
+    score_scale.sh -= b->q_sh + b->k_sh;                /* * 2^q_sh * 2^k_sh */
+    /* -> exponent base 2: * log2(e), the float32 1.4426950f (0x3fb8aa3b) */
+    dav2_xf_t kf = xf_mul(score_scale, xf_from_f32_bits(0x3fb8aa3bu));
     int32_t kmult; int kshift;
-    dav2_make_multiplier(kf, &kmult, &kshift);
+    xf_to_mult(kf, &kmult, &kshift);
 
     int32_t *scores = (int32_t *)dav2_scratch;   /* q/k are no longer needed */
     for (int t = 0; t < n; t++) {
@@ -426,7 +426,7 @@ static void attention_all(const dav2_tensor_t *qkv, int n_tokens, dav2_tensor_t 
 
 typedef struct {
     dav2_qw_t qkv, proj, fc1, fc2;
-    const float *n1w, *n1b, *n2w, *n2b;
+    const int32_t *n1w, *n1b, *n2w, *n2b;   /* LayerNorm gamma Q15, beta Q16 */
 } block_w_t;
 
 static void load_block(block_w_t *bw, int i)
@@ -439,10 +439,10 @@ static void load_block(block_w_t *bw, int i)
     sprintf(nm, "%sfc1", base);  dav2_qw(&bw->fc1, nm, DAV2_EMBED_DIM);
     sprintf(nm, "%sfc2", base);  dav2_qw(&bw->fc2, nm, 4 * DAV2_EMBED_DIM);
 
-    sprintf(nm, "%snorm1.w", base); bw->n1w = (const float *)dav2_find(nm, 0);
-    sprintf(nm, "%snorm1.b", base); bw->n1b = (const float *)dav2_find(nm, 0);
-    sprintf(nm, "%snorm2.w", base); bw->n2w = (const float *)dav2_find(nm, 0);
-    sprintf(nm, "%snorm2.b", base); bw->n2b = (const float *)dav2_find(nm, 0);
+    sprintf(nm, "%snorm1.w", base); bw->n1w = (const int32_t *)dav2_find(nm, 0);
+    sprintf(nm, "%snorm1.b", base); bw->n1b = (const int32_t *)dav2_find(nm, 0);
+    sprintf(nm, "%snorm2.w", base); bw->n2w = (const int32_t *)dav2_find(nm, 0);
+    sprintf(nm, "%snorm2.b", base); bw->n2b = (const int32_t *)dav2_find(nm, 0);
 }
 
 /* One transformer block, in place on x. */
@@ -594,7 +594,7 @@ void dav2_prof_report(uint64_t frame_cycles)
 
 /* ------------------------------------------------------------------ main */
 
-void dav2_infer(const dav2_cfg_t *cfg, float *depth_out)
+void dav2_infer(const dav2_cfg_t *cfg, int16_t *depth_q, dav2_xf_t *depth_scale)
 {
     const int ED = DAV2_EMBED_DIM;
     const int grid = cfg->grid;
@@ -631,21 +631,10 @@ void dav2_infer(const dav2_cfg_t *cfg, float *depth_out)
                                             &pe_w, DAV2_PATCH, DAV2_PATCH, 0,
                                             0, 0);
         /* prepend the class token and add the (pre-interpolated) position
-         * embedding; both are float in the blob, so this is done in float and
-         * requantised once. */
-        const float *cls = (const float *)dav2_find("cls_token", 0);
-        const float *pos = (const float *)dav2_find("pos_embed", 0);
-        size_t mark = dav2_arena_mark();
-        float *tmp = (float *)dav2_arena_alloc((size_t)n_tokens * ED * sizeof(float));
-        for (int c = 0; c < ED; c++)
-            tmp[c] = cls[c] + pos[c];
-        for (int p = 0; p < n_patch; p++)
-            for (int c = 0; c < ED; c++)
-                tmp[(size_t)(p + 1) * ED + c] =
-                    (float)patches.v[(size_t)p * ED + c] * patches.scale
-                    + pos[(size_t)(p + 1) * ED + c];
-        dav2_quantize_f32(tmp, n_tokens, ED, &x);
-        dav2_arena_release(mark);
+         * embedding, both Q24 integers in the blob, then requantise once */
+        const int32_t *cls = (const int32_t *)dav2_find("cls_token", 0);
+        const int32_t *pos = (const int32_t *)dav2_find("pos_embed", 0);
+        dav2_embed_tokens(&patches, cls, pos, &x);
     }
 
 #ifdef DAV2_TRACE
@@ -653,8 +642,8 @@ void dav2_infer(const dav2_cfg_t *cfg, float *depth_out)
 #endif
 
     /* ---- transformer blocks, capturing the four DPT taps --------------- */
-    const float *nw = (const float *)dav2_find("norm.w", 0);
-    const float *nbf = (const float *)dav2_find("norm.b", 0);
+    const int32_t *nw = (const int32_t *)dav2_find("norm.w", 0);
+    const int32_t *nbf = (const int32_t *)dav2_find("norm.b", 0);
 
     dav2_tensor_t feats[4];
     for (int i = 0; i < 4; i++)
@@ -756,8 +745,10 @@ void dav2_infer(const dav2_cfg_t *cfg, float *depth_out)
     dav2_tensor_t c2 = dav2_conv2d_ex(&up, out_size, out_size, &o2a, 3, 1, 1, 0, 1, &oh, &ow);
     dav2_tensor_t c3 = dav2_conv2d_ex(&c2, out_size, out_size, &o2b, 1, 1, 0, 0, 1, &oh, &ow);
 
-    for (int i = 0; i < out_size * out_size; i++)
-        depth_out[i] = (float)c3.v[i] * c3.scale;
+    /* int16 depth and its scale; converting to float is the caller's
+     * choice (the board leaves it to the PC) */
+    dav2_copy16(depth_q, c3.v, (size_t)out_size * out_size);
+    *depth_scale = c3.scale;
 
     dav2_progress("done");
     dav2_prof_report(dav2_cycles() - t_frame);

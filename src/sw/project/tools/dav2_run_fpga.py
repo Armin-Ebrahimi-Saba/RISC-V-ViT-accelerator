@@ -8,7 +8,8 @@ Sequence:
   2. wait for the program to initialise DDR3 and print DAV2_WAITING_FOR_WEIGHTS
   3. push the ~25 MB weight blob into DDR3 at 0x80000000 over JTAG (~1 min)
   4. write the handshake word so the program starts inference (~95 s)
-  5. stream stdout, capture the hex-encoded depth map and save it as .npy
+  5. read the int16 depth map and its scale from DDR3, convert it to float32
+     and save it as .npy
 
 Usage (from the repository root, after `source .venv/bin/activate`):
 
@@ -40,6 +41,7 @@ Two traps this script avoids, both learned the hard way:
     OpenOCD a live run depends on. Peek with a raw socket instead.
 """
 import argparse
+import math
 import subprocess
 import random
 import re
@@ -63,7 +65,7 @@ GO_FRAME   = 0xF00DF00D   # host -> device: a new image is at IMAGE_ADDR
 GO_DONE    = 0xD0DEC0DE   # device -> host: result printed, ready for the next
 IMAGE_ADDR = 0x81E00000   # where each input image goes; see main.c
 # The result's address is not hard-coded here: the program prints it in its
-# "DAV2_RESULT <count> <addr>" line, so main.c owns that number.
+# "DAV2_RESULT_Q <count> <addr>" line, so main.c owns that number.
 
 
 def read_hostio(ocd):
@@ -344,25 +346,33 @@ def run_frame(ocd, go, img_bytes, tmpdir, timeout, buf):
 def fetch_result(ocd, text, tmpdir):
     """Read the depth map the program left in DDR3.
 
-    The program prints "DAV2_RESULT <count> <addr>" and nothing else; the
-    63 kB of floats come back over the JTAG system bus with dump_image in
-    about 0.2 s. The earlier design printed them as hex through the console
-    and took ~30 s per frame for it. Sysbus reads go through the same DDR3
-    cache the CPU wrote, so what comes back is what the program computed.
+    The program prints "DAV2_RESULT_Q <count> <addr>". At <addr> lie the
+    scale as two int32 (m, sh) and then <count> int16 values; the depth is
+    q * m * 2^-sh. The board has no FPU, so the conversion to float is done
+    here, exactly as dav2_host does it: the product is exact in float64 and
+    is rounded once to float32. The result is therefore bit-identical to
+    dav2_host's output file. The 32 kB come back over the JTAG system bus
+    with dump_image. Sysbus reads go through the same DDR3 cache the CPU
+    wrote, so what comes back is what the program computed.
     """
-    m = re.search(r"DAV2_RESULT (\d+) (0x[0-9a-fA-F]+)", text)
+    m = re.search(r"DAV2_RESULT_Q (\d+) (0x[0-9a-fA-F]+)", text)
     if not m:
         print("no depth map announced in program output")
         return None
     count, addr = int(m.group(1)), int(m.group(2), 16)
+    nbytes = 8 + 2 * count
     f = Path(tmpdir) / "result.bin"
     t0 = time.time()
-    ocd.cmd(f"dump_image {{{f}}} 0x{addr:08x} {count * 4}")
+    ocd.cmd(f"dump_image {{{f}}} 0x{addr:08x} {nbytes}")
     raw = f.read_bytes()
     print(f"  result read in {time.time() - t0:.2f} s", flush=True)
-    if len(raw) != count * 4:
-        print(f"warning: expected {count*4} bytes, got {len(raw)}")
-    return raw[:count * 4]
+    if len(raw) < nbytes:
+        print(f"warning: expected {nbytes} bytes, got {len(raw)}")
+        return None
+    sm, ssh = struct.unpack_from("<2i", raw, 0)
+    scale = math.ldexp(sm, -ssh)
+    q = struct.unpack_from("<%dh" % count, raw, 8)
+    return struct.pack("<%df" % count, *[v * scale for v in q])
 
 
 def probe_stall(ocd):

@@ -33,8 +33,10 @@ int dav2_blob_check(void)
         return 1;
     }
     if (blob_hdr->version != DAV2_VERSION) {
-        printf("dav2: blob version %lu, engine expects %lu\n",
-               (unsigned long)blob_hdr->version, (unsigned long)DAV2_VERSION);
+        printf("dav2: blob version %lu, engine expects %lu%s\n",
+               (unsigned long)blob_hdr->version, (unsigned long)DAV2_VERSION,
+               blob_hdr->version == 2u
+                   ? " -- convert it with tools/dav2_blob_int.py" : "");
         return 1;
     }
     return 0;
@@ -101,10 +103,10 @@ void dav2_qw(dav2_qw_t *out, const char *base, int expect_k)
     const uint32_t *dims = dav2_find_dims(buf);
 
     strcpy(buf, base); strcat(buf, ".s");
-    out->s = (const float *)dav2_find(buf, 0);
+    out->s = (const dav2_xf_t *)dav2_find(buf, 0);     /* (m, sh) pairs */
 
     strcpy(buf, base); strcat(buf, ".b");
-    out->b = (const float *)dav2_find_quiet(buf);
+    out->b = (const dav2_xf_t *)dav2_find_quiet(buf);
 
     if (dims) {
         out->m = (int)dims[0];

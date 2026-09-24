@@ -2,7 +2,7 @@
 <rect width="100%" height="100%" fill="#fff"/>
 <defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#222"/></marker></defs>
 <text x="20" y="30" font-size="16" font-weight="700">One frame of Depth-Anything V2 on the board: every computation, in order</text>
-<text x="20" y="48" font-size="11">Shapes are [rows × columns] of the matrix the operation sees; int16 activations, int8 weights, int32 sums, f32 = 32-bit float. 82 tokens = 81 patches + 1 class token; 384 = the model width.</text>
+<text x="20" y="48" font-size="11">Shapes are [rows × columns] of the matrix the operation sees; int16 activations, int8 weights, int32 sums, xf = m·2^−sh (two int32), f32 = float. 82 tokens = 81 patches + 1 class; 384 = width.</text>
 <rect x="20" y="66" width="14" height="14" rx="3" fill="#fff" stroke="#1c7ed6" stroke-width="1.6"/><text x="40" y="77" font-size="10.5">runs on the CPU</text>
 <rect x="150" y="66" width="14" height="14" rx="3" fill="#fff" stroke="#e8590c" stroke-width="1.6"/><text x="170" y="77" font-size="10.5">runs on the accelerator (inside every such job: read engine ∥ 128 multipliers ∥ write engine, see 3)</text>
 <rect x="700" y="66" width="14" height="14" rx="3" fill="#fff" stroke="#868e96" stroke-width="1.6"/><text x="720" y="77" font-size="10.5">runs on the PC</text>
@@ -90,10 +90,10 @@
 <text x="91.0" y="512" font-size="10">R  stats [1 × 384 × {max,min}]</text>
 <rect x="50" y="516.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="526" font-size="9">blob</text>
-<text x="85.2" y="525" font-size="10">R  patch_embed scale [384] f32, bias [384] f32</text>
+<text x="85.2" y="525" font-size="10">R  patch_embed scale [384] xf, bias [384] xf</text>
 <rect x="50" y="529.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="539" font-size="9">arena</text>
-<text x="91.0" y="538" font-size="10">W  params [384 × {mult, shift, bias}] int32; one output scale (f32) for the tensor</text>
+<text x="91.0" y="538" font-size="10">W  params [384 × {mult, shift, bias}] int32; one output scale (xf) for the tensor</text>
 <line x1="320.0" y1="553" x2="320.0" y2="567" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
 <rect x="40" y="567" width="560" height="85" rx="6" fill="#fff" stroke="#e8590c" stroke-width="1.6"/>
 <circle cx="40" cy="579" r="11" fill="#e8590c"/>
@@ -113,13 +113,13 @@
 <rect x="40" y="666" width="560" height="73" rx="6" fill="#fff" stroke="#1c7ed6" stroke-width="1.6"/>
 <circle cx="40" cy="678" r="11" fill="#1c7ed6"/>
 <text x="40" y="682" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">6</text>
-<text x="56" y="682" font-weight="600" font-size="11">tokens:  x = [cls + pos₀ ;  emb + pos₁..₈₁]   (in float, requantised once)</text>
+<text x="56" y="682" font-weight="600" font-size="11">tokens:  x = [cls + pos₀ ;  emb + pos₁..₈₁]   (Q24 integers, requantised once)</text>
 <rect x="50" y="689.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="699" font-size="9">arena</text>
 <text x="91.0" y="698" font-size="10">R  emb [81 × 384]</text>
 <rect x="50" y="702.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="712" font-size="9">blob</text>
-<text x="85.2" y="711" font-size="10">R  cls_token [384] f32,  pos_embed [82 × 384] f32</text>
+<text x="85.2" y="711" font-size="10">R  cls_token [384] Q24,  pos_embed [82 × 384] Q24</text>
 <rect x="50" y="715.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="725" font-size="9">arena</text>
 <text x="91.0" y="724" font-size="10">W  x [82 × 384] int16  — the token matrix every block updates</text>
@@ -136,7 +136,7 @@
 <text x="91.0" y="831" font-size="10">R  x [82 × 384]</text>
 <rect x="50" y="835.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="845" font-size="9">blob</text>
-<text x="85.2" y="844" font-size="10">R  norm1 γ, β [384] f32</text>
+<text x="85.2" y="844" font-size="10">R  norm1 γ, β [384] Q15, Q16</text>
 <rect x="50" y="848.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="858" font-size="9">arena</text>
 <text x="91.0" y="857" font-size="10">W  n [82 × 384] int16</text>
@@ -314,7 +314,7 @@
 <text x="91.0" y="1775" font-size="10">R  x [82 × 384]</text>
 <rect x="50" y="1779.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="1789" font-size="9">blob</text>
-<text x="85.2" y="1788" font-size="10">R  norm2 γ, β [384] f32</text>
+<text x="85.2" y="1788" font-size="10">R  norm2 γ, β [384] Q15, Q16</text>
 <rect x="50" y="1792.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="1802" font-size="9">arena</text>
 <text x="91.0" y="1801" font-size="10">W  n2 [82 × 384]</text>
@@ -379,7 +379,7 @@
 <text x="91.0" y="2198" font-size="10">R  x [82 × 384]</text>
 <rect x="50" y="2202.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="2212" font-size="9">blob</text>
-<text x="85.2" y="2211" font-size="10">R  norm γ, β [384] f32 (the final norm)</text>
+<text x="85.2" y="2211" font-size="10">R  norm γ, β [384] Q15, Q16 (the final norm)</text>
 <rect x="50" y="2215.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="2225" font-size="9">arena</text>
 <text x="91.0" y="2224" font-size="10">W  feats[i] [81 × 384] int16,  i = 0..3  (a 9 × 9 grid of 384-vectors)</text>
@@ -679,13 +679,13 @@
 <rect x="40" y="3470" width="760" height="60" rx="6" fill="#fff" stroke="#1c7ed6" stroke-width="1.6"/>
 <circle cx="40" cy="3482" r="11" fill="#1c7ed6"/>
 <text x="40" y="3486" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">34</text>
-<text x="56" y="3486" font-weight="600" font-size="11">to float:  depth = d · scale;  raise the done flag</text>
+<text x="56" y="3486" font-weight="600" font-size="11">publish:  int16 d and its scale;  raise the done flag</text>
 <rect x="50" y="3493.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="3503" font-size="9">arena</text>
 <text x="91.0" y="3502" font-size="10">R  d [126×126] int16</text>
 <rect x="50" y="3506.5" width="43" height="12" rx="3" fill="#ffe8cc" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="3516" font-size="9">result</text>
-<text x="96.8" y="3515" font-size="10">W  depth [126 × 126] f32, 63 kB</text>
+<text x="96.8" y="3515" font-size="10">W  depth [126 × 126] int16 + scale, 32 kB</text>
 <line x1="420.0" y1="3530" x2="420.0" y2="3542" stroke="#222" stroke-width="1.4" marker-end="url(#ar)"/>
 <rect x="40" y="3542" width="760" height="60" rx="6" fill="#fff" stroke="#868e96" stroke-width="1.6"/>
 <circle cx="40" cy="3554" r="11" fill="#868e96"/>
@@ -693,7 +693,7 @@
 <text x="56" y="3558" font-weight="600" font-size="11">read the depth map over JTAG (0.7 s), save .npy, compare with the host build (bit-exact), render</text>
 <rect x="50" y="3565.5" width="43" height="12" rx="3" fill="#ffe8cc" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="3575" font-size="9">result</text>
-<text x="96.8" y="3574" font-size="10">R  depth [126 × 126] f32</text>
+<text x="96.8" y="3574" font-size="10">R  depth [126 × 126] int16 + scale</text>
 <rect x="50" y="3578.5" width="20" height="12" rx="3" fill="#e9ecef" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="3588" font-size="9">pc</text>
 <text x="73.6" y="3587" font-size="10">W  fpga_depth_&lt;name&gt;.npy, PNG</text>

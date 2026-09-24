@@ -16,6 +16,7 @@
 #include "../dav2.h"
 #include "../dav2_accel.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <time.h>
 
@@ -91,8 +92,10 @@ int main(int argc, char **argv)
         if (fread(img, 1, (size_t)ni, fi) != (size_t)ni) { perror("read image"); return 1; }
         fclose(fi);
         float scale;
+        uint32_t scale_bits;
         memcpy(&scale, img + ni - 4, 4);
-        dav2_set_image((const int16_t *)img, scale);
+        memcpy(&scale_bits, img + ni - 4, 4);
+        dav2_set_image((const int16_t *)img, scale_bits);
         printf("loaded %ld-byte image, scale %g\n", ni, scale);
     }
 
@@ -101,7 +104,10 @@ int main(int argc, char **argv)
     dav2_cfg_t cfg = { DAV2_INPUT_SIZE, DAV2_PATCH_GRID, DAV2_N_TOKENS };
 
     const int out_size = cfg.grid * DAV2_PATCH;
-    float *depth = (float *)malloc((size_t)out_size * out_size * sizeof(float));
+    const int npix = out_size * out_size;
+    int16_t *depth_q = (int16_t *)host_alloc((size_t)npix * sizeof(int16_t));
+    float *depth = (float *)malloc((size_t)npix * sizeof(float));
+    dav2_xf_t depth_scale;
 
 #ifdef DAV2_ACCEL_EMU
     /* the board's boot sequence: probe, then the GEMM and gather self-tests */
@@ -110,7 +116,13 @@ int main(int argc, char **argv)
 #endif
     printf("running inference at %dx%d (%d patches)\n",
            cfg.size, cfg.size, cfg.grid * cfg.grid);
-    dav2_infer(&cfg, depth);
+    dav2_infer(&cfg, depth_q, &depth_scale);
+
+    /* int16 + scale -> float32, the same conversion the board's runner does
+     * on the PC (dav2_run_fpga.py): the product is exact in double, so
+     * there is one rounding, to float32, on both sides. */
+    for (int i = 0; i < npix; i++)
+        depth[i] = (float)((double)depth_q[i] * ldexp((double)depth_scale.m, -depth_scale.sh));
 
     printf("arena peak: %.2f MB\n", (double)dav2_arena_peak() / 1e6);
 #ifdef DAV2_ACCEL_EMU

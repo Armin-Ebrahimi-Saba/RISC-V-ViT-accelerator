@@ -7,8 +7,9 @@
  *   1. Print a banner and run dav2_selftest (a checksum that must match the
  *      host build bit for bit) and the accelerator's small self-check.
  *   2. Bring up DDR3 and wait for the host to load the weights over JTAG.
- *   3. Run one inference (dav2_infer in dav2_engine.c) into a float depth map.
- *   4. Print the depth map as hex so the host can capture it.
+ *   3. Run one inference (dav2_infer in dav2_engine.c) into an int16 depth
+ *      map with one scale.
+ *   4. Leave it in DDR3 at RESULT_ADDR for the host to read over JTAG.
  *
  * DDR3 map (see docs/design_ref/memory_map.rst -- DDR3 starts at 0x80000000):
  *
@@ -57,7 +58,9 @@ void dav2_selftest_report(void);
  * touch it. Layout: size*size*3 int16 (HWC), then one float32 scale. */
 #define IMAGE_ADDR  0x81E00000u
 
-/* Where the result goes: out_size*out_size float32, row-major. Also in the
+/* Where the result goes: the scale as two int32 (m, sh), depth = q * m *
+ * 2^-sh, then out_size*out_size int16 q, row-major. The PC converts to
+ * float; the board has no FPU and does no float arithmetic. Also in the
  * gap, above the image (95 kB) and the simulation start token (0x81F00000).
  * The host reads it back over the JTAG system bus in ~0.2 s. Printing it as
  * hex text through the console took ~30 s per frame -- a third of the
@@ -182,26 +185,26 @@ __attribute__((noinline)) static void dav2_bench(void)
 #endif
 
 /* Print the depth map as coarse ASCII art so the result is visible over the
- * hostio link without transferring the whole image. */
-static void print_ascii_depth(const float *depth, int size, int cols)
+ * hostio link without transferring the whole image. Integer only. */
+static void print_ascii_depth(const int16_t *q, dav2_xf_t scale, int size, int cols)
 {
     const char *ramp = " .:-=+*#%@";
     int step = size / cols;
     if (step < 1) step = 1;
 
-    float lo = depth[0], hi = depth[0];
+    int32_t lo = q[0], hi = q[0];
     for (int i = 0; i < size * size; i++) {
-        if (depth[i] < lo) lo = depth[i];
-        if (depth[i] > hi) hi = depth[i];
+        if (q[i] < lo) lo = q[i];
+        if (q[i] > hi) hi = q[i];
     }
-    float span = (hi > lo) ? (hi - lo) : 1.0f;
+    int32_t span = (hi > lo) ? (hi - lo) : 1;
 
     printf("depth map (near = bright), range %d..%d milli-units\n",
-           (int)(lo * 1000.0f), (int)(hi * 1000.0f));
+           (int)xf_round(xf_mul(xf_from_int((int64_t)lo * 1000), scale), 0),
+           (int)xf_round(xf_mul(xf_from_int((int64_t)hi * 1000), scale), 0));
     for (int y = 0; y < size; y += step * 2) {   /* *2: characters are tall */
         for (int x = 0; x < size; x += step) {
-            float v = (depth[y * size + x] - lo) / span;
-            int idx = (int)(v * 9.0f + 0.5f);
+            int idx = ((q[y * size + x] - lo) * 18 + span) / (2 * span);
             if (idx < 0) idx = 0;
             if (idx > 9) idx = 9;
             putchar(ramp[idx]);
@@ -416,7 +419,8 @@ int main(void)
 #endif
 
     const int out_size = DAV2_PATCH_GRID * DAV2_PATCH;
-    float *depth = (float *)RESULT_ADDR;
+    int32_t   *result_hdr = (int32_t *)RESULT_ADDR;               /* m, sh */
+    int16_t   *depth = (int16_t *)(RESULT_ADDR + 8u);
 
     dav2_cfg_t cfg = { DAV2_INPUT_SIZE, DAV2_PATCH_GRID, DAV2_N_TOKENS };
 
@@ -427,8 +431,9 @@ int main(void)
      * 25 MB weight transfer happens once per session instead of once per
      * image. */
     const int16_t *image = (const int16_t *)IMAGE_ADDR;
-    const float   *image_scale =
-        (const float *)(IMAGE_ADDR + (uint32_t)cfg.size * cfg.size * 3u * 2u);
+    /* the image's float32 scale, used as its bit pattern only */
+    const uint32_t *image_scale =
+        (const uint32_t *)(IMAGE_ADDR + (uint32_t)cfg.size * cfg.size * 3u * 2u);
 
     printf("DAV2_READY\n");
     for (unsigned frame = 0;; frame++) {
@@ -437,11 +442,14 @@ int main(void)
             ;
 
         dav2_set_image(image, *image_scale);
-        printf("frame %u: image scale %d/1e6\n", frame, (int)(*image_scale * 1e6f));
+        printf("frame %u: image scale bits %08x\n", frame, (unsigned)*image_scale);
 
         dav2_floatprof_reset();     /* count only this frame's float calls */
         uint64_t t0 = cycles64();
-        dav2_infer(&cfg, depth);
+        dav2_xf_t depth_scale;
+        dav2_infer(&cfg, depth, &depth_scale);
+        result_hdr[0] = depth_scale.m;
+        result_hdr[1] = depth_scale.sh;
         uint64_t t1 = cycles64();
 
         if (dav2_arena_failed) {
@@ -464,12 +472,12 @@ int main(void)
         dav2_accel_report();        /* jobs, cycles/beat and retries this frame */
         dav2_floatprof_report(t1 - t0);   /* prints only with build_flags.txt */
 
-        print_ascii_depth(depth, out_size, 63);
+        print_ascii_depth(depth, depth_scale, out_size, 63);
 
         /* Tell the host where the depth map is; it fetches the bytes itself
          * (see dav2_run_fpga.py) and compares them bit-for-bit against the
          * host build of the same engine. */
-        printf("DAV2_RESULT %d 0x%08x\n", out_size * out_size, (unsigned)RESULT_ADDR);
+        printf("DAV2_RESULT_Q %d 0x%08x\n", out_size * out_size, (unsigned)RESULT_ADDR);
         printf("DAV2_RESULT_END\n");
     }
 }

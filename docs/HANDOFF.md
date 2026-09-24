@@ -32,12 +32,17 @@ after the 25 MB weight transfer (~66 s) it waits for images at a fixed DDR3
 address, each a 95 kB transfer (~0.26 s), and runs them in turn. Any
 JPEG/PNG works — PIL, numpy and torch are installed in the venv.
 
+**The weight file has no floats.** `build/dav2/dav2_weights.bin` is blob
+version 3: every parameter is an integer. The engine rejects version 2.
+`tools/dav2_blob_int.py` converts a version 2 file (the float version is
+kept as `dav2_weights_f32.bin`), and `export_dav2.py` calls it itself.
+
 | Measurement | Value |
 |---|---|
-| Frame time | 8.187 s (0.409 G cycles at 50 MHz); was 93.6 s |
-| Frames per second | 0.1221 |
+| Frame time | 7.20 s (0.360 G cycles at 50 MHz); was 93.6 s |
+| Frames per second | 0.139 |
 | Weight load (once per session, JTAG) | ~66 s at 0.37 MB/s |
-| Image in / result out | 0.3 s / 0.74 s over the JTAG system bus |
+| Image in / result out | 0.3 s / 0.36 s over the JTAG system bus |
 | Accelerator | 128 rows per tile, 8 reads in flight, 2.1 cycles/beat, 0 retries per frame |
 | Accelerator jobs | 1268 per frame, 585 overlapped with CPU work |
 | Timing, last build | pnr WNS +0.395 ns, WHS +0.019 ns, 0 failing |
@@ -110,7 +115,7 @@ work.
   `DEBUGGING.md` § 11.
 - ~~Rounds two to five of the speed-up are not measured on the board~~
   **Measured**: 8.667 s per frame, bit-exact output, 15876/15876 pixels
-  identical. Round six brought it to 8.187 s (`PERFORMANCE.md` §6). Round two: LayerNorm, the adds, attention's arithmetic,
+  identical. Round six brought it to 8.187 s, and round seven (no floating point, integer weight file) to 7.20 s (`PERFORMANCE.md` §6). Round two: LayerNorm, the adds, attention's arithmetic,
   `make_multiplier`, and the accelerator's gather mode and `RQ_AMAX`
   register. Round three: a 128-row tile and the repaired prefetcher.
   Round four: the CPU working while the accelerator runs (585 of 1268

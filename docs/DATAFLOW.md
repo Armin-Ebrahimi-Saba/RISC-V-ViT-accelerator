@@ -139,14 +139,14 @@ accelerator applies those parameters to produce int16 output.*
 
 | Step | What happens |
 |---|---|
-| 7 | LayerNorm 1. The CPU rescales each token's row to zero mean and unit variance. The row statistics are computed in float; the per-element work is fixed point. |
+| 7 | LayerNorm 1. The CPU rescales each token's row to zero mean and unit variance. The row statistics and 1/√variance are computed in fixed point, like the per-element work. |
 | 8 | GEMM + requant. The block's qkv weights produce query, key and value vectors for all 6 attention heads at once. |
 | 9 to 13 | Attention, repeated for each of the 6 heads. See the table below. Heads do not depend on each other, but run one after another today. |
 | 14 | GEMM + requant. The combined attention output is projected back to 384 dimensions. |
 | 15 | Residual add. The block's output is added to its input, so information is not lost. This runs inside step 14's requantisation job, on the accelerator, and updates the token matrix in place. |
 | 16 | LayerNorm 2, the same idea as step 7. |
 | 17 | GEMM + requant. The MLP's first layer expands the data from 384 to 1536 dimensions. |
-| 18 | GELU. A smooth activation function, applied to each element. It uses a 257-entry lookup table with linear interpolation, because the CPU has no floating-point unit. |
+| 18 | GELU. A smooth activation function, applied to each element. It uses a 257-entry lookup table with linear interpolation, because the CPU has no floating-point unit. The table is built from a fixed Φ table in the program. |
 | 19 | GEMM + requant. The MLP's second layer compresses the data back to 384 dimensions. |
 | 20 | Residual add, the same idea as step 15, inside step 19's requantisation job. The result feeds the next block's step 7. |
 | 21 | After blocks 3, 6, 9 and 12 only: a normalised copy of the data is saved as one of the four feature maps the decoder needs. |
@@ -186,7 +186,7 @@ The four feature maps from step 21 are at four resolutions, from 9x9 up to
 | 31 | Bilinear upsampling on the CPU, from 72x72 to the full 126x126. |
 | 32 | Another 3x3 convolution at 32 channels, followed by a ReLU. |
 | 33 | A final 1x1 convolution reduces 32 channels to one, the depth channel, followed by a ReLU. |
-| 34 | The CPU converts the fixed-point result to a float depth map and raises the done flag. |
+| 34 | The CPU writes the int16 depth map and its scale (m, sh) to DDR3 and raises the done flag. The PC converts it to float. |
 | 35 | The host reads the depth map over JTAG. This takes 0.7 seconds. It saves the map and renders it next to the PyTorch reference. |
 
 One frame runs 1,268 accelerator jobs in total (counted by the accelerator

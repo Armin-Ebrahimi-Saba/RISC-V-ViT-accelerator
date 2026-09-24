@@ -23,10 +23,12 @@ reference repository with its checkpoint (set DAV2_REF_DIR / DAV2_CKPT, see
 dav2_common.py). None of these are in the project's .venv, which only holds
 the FPGA flow. Run this in a separate Python environment.
 
-The exported blob is checked into build/dav2/dav2_weights.bin. To run a
-different picture WITHOUT this exporter's dependencies, use
-dav2_patch_image.py, which rewrites just the two image tensors in a copy of
-an existing blob -- the weights do not depend on the picture.
+The exporter first builds a version 2 blob, in which the small per-row
+and per-channel parameters are float32. It keeps that file as
+build/dav2/dav2_weights_f32.bin. It then converts it with dav2_blob_int.py
+to version 3, in which every parameter is an integer, and writes that as
+build/dav2/dav2_weights.bin. The engine reads only version 3; the board has
+no FPU. Images travel separately (dav2_image.py), not in the blob.
 
 The blob also carries dav2_blob_config.h, generated alongside it, which tells
 the C engine the input size, patch grid and token count at compile time.
@@ -237,8 +239,14 @@ def build(sd, pos_embed, image_chw, size, out_dir):
     b.add_quant_weight("out2b", conv_to_gemm(g("depth_head.scratch.output_conv2.2.weight")),
                        g("depth_head.scratch.output_conv2.2.bias"))
 
-    raw = b.serialize()
+    raw_f32 = b.serialize()
     out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "dav2_weights_f32.bin").write_bytes(raw_f32)
+    # float parameters -> integers (version 3), the form the engine reads
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import dav2_blob_int
+    _, recs = dav2_blob_int.read_blob(raw_f32)
+    raw = dav2_blob_int.write_blob(dav2_blob_int.convert(recs), dav2_blob_int.VERSION_INT)
     (out_dir / "dav2_weights.bin").write_bytes(raw)
 
     cfg_text = f"""/* SPDX-License-Identifier: CC0-1.0

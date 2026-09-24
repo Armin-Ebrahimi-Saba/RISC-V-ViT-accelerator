@@ -1,4 +1,4 @@
-# Performance — how one frame went from 93.6 s to 8.2 s
+# Performance — how one frame went from 93.6 s to 7.2 s
 
 This is the record of the speed-up work: what was measured, what each change
 did, and what is left. Every step kept the FPGA output **bit-exact with the
@@ -9,7 +9,8 @@ for speed). Sections 5–7 (rounds two to five) were developed and verified in
 simulation and on the accelerator emulator while the board was unavailable;
 §6 has the measurement taken once the board came back, confirming bit-exact
 output at 8.667 s per frame. §6 also covers round six, which brought the
-frame to 8.187 s.
+frame to 8.187 s, and round seven, which removed all floating point and
+brought it to 7.20 s.
 
 Terms used below: *frame* — one 126×126 depth map; *GEMM* — a matrix
 multiplication, the accelerator's job; *requantisation* — turning the int32
@@ -22,32 +23,32 @@ sums a GEMM produces back into int16 activations with a per-row scale;
 
 | | Start of the work | After round 1 (measured) | **Current (measured, §6)** |
 |---|---|---|---|
-| Frame time (inference only) | 93.6 s | 14.2 s | **8.187 s** |
-| Frames per second | 0.0107 | 0.0704 | **0.1221** |
-| Result readout to the PC | ~30 s (hex text over the console) | 0.7 s (JTAG system bus) | 0.74 s |
+| Frame time (inference only) | 93.6 s | 14.2 s | **7.20 s** |
+| Frames per second | 0.0107 | 0.0704 | **0.139** |
+| Result readout to the PC | ~30 s (hex text over the console) | 0.7 s (JTAG system bus) | 0.36 s (int16) |
 | Accelerator | 16 multipliers, 1 read in flight, 8.3 cycles/beat | 64 multipliers, 8 in flight, 3.2 cycles/beat | **128 multipliers, 8 in flight, 2.1 cycles/beat** |
 | FPGA output vs host build | bit-exact | bit-exact | **bit-exact (15876/15876)** |
-| Correlation with PyTorch (demo) | 0.999836 | 0.999872 | 0.999872 |
+| Correlation with PyTorch (demo) | 0.999836 | 0.999872 | 0.999862 |
 | LUT / BRAM / DSP | 12.4 % / 23.0 % / 3.1 % | 14.8 % / 36.9 % / 10.4 % | **18.9 % / 54.4 % / 20.4 %** |
 | Timing (WNS, 50 MHz) | +0.287 ns | +0.121 ns | **+0.395 ns** |
 
-Where the 8.187 s goes now (cycles at 50 MHz, measured on the board — see
+Where the 7.20 s goes now (cycles at 50 MHz, measured on the board — see
 §6 for the full profile and how it compares to the 14.2 s breakdown below):
 
-| Operator | Mcycles (14.2 s) | Mcycles (8.2 s) | Runs on |
-|---|---|---|---|
-| LayerNorm | 128 | 97 | CPU |
-| attention | 114 | 87 | CPU; the two matmuls on the accelerator |
-| requantisation | 101 | 82 | CPU sets up, accelerator converts (+ fused add/ReLU) |
-| GELU | 51 | 57 | CPU |
-| interpolate | 63* | 30 | CPU |
-| other | — | 28 | mixed |
-| GEMM | 93 | **15** | accelerator (128-row tile, repaired prefetcher) |
-| add/relu | 92 | **12** | fused into the requantisation job (accelerator) |
-| im2col | 67 | **1** | gather mode (accelerator) |
+| Operator | Mcycles (14.2 s) | Mcycles (8.2 s) | Mcycles (7.2 s) | Runs on |
+|---|---|---|---|---|
+| LayerNorm | 128 | 97 | 86 | CPU |
+| attention | 114 | 87 | 87 | CPU; the two matmuls on the accelerator |
+| requantisation | 101 | 82 | 74 | CPU sets up, accelerator converts (+ fused add/ReLU) |
+| GELU | 51 | 57 | 43 | CPU |
+| interpolate | 63* | 30 | 29 | CPU |
+| other | — | 28 | 12 | mixed |
+| GEMM | 93 | **15** | 15 | accelerator (128-row tile, repaired prefetcher) |
+| add/relu | 92 | **12** | 12 | fused into the requantisation job (accelerator) |
+| im2col | 67 | **1** | 1 | gather mode (accelerator) |
 
 *the 14.2 s column's "interpolate, misc" bucket is split into "interpolate"
-and "other" in the 8.2 s profile.
+and "other" in the later profiles.
 
 GEMM, the residual add/ReLU, and im2col are no longer worth optimising —
 gather mode and the fused epilogue removed nearly all of their CPU-side and
@@ -473,9 +474,49 @@ is about 2.0 s of the 8.19 s frame, or 25 %.
 | Final depth map to float | ~2 |
 | Resize weights, softmax scale, adds | <1 |
 
+### Round seven — no floating point
+
+The float parameters are converted to integers offline, and every scale in
+the engine is a pair of integers (m, sh), value = m · 2^−sh (`dav2_xf.h`).
+The program contains no soft-float routine: `nm sw.elf` lists none of
+`__mulsf3`, `__addsf3`, `__floatsisf` and the others.
+
+| Change | Where |
+|---|---|
+| New blob version 3. Row scales and biases are (m, sh) pairs, exact from float32. LayerNorm γ is Q15 and β is Q16, rounded as the engine rounded them before. `cls_token` and `pos_embed` are Q24. The image tensors are removed. | `tools/dav2_blob_int.py`, `export_dav2.py` |
+| Multiply, add, 1/x, 1/√x (Newton in Q30) on (m, sh) pairs. A 31-bit mantissa; the measured relative error is below 3·10⁻⁹. | `dav2_xf.h` |
+| Requantisation parameters, the fused add, LayerNorm statistics, the attention scale, the resize weights and the token matrix use these routines. | `dav2_ops.c`, `dav2_engine.c` |
+| GELU is built from a fixed table of Φ (2049 entries, Q30) with linear interpolation, compiled into the program. The boot self-test needs GELU before the weights arrive, so the table is not in the blob. | `dav2_gelu_phi.h` |
+| The board returns the int16 depth map and its scale. The PC converts it to float32; `dav2_host` and `dav2_run_fpga.py` use the same formula, so the files are equal bit for bit. | `main.c`, `host_main.c`, `dav2_run_fpga.py` |
+
+Measured on the board: **7.20 s per frame (0.139 FPS)**, five frames in a
+row, each 7.201 to 7.212 s. All five are bit-exact with the host build
+(15876/15876 pixels). The self-test hash is `4fb8021c` on both. The
+accelerator emulator also gives the same output as the host.
+
+| Operator | Round six (Mcycles) | Round seven (Mcycles) |
+|---|---|---|
+| LayerNorm | 97 | 86 |
+| requantisation | 82 | 74 |
+| GELU | 57 | 43 |
+| other | 28 | 12 |
+| frame | 409 | 360 |
+
+The saving is 49 Mcycles, about half of the 102 Mcycles the float routines
+took. The integer code that replaces them is not free.
+
+The numbers differ from the float version in the last bits, so the output
+is not the same as before. Against PyTorch on the demo image the
+correlation is 0.999862 (before: 0.999872). The mean relative error is
+4.5 % (before: 3.8 %). Most of both is a gain difference: after the best
+gain is fitted, the mean relative error is 0.66 % (before: 0.65 %). The
+new and the old output differ by at most 1.9 % of the largest value.
+
 ## 7. What is left, in order of expected gain
 
-Based on the measured 8.187 s profile (§6, round six), not the earlier estimate.
+Based on the measured 8.187 s profile (§6, round six), not the earlier
+estimate. Round seven removed the float routines named in this table;
+LayerNorm is now 86, requantisation 74 and GELU 43 Mcycles.
 
 | Item | Now (measured) | Estimate | How |
 |---|---|---|---|

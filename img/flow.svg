@@ -37,7 +37,7 @@
 <text x="907" y="554" text-anchor="middle" font-size="10" font-style="italic">R = reads, W = writes</text>
 <text x="907" y="580" text-anchor="middle" font-size="10">weights: 25 MB int8</text>
 <text x="907" y="594" text-anchor="middle" font-size="10">image: 95 kB int16</text>
-<text x="907" y="608" text-anchor="middle" font-size="10">result: 63 kB float32</text>
+<text x="907" y="608" text-anchor="middle" font-size="10">result: 32 kB int16</text>
 <text x="907" y="622" text-anchor="middle" font-size="10">arena: activations,</text>
 <text x="907" y="636" text-anchor="middle" font-size="10">accumulators, tables</text>
 <text x="907" y="650" text-anchor="middle" font-size="10">(peak ~6 MB of 64)</text>
@@ -94,7 +94,7 @@
 <circle cx="200" cy="318" r="11" fill="#1c7ed6"/>
 <text x="200" y="322" text-anchor="middle" fill="#fff" font-weight="700" font-size="11">5a</text>
 <text x="214" y="334" font-weight="600" font-size="11.5">LayerNorm 1 (CPU)</text>
-<text x="210" y="348" font-size="10.5">row stats in float, elements</text>
+<text x="210" y="348" font-size="10.5">row stats and elements</text>
 <text x="210" y="361" font-size="10.5">fixed point; x → n</text>
 <rect x="210" y="367" width="52" height="13" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="214" y="377" font-size="9.5">R arena</text>
@@ -269,13 +269,13 @@
 <text x="205" y="984" font-size="10.5">6a  per level: 1×1 conv (GEMM) → resize: conv-transpose ×4 / ×2 (GEMM + scatter), identity, or 3×3 stride-2 conv (K = 3456:</text>
 <text x="205" y="997" font-size="10.5">      gathered in 5 + 4 kernel positions, partial sums added on the CPU) → 3×3 conv (patches gathered by the accelerator, then GEMM)</text>
 <text x="205" y="1010" font-size="10.5">6b  fusion, coarse to fine: ResidualConvUnit = ReLU → 3×3 conv → ReLU → 3×3 conv → add; bilinear ×2 (CPU); 1×1 conv</text>
-<text x="205" y="1023" font-size="10.5">6c  output: 3×3 conv → bilinear to 126×126 (CPU) → 3×3 conv → ReLU → 1×1 conv → ReLU → float depth</text>
+<text x="205" y="1023" font-size="10.5">6c  output: 3×3 conv → bilinear to 126×126 (CPU) → 3×3 conv → ReLU → 1×1 conv → ReLU → int16 depth</text>
 <text x="205" y="1046" font-size="10">every 3×3 conv: GEMM on patches the accelerator gathers (gather mode) + requant (→ A, B), which also does ReLU/add; 1 268 jobs per frame</text>
 <rect x="195" y="1071" width="210" height="83" rx="6" fill="#fff" stroke="#1c7ed6" stroke-width="1.6"/>
 <circle cx="195" cy="1071" r="11" fill="#1c7ed6"/>
 <text x="195" y="1075" text-anchor="middle" fill="#fff" font-weight="700" font-size="11">7</text>
 <text x="209" y="1087" font-weight="600" font-size="11.5">publish result</text>
-<text x="205" y="1101" font-size="10.5">depth 126×126 float32 →</text>
+<text x="205" y="1101" font-size="10.5">depth 126×126 int16 + scale →</text>
 <text x="205" y="1114" font-size="10.5">0x81F1_0000; print profile;</text>
 <text x="205" y="1127" font-size="10.5">dav2_go = GO_DONE</text>
 <rect x="205" y="1133" width="59" height="13" rx="3" fill="#ffe8cc" stroke="#2b8a3e" stroke-width="0.6"/>
@@ -359,7 +359,7 @@
 <text x="200" y="1456" text-anchor="middle" fill="#fff" font-weight="700" font-size="11">B1</text>
 <text x="214" y="1468" font-weight="600" font-size="11.5">per-row parameters (CPU)</text>
 <text x="210" y="1482" font-size="10.5">from the {max,min} per row: output</text>
-<text x="210" y="1495" font-size="10.5">scale (float, one per tensor), then</text>
+<text x="210" y="1495" font-size="10.5">scale (m·2^−sh, one per tensor), then</text>
 <text x="210" y="1508" font-size="10.5">{mult, shift, bias} per row → table</text>
 <rect x="210" y="1514" width="52" height="13" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="214" y="1524" font-size="9.5">R arena</text>

@@ -6,15 +6,17 @@
  * Numeric format
  * --------------
  * Weights   : per-output-channel symmetric int8 (prepared by export_dav2.py)
- * Activations: int16 restricted to +-DAV2_ACT_QMAX (14 bit) with one float
- *              scale per tensor, recomputed dynamically from the actual data.
+ * Activations: int16 restricted to +-DAV2_ACT_QMAX (14 bit) with one scale
+ *              per tensor, recomputed dynamically from the actual data.
  * Accumulate : int32. The 14-bit activation limit guarantees that the longest
  *              reduction in the network (K = 1536) cannot overflow:
  *              1536 * 8191 * 127 = 1.60e9 < 2^31.
  *
- * Floating point is used only for O(channels) bookkeeping (deriving scales and
- * requantisation multipliers). Every per-element inner loop is pure integer, so
- * the lack of an FPU on the CV32E40P costs almost nothing.
+ * There is no floating point. The CV32E40P has no FPU, and each float
+ * operation would be a libgcc call of 35 to 200 cycles. A scale is a pair
+ * of integers, value = m * 2^-sh (dav2_xf.h). The small float parameters of
+ * the model (row scales, biases, LayerNorm gamma and beta, embeddings) are
+ * converted to integer forms offline by tools/dav2_blob_int.py.
  *
  * Memory layout
  * -------------
@@ -30,6 +32,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "dav2_xf.h"
+
 #define DAV2_ACT_QMAX  8191   /* 14-bit activation magnitude   */
 #define DAV2_QK_QMAX   2047   /* q/k magnitude inside attention */
 #define DAV2_W_QMAX     127
@@ -44,10 +48,18 @@
 /* ------------------------------------------------------------------ blob */
 
 #define DAV2_MAGIC    0x32564144u   /* 'DAV2' */
-#define DAV2_VERSION  2u
+#define DAV2_VERSION  3u   /* 3: integer parameters (tools/dav2_blob_int.py) */
 #define DAV2_NAME_LEN 40
 
 enum { DAV2_DT_F32 = 0, DAV2_DT_I8 = 1, DAV2_DT_I16 = 2, DAV2_DT_I32 = 3 };
+
+/* Integer formats of the parameters in a version 3 blob. */
+#define DAV2_POS_Q        24   /* cls_token, pos_embed: value = int / 2^24     */
+#define DAV2_LN_G_Q       15   /* LayerNorm gamma                              */
+#define DAV2_LN_B_Q       16   /* LayerNorm beta                               */
+#define DAV2_PHI_Z0       (-8) /* gelu_phi: Phi(z), z = -8 + i/128, i=0..2048 */
+#define DAV2_PHI_STEP_LOG2 7
+#define DAV2_PHI_Q        30
 
 typedef struct {
     uint32_t magic, version, n_tensors, dir_off, data_off, total_bytes;
@@ -59,13 +71,13 @@ typedef struct {
     uint32_t dtype, nbytes, offset, dims[4], pad;
 } dav2_record_t;
 
-/* A quantised weight matrix: (m x k) int8 rows, one float scale per row and an
- * optional float bias per row. */
+/* A quantised weight matrix: (m x k) int8 rows, one scale per row and an
+ * optional bias per row. Scale and bias are (m, sh) integer pairs. */
 typedef struct {
-    const int8_t  *w;
-    const float   *s;
-    const float   *b;   /* NULL when the layer has no bias */
-    int            m, k;
+    const int8_t    *w;
+    const dav2_xf_t *s;
+    const dav2_xf_t *b;   /* NULL when the layer has no bias */
+    int              m, k;
 } dav2_qw_t;
 
 /* An activation tensor: n rows of c int16 channels, real = v * scale.
@@ -76,10 +88,10 @@ typedef struct {
  * Consumers that need the range -- the residual add -- use it instead of a
  * scan; a scan and a known amax_q give identical results. */
 typedef struct {
-    int16_t *v;
-    float    scale;
-    int      n, c;
-    int32_t  amax_q;
+    int16_t   *v;
+    dav2_xf_t  scale;
+    int        n, c;
+    int32_t    amax_q;
 } dav2_tensor_t;
 
 /* ------------------------------------------------------------- blob access */
@@ -99,15 +111,14 @@ size_t dav2_arena_peak(void);
 /* Non-zero if any allocation has failed since dav2_arena_init. */
 extern int dav2_arena_failed;
 
-/* Split a positive float into (mult, shift) with mult in [2^30, 2^31) so that
- * x*m can be evaluated as (x*mult) >> shift in integer arithmetic. */
-void dav2_make_multiplier(float m, int32_t *mult, int *shift);
 
 /* --------------------------------------------------------------- tensors */
 
 dav2_tensor_t dav2_tensor_new(int n, int c);
-/* Quantise a float buffer into a fresh activation tensor. */
-void dav2_quantize_f32(const float *src, int n, int c, dav2_tensor_t *out);
+/* The token matrix: row 0 = cls + pos[0], row p+1 = patch[p] + pos[p+1],
+ * with cls and pos in Q24 (DAV2_POS_Q). out must hold (n_patch + 1) x c. */
+void dav2_embed_tokens(const dav2_tensor_t *patches, const int32_t *cls_q24,
+                       const int32_t *pos_q24, dav2_tensor_t *out);
 
 /* -------------------------------------------------------------------- ops */
 
@@ -121,8 +132,8 @@ void dav2_qgemm_ex(const dav2_tensor_t *a, const dav2_qw_t *wt,
                    const dav2_tensor_t *res, int relu, dav2_tensor_t *out);
 
 /* LayerNorm over channels, producing a fresh dynamic scale. */
-void dav2_layernorm(const dav2_tensor_t *in, const float *g, const float *b,
-                    dav2_tensor_t *out);
+void dav2_layernorm(const dav2_tensor_t *in, const int32_t *g_q15,
+                    const int32_t *b_q16, dav2_tensor_t *out);
 
 /* out = a + b (elementwise, different input scales allowed). */
 void dav2_add(const dav2_tensor_t *a, const dav2_tensor_t *b, dav2_tensor_t *out);
@@ -160,9 +171,11 @@ typedef struct {
     int   n_tokens;  /* grid*grid + 1          */
 } dav2_cfg_t;
 
-/* Runs the full network. depth_out receives grid*14 x grid*14 float values
- * (the same units as the PyTorch model's output). */
-void dav2_infer(const dav2_cfg_t *cfg, float *depth_out);
+/* Runs the full network. depth_q receives grid*14 x grid*14 int16 values
+ * and *depth_scale their scale: depth = depth_q * scale, in the same units
+ * as the PyTorch model's output. The caller converts to float if it needs
+ * to (the PC does; the board does not). */
+void dav2_infer(const dav2_cfg_t *cfg, int16_t *depth_q, dav2_xf_t *depth_scale);
 
 /* Input image.
  *
@@ -172,8 +185,10 @@ void dav2_infer(const dav2_cfg_t *cfg, float *depth_out);
  * (size x size x 3, values in -8191..8191) and its scale, and can do so again
  * before every dav2_infer without touching the weights. On the board the
  * buffer lives at a fixed DDR3 address the host writes over JTAG; the host
- * build passes a malloc'd array. */
-void dav2_set_image(const int16_t *hwc, float scale);
+ * build passes a malloc'd array. The scale is the float32 of the .dav2img
+ * file, passed as its bit pattern; it is converted exactly with integer bit
+ * operations (xf_from_f32_bits). */
+void dav2_set_image(const int16_t *hwc, uint32_t scale_f32_bits);
 
 /* On-chip scratch buffer and word-wise copies -- see dav2_ops.c. 40 kB:
  * enough for one attention head's q, k and transposed v (3 x 82 x 64 int16)

@@ -43,8 +43,9 @@ peripherals and interconnect that together make a computer. Here it is:
 **Bus masters** — the things that start transactions:
 
 - **CV32E40P** — the RISC-V processor. RV32IMC: 32-bit, integer, multiply,
-  compressed instructions. No floating-point unit, so every `float` in the C
-  code is emulated in software. It has two bus ports, one for fetching
+  compressed instructions. No floating-point unit, so a `float` in the C
+  code would be emulated in software. The program therefore uses no floats
+  (`dav2_xf.h`). It has two bus ports, one for fetching
   instructions and one for data.
 - **Debug module** — reachable over JTAG (a serial debug link from the host
   PC). It can halt the CPU and read its registers, and it can also read and
@@ -89,17 +90,20 @@ Four regions in DDR3 do all the work:
 
 - **The weight blob** at `0x8000_0000`. A single file produced by
   `export_dav2.py` containing every tensor the network needs — weights,
-  biases, scales — plus a directory at the front so the C code can find them
+  biases, scales, all as integers — plus a directory at the front so the C code can find them
   by name. It is loaded once over JTAG (about a minute).
 - **The input image** at `0x81E0_0000`, in the gap between blob and arena:
-  126×126×3 int16 pixels then one float scale, 95 kB. It is *not* part of the
+  126×126×3 int16 pixels then one float32 scale, 95 kB. The program never
+  computes with that float: it converts its bits to an integer pair. It is *not* part of the
   blob, so a new picture is a quarter-second transfer rather than a new
   minute-long weight load. The program serves frames: it waits for the host
   to write an image here and raise a flag, runs it, publishes the result,
   and waits for the next.
-- **The depth map** at `0x81F1_0000`, also in the gap: 126×126 float32,
-  63 kB. The host reads it straight off the bus over JTAG in 0.7 s (it used
-  to be printed as hex text through the console, ~30 s).
+- **The depth map** at `0x81F1_0000`, also in the gap: the scale as two
+  int32 (m, sh), then 126×126 int16 values, 32 kB. The depth is
+  q · m · 2^−sh. The host reads it straight off the bus over JTAG and
+  converts it to float32 (it used to be printed as hex text through the
+  console, ~30 s).
 - **The activation arena** at `0x8200_0000`. Working memory for the tensors
   the network produces as it runs. A *bump allocator* hands out space by
   advancing a pointer and can only free it all at once, which suits a
@@ -260,8 +264,8 @@ last write of a tile followed by the next tile's first access produces.
 | Board | the bitstream on the FPGA | real | 14.2 s per frame |
 
 The host reference is the *oracle*: the same C source compiled for the PC.
-Because every kernel is integer and the float bookkeeping is IEEE single
-precision on both sides, the board's output is required to be bit-identical
+Because all the arithmetic is integer, including the scales
+(`dav2_xf.h`), the board's output is required to be bit-identical
 to it — and is, on every image tried. That equality was also the regression
 test for the speed-up work: every change was checked against the previous
 host output byte for byte (`PERFORMANCE.md`).

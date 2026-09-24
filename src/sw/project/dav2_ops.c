@@ -32,7 +32,7 @@
 
 #include "dav2.h"
 #include "dav2_accel.h"
-#include "dav2_mathf.h"
+#include "dav2_gelu_phi.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -102,6 +102,9 @@ int16_t dav2_scratch[DAV2_SCRATCH_ELEMS] __attribute__((aligned(16)));
  * always shows up first as a scale that runs away. */
 #ifdef DAV2_TRACE
 #include <stdio.h>
+#include <math.h>
+/* Host-only: a scale as a double, for printing. */
+static double xf_d(dav2_xf_t a) { return ldexp((double)a.m, -a.sh); }
 double dav2_mac_count = 0.0;      /* total multiply-accumulates, for costing */
 double dav2_elem_count = 0.0;     /* total requantised output elements */
 static const char *trace_tag = "?";
@@ -115,8 +118,8 @@ static void trace_tensor(const char *op, const dav2_tensor_t *t)
         if (t->v[i] < lo) lo = t->v[i];
     }
     printf("    %-12s %-8s n=%-6d c=%-5d q=[%6d,%6d] scale=%.6g real_max=%.6g\n",
-           trace_tag, op, t->n, t->c, lo, hi, (double)t->scale,
-           (double)((hi > -lo ? hi : -lo) * t->scale));
+           trace_tag, op, t->n, t->c, lo, hi, xf_d(t->scale),
+           (double)(hi > -lo ? hi : -lo) * xf_d(t->scale));
 }
 /* Dump a dequantised tensor for offline comparison against the numpy
  * blueprint. Host-only; the target build compiles this away. */
@@ -126,7 +129,7 @@ void dav2_dump(const char *path, const dav2_tensor_t *t)
     if (!f) return;
     const int total = t->n * t->c;
     for (int i = 0; i < total; i++) {
-        float v = (float)t->v[i] * t->scale;
+        float v = (float)((double)t->v[i] * xf_d(t->scale));
         fwrite(&v, sizeof(float), 1, f);
     }
     fclose(f);
@@ -180,7 +183,7 @@ dav2_tensor_t dav2_tensor_new(int n, int c)
     dav2_tensor_t t;
     t.n = n;
     t.c = c;
-    t.scale = 1.0f;
+    t.scale = XF_ONE;
     t.amax_q = -1;
     t.v = (int16_t *)dav2_arena_alloc((size_t)n * (size_t)c * sizeof(int16_t));
     return t;
@@ -188,48 +191,12 @@ dav2_tensor_t dav2_tensor_new(int n, int c)
 
 /* ---------------------------------------------------- fixed-point helpers */
 
-/* Split a positive float multiplier into (mult, shift) with mult in
- * [2^30, 2^31), so that round(x*m) == (x*mult + rounding) >> shift. */
-void dav2_make_multiplier(float m, int32_t *mult, int *shift)
-{
-    if (m <= 0.0f) { *mult = 0; *shift = 0; return; }
-    int e;
-    int64_t q;
-    uint32_t bits;
-    /* __builtin_memcpy, not memcpy: the flow compiles with -fno-builtin, so
-     * a plain memcpy here is a call to libsys's byte-by-byte copy. The
-     * builtin is a register move. (The same holds for every 4-byte bit
-     * copy in this file.) */
-    __builtin_memcpy(&bits, &m, 4);
-    if (((bits >> 23) & 0xffu) != 0u) {
-        /* Normal float: the mantissa with its hidden bit is m's frexp
-         * fraction times 2^24, so f * 2^31 is exactly mantissa << 7 and the
-         * "+ 0.5" of the general path truncates away. Same (mult, shift) as
-         * below, without frexpf and two soft-float operations -- this runs
-         * once per weight row, ~3500 times per transformer block. */
-        q = (int64_t)(((bits & 0x7fffffu) | 0x800000u) << 7);
-        e = (int)((bits >> 23) & 0xffu) - 126;
-    } else {
-        float f = dav2_frexpf(m, &e);             /* m = f * 2^e, f in [0.5,1) */
-        q = (int64_t)(f * 2147483648.0f + 0.5f);
-        if (q > 2147483647LL) { q >>= 1; e += 1; }
-    }
-    int sh = 31 - e;
-    if (sh < 0) {                                  /* |m| >= 1 */
-        if (-sh >= 31) { q = 2147483647LL; sh = 0; }
-        else { q >>= (-sh); sh = 0; }
-    } else if (sh > 62) {                          /* underflows to zero */
-        q = 0; sh = 0;
-    }
-    *mult = (int32_t)q;
-    *shift = sh;
-}
 
 static inline int32_t apply_multiplier(int32_t acc, int32_t mult, int shift)
 {
     /* round(acc * mult / 2^shift), exactly, without a 64-bit shift.
      *
-     * The multiplier is scaled into [2^30, 2^31) by dav2_make_multiplier,
+     * The multiplier is a normalised dav2_xf_t mantissa, in [2^30, 2^31),
      * so the shift is 31..62 for factors below 1 and smaller for larger
      * factors. Two straight-line cases cover everything this engine does;
      * on the CV32E40P a taken branch costs ~4 cycles, as much as the
@@ -278,32 +245,72 @@ static inline int16_t sat_act(int32_t v)
     return (int16_t)v;
 }
 
-static inline int32_t iround(float f)
+
+
+/* ------------------------------------------------------------ embedding */
+
+/* v * s * 2^k rounded half away from zero, v an int16-range value. */
+static inline int64_t mul_xf_round(int32_t v, dav2_xf_t s, int k)
 {
-    /* Round half away from zero. The sign is taken from the float's sign
-     * bit, not from a comparison: the core has no FPU, so "f >= 0.0f" is a
-     * library call. The results are the same, including for -0.0f (both
-     * forms give 0). */
-    uint32_t bits;
-    __builtin_memcpy(&bits, &f, 4);
-    return (int32_t)((bits >> 31) ? f - 0.5f : f + 0.5f);
+    int64_t p = (int64_t)v * s.m;
+    int32_t sh = s.sh - k;
+    if (sh <= 0)
+        return p * ((int64_t)1 << (-sh > 20 ? 20 : -sh));
+    if (sh > 62)
+        return 0;
+    int64_t a = p < 0 ? -p : p;
+    a = (a + ((int64_t)1 << (sh - 1))) >> sh;
+    return p < 0 ? -a : a;
 }
 
-void dav2_quantize_f32(const float *src, int n, int c, dav2_tensor_t *out)
+void dav2_embed_tokens(const dav2_tensor_t *patches, const int32_t *cls,
+                       const int32_t *pos, dav2_tensor_t *out)
 {
-    const int total = n * c;
-    float amax = 0.0f;
-    for (int i = 0; i < total; i++) {
-        float a = dav2_fabsf(src[i]);
+    const int C = patches->c, NP = patches->n, N = NP + 1;
+    const size_t mark = dav2_arena_mark();
+
+    /* Every token value in Q24 (DAV2_POS_Q), as int64: row 0 is
+     * cls + pos[0], row p+1 is patch[p] * scale + pos[p+1]. */
+    int64_t *v = (int64_t *)dav2_arena_alloc((size_t)N * C * sizeof(int64_t));
+    if (!v) { dav2_arena_release(mark); return; }
+    int64_t amax = 0;
+    for (int i = 0; i < N * C; i++) {
+        int64_t x = (i < C) ? (int64_t)cls[i]
+                            : mul_xf_round(patches->v[i - C], patches->scale, DAV2_POS_Q);
+        x += pos[i];
+        v[i] = x;
+        int64_t a = x < 0 ? -x : x;
         if (a > amax) amax = a;
     }
-    float s = (amax > 0.0f) ? amax * (1.0f / (float)DAV2_ACT_QMAX) : 1.0f;
-    float inv = 1.0f / s;
-    for (int i = 0; i < total; i++)
-        out->v[i] = sat_act(iround(src[i] * inv));
-    out->scale = s;
-    out->n = n;
-    out->c = c;
+
+    /* Common output scale amax / 8191. The values are brought into int32
+     * range first (a right shift by r, normally 0), so apply_multiplier can
+     * scale them. */
+    int r = 0;
+    while ((amax >> r) >= ((int64_t)1 << 30))
+        r++;
+    dav2_xf_t out_scale = amax ? xf_div(xf_norm(amax, DAV2_POS_Q),
+                                        xf_from_int(DAV2_ACT_QMAX)) : XF_ONE;
+    int32_t om; int osh;
+    xf_to_mult(xf_div(xf_norm(1, DAV2_POS_Q - r), out_scale), &om, &osh);
+    int32_t omax = 0;
+    for (int i = 0; i < N * C; i++) {
+        int64_t x = v[i];
+        if (r) {
+            int64_t a = x < 0 ? -x : x;
+            a = (a + ((int64_t)1 << (r - 1))) >> r;
+            x = x < 0 ? -a : a;
+        }
+        int32_t q = sat_act(apply_multiplier((int32_t)x, om, osh));
+        out->v[i] = (int16_t)q;
+        if (q < 0) q = -q;
+        if (q > omax) omax = q;
+    }
+    out->n = N;
+    out->c = C;
+    out->scale = out_scale;
+    out->amax_q = omax;
+    dav2_arena_release(mark);
 }
 
 /* ------------------------------------------------------------------- GEMM */
@@ -377,6 +384,23 @@ static int32_t amax_scan(const dav2_tensor_t *t)
     return m;
 }
 
+/* The parameters of out = a + b, from the operands' largest |values| and
+ * scales. The sum is bounded by amax_a*sa + amax_b*sb, which becomes the
+ * output's full range; ma/sha and mb/shb rescale a and b to the output
+ * scale. dav2_add and the requantisation job's add epilogue both use this,
+ * so the fused and the separate add agree to the bit. */
+static void add_params(int32_t amax_a, dav2_xf_t sa, int32_t amax_b, dav2_xf_t sb,
+                       dav2_xf_t *out_scale, int32_t *ma, int *sha,
+                       int32_t *mb, int *shb)
+{
+    dav2_xf_t bound = xf_add(xf_mul(xf_from_int(amax_a), sa),
+                             xf_mul(xf_from_int(amax_b), sb));
+    *out_scale = bound.m ? xf_div(bound, xf_from_int(DAV2_ACT_QMAX)) : XF_ONE;
+    dav2_xf_t inv = xf_recip(*out_scale);
+    xf_to_mult(xf_mul(sa, inv), ma, sha);
+    xf_to_mult(xf_mul(sb, inv), mb, shb);
+}
+
 /* A convolution's geometry, for a GEMM whose A matrix is the im2col of an
  * image rather than a tensor in memory. */
 typedef struct { int h, w, k, stride, pad; } conv_desc_t;
@@ -430,7 +454,7 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
         dav2_arena_release(mark);
         out->n = N;
         out->c = M;
-        out->scale = 1.0f;
+        out->scale = XF_ONE;
         return;
     }
 
@@ -474,8 +498,7 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
     /* Exact output range, including bias, so nothing clips. The per-row
      * extremes come from the accelerator's drain when it produced them (two
      * words per row per tile); otherwise from a scan of acc. */
-    float amax;
-    uint32_t amax_bits = 0;               /* bit pattern of +0.0f */
+    dav2_xf_t amax = XF_ZERO;
     for (int m = 0; m < M; m++) {
         int32_t cmax, cmin;
         if (st.tiles) {
@@ -506,26 +529,20 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
             }
         }
         if (rmax) { rmax[m] = cmax; rmin[m] = cmin; }
-        float k_c = a->scale * wt->s[m];
-        /* Keep k_c for the parameter pass below, which needs the same
-         * product. It is stored in the row's first parameter slot, which
-         * that pass overwrites after reading it. */
-        __builtin_memcpy(&par[3 * m], &k_c, 4);
-        float bias = wt->b ? wt->b[m] : 0.0f;
-        float hi = (float)cmax * k_c + bias;
-        float lo = (float)cmin * k_c + bias;
-        /* Compare the magnitudes as integers. For floats that are not
-         * negative, the order of the bit patterns is the order of the
-         * values, so this finds the same maximum without two library
-         * calls per row. */
-        uint32_t ah, al;
-        float fah = dav2_fabsf(hi), fal = dav2_fabsf(lo);
-        __builtin_memcpy(&ah, &fah, 4);
-        __builtin_memcpy(&al, &fal, 4);
-        if (ah > amax_bits) amax_bits = ah;
-        if (al > amax_bits) amax_bits = al;
+        /* k_c = input scale * row scale, kept in the row's first two
+         * parameter words for the parameter pass below */
+        dav2_xf_t k_c = xf_mul(a->scale, wt->s[m]);
+        par[3 * m] = k_c.m;
+        par[3 * m + 1] = k_c.sh;
+        dav2_xf_t hi = xf_mul(xf_from_int(cmax), k_c);
+        dav2_xf_t lo = xf_mul(xf_from_int(cmin), k_c);
+        if (wt->b) {
+            hi = xf_add(hi, wt->b[m]);
+            lo = xf_add(lo, wt->b[m]);
+        }
+        if (xf_cmp_abs(hi, amax) > 0) amax = xf_abs(hi);
+        if (xf_cmp_abs(lo, amax) > 0) amax = xf_abs(lo);
     }
-    __builtin_memcpy(&amax, &amax_bits, 4);
     if (run == 2) {
         /* every row's statistics have been read, so the job is done or
          * failed; collect it (and learn which) */
@@ -533,8 +550,9 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
         if (!dav2_accel_finish()) goto redo_on_cpu;
         waited += dav2_cycles() - w0;
     }
-    float out_scale = (amax > 0.0f) ? amax * (1.0f / (float)DAV2_ACT_QMAX) : 1.0f;
-    float inv_out = 1.0f / out_scale;
+    const dav2_xf_t qmax = xf_from_int(DAV2_ACT_QMAX);
+    dav2_xf_t out_scale = amax.m ? xf_div(amax, qmax) : XF_ONE;
+    dav2_xf_t inv_out = xf_recip(out_scale);
 
     /* ---- requantisation ---------------------------------------------------
      *
@@ -546,11 +564,11 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
 #define PAR_UPTO(end_m) do {                                                  \
         for (; par_done < (end_m); par_done++) {                              \
             int m_ = par_done, sh_;                                           \
-            float k_;                /* a->scale * wt->s[m_], see above */ \
-            __builtin_memcpy(&k_, &par[3 * m_], 4);                                     \
-            dav2_make_multiplier(k_ * inv_out, &par[3 * m_], &sh_);           \
+            dav2_xf_t k_ = { par[3 * m_], par[3 * m_ + 1] };  /* see above */ \
+            xf_to_mult(xf_mul(k_, inv_out), &par[3 * m_], &sh_);              \
             par[3 * m_ + 1] = sh_;                                            \
-            par[3 * m_ + 2] = wt->b ? iround(wt->b[m_] * inv_out) : 0;        \
+            par[3 * m_ + 2] = wt->b                                           \
+                ? (int32_t)xf_round(xf_mul(wt->b[m_], inv_out), 0) : 0;       \
         }                                                                     \
     } while (0)
 
@@ -560,7 +578,7 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
         enum { RQ_CHUNK = 256 };          /* <= CAPS.KMAX/4, the add-mode limit */
         int32_t rq_amax = 0;
         int ok = 1;
-        float fin_scale = out_scale;
+        dav2_xf_t fin_scale = out_scale;
         dav2_rq_epi_t epi;
         memset(&epi, 0, sizeof epi);
         epi.relu = relu;
@@ -586,13 +604,9 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
                 if (e1 > amax_h) amax_h = e1;
             }
             int32_t amax_x = res->amax_q >= 0 ? res->amax_q : amax_scan(res);
-            /* as in dav2_add (the sum is commutative, so operand order
-             * does not matter) */
-            float bound = (float)amax_x * res->scale + (float)amax_h * out_scale;
-            fin_scale = (bound > 0.0f) ? bound * (1.0f / (float)DAV2_ACT_QMAX) : 1.0f;
-            float inv = 1.0f / fin_scale;
-            dav2_make_multiplier(res->scale * inv, &epi.mx, &epi.sx);
-            dav2_make_multiplier(out_scale * inv, &epi.mh, &epi.sh);
+            /* exactly as dav2_add(res, h) computes them */
+            add_params(amax_x, res->scale, amax_h, out_scale,
+                       &fin_scale, &epi.mx, &epi.sx, &epi.mh, &epi.sh);
             epi.x = res->v;
             epi.add = 1;
         }
@@ -735,21 +749,25 @@ static inline int32_t ln_y(int32_t x, int32_t mean16, int32_t am, int ash,
 }
 
 
-void dav2_layernorm(const dav2_tensor_t *in, const float *g, const float *b,
-                    dav2_tensor_t *out)
+void dav2_layernorm(const dav2_tensor_t *in, const int32_t *gq,
+                    const int32_t *bq, dav2_tensor_t *out)
 {
     const int N = in->n, C = in->c;
     const size_t mark = dav2_arena_mark();
     PROF_START();
 
-    /* The core has no FPU: every float operation is a library call of
-     * 50-150 cycles. The statistics are per row (N = 82 of them) and stay
-     * in float; the per-element work (N*C = 31k) is fixed point:
+    /* All integer. Per element (N*C = 31k):
      *
      *   y = (x - mean) * (s * inv_std) * g[c] + b[c]
      *
      * with x - mean in Q16, s*inv_std as a (mult, shift) pair per row, g in
-     * Q15 and b in Q16. y comes out in Q16 -- resolution 1.5e-5 against an
+     * Q15 and b in Q16, both converted offline (dav2_blob_int.py). Per row
+     * (N = 82), the statistics are exact integers:
+     *
+     *   var_q = (C * sum(x^2) - sum(x)^2) / C^2        (in units of s^2)
+     *   s * inv_std = s / sqrt(var_q * s^2 + eps) = 1 / sqrt(var_q + eps/s^2)
+     *
+     * and the reciprocal square root is a Newton iteration (xf_rsqrt). y comes out in Q16 -- resolution 1.5e-5 against an
      * output step of ~1e-3 after quantisation to 14 bits -- and is then
      * requantised to the tensor's common scale.
      *
@@ -758,15 +776,13 @@ void dav2_layernorm(const dav2_tensor_t *in, const float *g, const float *b,
      * storing it was slower: on this core a load and a store cost less
      * than the twelve instructions of arithmetic they replace. */
     int32_t *y16 = (int32_t *)dav2_arena_alloc((size_t)N * C * sizeof(int32_t));
-    int32_t *gq  = (int32_t *)dav2_scratch;               /* g[c] in Q15 */
-    int32_t *bq  = gq + C;                                /* b[c] in Q16 */
     if (!y16) { dav2_arena_release(mark); return; }
-    for (int c = 0; c < C; c++) {
-        gq[c] = iround(g[c] * 32768.0f);
-        bq[c] = iround(b[c] * 65536.0f);
-    }
 
-    const float s = in->scale;
+    /* per call: 1/C^2 and eps/s^2, eps = 1e-6 as in PyTorch (the exact
+     * float32 value 1e-6f, 0x358637bd) */
+    const dav2_xf_t inv_c2 = xf_recip(xf_from_int((int64_t)C * C));
+    const dav2_xf_t inv_s  = xf_recip(in->scale);
+    const dav2_xf_t eps_s2 = xf_mul(xf_from_f32_bits(0x358637bdu), xf_mul(inv_s, inv_s));
     const int wide = (((uintptr_t)in->v | (uintptr_t)out->v) & 3u) == 0 && (C & 3) == 0;
     int32_t amax = 0;
     for (int n = 0; n < N; n++) {
@@ -789,19 +805,15 @@ void dav2_layernorm(const dav2_tensor_t *in, const float *g, const float *b,
                 sq += (int64_t)d * (int64_t)d;
             }
         }
-        /* mean/variance in the integer domain, then converted once per row.
-         * sq <= 384 * 8191^2 = 2.6e10, so sq/C fits comfortably in int32 */
-        float mean_q = (float)sum / (float)C;
-        float mean_sq = (float)(int32_t)(sq / C)
-                      + (float)(int32_t)(sq % C) / (float)C;
-        float var_q = mean_sq - mean_q * mean_q;
-        if (var_q < 0.0f) var_q = 0.0f;
-        /* variance in real units = var_q * s^2; eps matches PyTorch's 1e-6 */
-        float inv_std = 1.0f / dav2_sqrtf(var_q * s * s + 1e-6f);
-
-        int32_t mean16 = iround(mean_q * 65536.0f);        /* |x| <= 8191: fits */
+        int64_t num = (int64_t)C * sq - (int64_t)sum * sum;   /* C^2 * var_q, exact */
+        if (num < 0) num = 0;
+        dav2_xf_t v = xf_add(xf_mul(xf_from_int(num), inv_c2), eps_s2);
         int32_t am; int ash;
-        dav2_make_multiplier(s * inv_std, &am, &ash);
+        xf_to_mult(xf_rsqrt(v), &am, &ash);                   /* s * inv_std */
+
+        /* mean in Q16, rounded half away from zero */
+        int64_t s16 = (int64_t)sum * 65536;
+        int32_t mean16 = (int32_t)(s16 >= 0 ? (s16 + C / 2) / C : -((-s16 + C / 2) / C));
 
         int32_t *orow = y16 + (size_t)n * C;
         if (wide) {
@@ -829,10 +841,10 @@ void dav2_layernorm(const dav2_tensor_t *in, const float *g, const float *b,
     }
 
     /* common output scale, then the second pass writes the result */
-    float out_scale = (amax > 0) ? (float)amax * (1.0f / 65536.0f)
-                                  * (1.0f / (float)DAV2_ACT_QMAX) : 1.0f;
-    int32_t om; int osh;
-    dav2_make_multiplier((1.0f / 65536.0f) / out_scale, &om, &osh);
+    dav2_xf_t out_scale = amax > 0 ? xf_div(xf_norm(amax, 16), xf_from_int(DAV2_ACT_QMAX))
+                                   : XF_ONE;
+    int32_t om; int osh;                         /* Q16 -> output units */
+    xf_to_mult(xf_div(xf_norm(1, 16), out_scale), &om, &osh);
     const int total = N * C;
     int32_t omax = 0;
     if (wide) {
@@ -901,13 +913,9 @@ void dav2_add(const dav2_tensor_t *a, const dav2_tensor_t *b, dav2_tensor_t *out
             if (vb > amax_b) amax_b = vb;
         }
     }
-    float bound = (float)amax_a * a->scale + (float)amax_b * b->scale;
-    float out_scale = (bound > 0.0f) ? bound * (1.0f / (float)DAV2_ACT_QMAX) : 1.0f;
-    float inv = 1.0f / out_scale;
-
+    dav2_xf_t out_scale;
     int32_t ma, mb; int sa, sb;
-    dav2_make_multiplier(a->scale * inv, &ma, &sa);
-    dav2_make_multiplier(b->scale * inv, &mb, &sb);
+    add_params(amax_a, a->scale, amax_b, b->scale, &out_scale, &ma, &sa, &mb, &sb);
 
     int32_t omax = 0;
     if (wide) {
@@ -972,24 +980,41 @@ void dav2_relu(dav2_tensor_t *t)
  * linear interpolation reproduces it to well below quantisation noise. The
  * table costs 257 float evaluations per call, versus 126k for direct
  * evaluation. */
+/* gelu(x) = x * Phi(x), with Phi the normal distribution function, read
+ * from the table dav2_gelu_phi (Q30, z = -8 + i/128, generated offline by
+ * dav2_blob_int.py --phi-header) with linear interpolation. The
+ * interpolation error is below 2e-6; torch.nn.GELU's default is this exact
+ * erf form. */
+#define gelu_phi dav2_gelu_phi
+
+static dav2_xf_t gelu_xf(dav2_xf_t x)
+{
+    const dav2_xf_t eight = { 1 << 30, 27 };             /* 8.0 */
+    if (xf_cmp_abs(x, eight) >= 0)
+        return x.m > 0 ? x : XF_ZERO;                   /* Phi = 1 or 0 */
+    int64_t u = xf_round(x, 20) + ((int64_t)-DAV2_PHI_Z0 << 20);  /* (z + 8) in Q20 */
+    int32_t idx = (int32_t)(u >> (20 - DAV2_PHI_STEP_LOG2));
+    int32_t frac = (int32_t)(u & ((1 << (20 - DAV2_PHI_STEP_LOG2)) - 1));
+    int64_t lo = gelu_phi[idx], hi = gelu_phi[idx + 1];
+    int64_t phi = lo + (((hi - lo) * frac) >> (20 - DAV2_PHI_STEP_LOG2));
+    return xf_mul(x, xf_norm(phi, DAV2_PHI_Q));
+}
+
 void dav2_gelu(dav2_tensor_t *t)
 {
-    float lut_f[257];
-    const float s = t->scale;
     PROF_START();
-    float amax = 0.0f;
+    dav2_xf_t g[257];
+    dav2_xf_t amax = XF_ZERO;
     for (int i = 0; i < 257; i++) {
-        float x = (float)(i * 64 - 8192) * s;
-        lut_f[i] = dav2_gelu_f(x);
-        float a = dav2_fabsf(lut_f[i]);
-        if (a > amax) amax = a;
+        g[i] = gelu_xf(xf_mul(xf_from_int(i * 64 - 8192), t->scale));
+        if (xf_cmp_abs(g[i], amax) > 0) amax = xf_abs(g[i]);
     }
-    float out_scale = (amax > 0.0f) ? amax * (1.0f / (float)DAV2_ACT_QMAX) : 1.0f;
-    float inv = 1.0f / out_scale;
+    dav2_xf_t out_scale = amax.m ? xf_div(amax, xf_from_int(DAV2_ACT_QMAX)) : XF_ONE;
+    dav2_xf_t inv = xf_recip(out_scale);
 
     int16_t lut[257];
     for (int i = 0; i < 257; i++)
-        lut[i] = sat_act(iround(lut_f[i] * inv));
+        lut[i] = sat_act((int32_t)xf_round(xf_mul(g[i], inv), 0));
 
     /* One 32-bit word per interval: the value at the left end in the low
      * half and the step to the right end in the high half. The step is at
@@ -1048,24 +1073,32 @@ void dav2_interpolate(const dav2_tensor_t *in, int h, int w,
     int *x1a = (int *)dav2_arena_alloc((size_t)ow * sizeof(int));
     int *wxa = (int *)dav2_arena_alloc((size_t)ow * sizeof(int));
 
-    /* align_corners=true, matching F.interpolate. Weights in Q8. */
-    float sy = (oh > 1) ? (float)(h - 1) / (float)(oh - 1) : 0.0f;
-    float sx = (ow > 1) ? (float)(w - 1) / (float)(ow - 1) : 0.0f;
+    /* align_corners=true, matching F.interpolate. Weights in Q8. The
+     * source position of output row i is i*(h-1)/(oh-1): its integer part
+     * and its fraction, as an exact ratio of integers, rounded to Q8. */
     for (int i = 0; i < oh; i++) {
-        float f = (float)i * sy;
-        int i0 = (int)f;
+        int i0 = 0, wq = 0;
+        if (oh > 1) {
+            int num = i * (h - 1), den = oh - 1;
+            i0 = num / den;
+            wq = ((num % den) * 512 + den) / (2 * den);
+        }
         if (i0 > h - 1) i0 = h - 1;
-        int i1 = (i0 + 1 < h) ? i0 + 1 : h - 1;
-        y0a[i] = i0; y1a[i] = i1;
-        wya[i] = iround((f - (float)i0) * 256.0f);
+        y0a[i] = i0;
+        y1a[i] = (i0 + 1 < h) ? i0 + 1 : h - 1;
+        wya[i] = wq;
     }
     for (int j = 0; j < ow; j++) {
-        float f = (float)j * sx;
-        int j0 = (int)f;
+        int j0 = 0, wq = 0;
+        if (ow > 1) {
+            int num = j * (w - 1), den = ow - 1;
+            j0 = num / den;
+            wq = ((num % den) * 512 + den) / (2 * den);
+        }
         if (j0 > w - 1) j0 = w - 1;
-        int j1 = (j0 + 1 < w) ? j0 + 1 : w - 1;
-        x0a[j] = j0; x1a[j] = j1;
-        wxa[j] = iround((f - (float)j0) * 256.0f);
+        x0a[j] = j0;
+        x1a[j] = (j0 + 1 < w) ? j0 + 1 : w - 1;
+        wxa[j] = wq;
     }
 
     for (int i = 0; i < oh; i++) {
