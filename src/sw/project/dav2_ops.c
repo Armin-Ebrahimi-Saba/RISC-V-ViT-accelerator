@@ -196,7 +196,11 @@ void dav2_make_multiplier(float m, int32_t *mult, int *shift)
     int e;
     int64_t q;
     uint32_t bits;
-    memcpy(&bits, &m, 4);
+    /* __builtin_memcpy, not memcpy: the flow compiles with -fno-builtin, so
+     * a plain memcpy here is a call to libsys's byte-by-byte copy. The
+     * builtin is a register move. (The same holds for every 4-byte bit
+     * copy in this file.) */
+    __builtin_memcpy(&bits, &m, 4);
     if (((bits >> 23) & 0xffu) != 0u) {
         /* Normal float: the mantissa with its hidden bit is m's frexp
          * fraction times 2^24, so f * 2^31 is exactly mantissa << 7 and the
@@ -276,7 +280,13 @@ static inline int16_t sat_act(int32_t v)
 
 static inline int32_t iround(float f)
 {
-    return (int32_t)(f >= 0.0f ? f + 0.5f : f - 0.5f);
+    /* Round half away from zero. The sign is taken from the float's sign
+     * bit, not from a comparison: the core has no FPU, so "f >= 0.0f" is a
+     * library call. The results are the same, including for -0.0f (both
+     * forms give 0). */
+    uint32_t bits;
+    __builtin_memcpy(&bits, &f, 4);
+    return (int32_t)((bits >> 31) ? f - 0.5f : f + 0.5f);
 }
 
 void dav2_quantize_f32(const float *src, int n, int c, dav2_tensor_t *out)
@@ -464,7 +474,8 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
     /* Exact output range, including bias, so nothing clips. The per-row
      * extremes come from the accelerator's drain when it produced them (two
      * words per row per tile); otherwise from a scan of acc. */
-    float amax = 0.0f;
+    float amax;
+    uint32_t amax_bits = 0;               /* bit pattern of +0.0f */
     for (int m = 0; m < M; m++) {
         int32_t cmax, cmin;
         if (st.tiles) {
@@ -496,13 +507,25 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
         }
         if (rmax) { rmax[m] = cmax; rmin[m] = cmin; }
         float k_c = a->scale * wt->s[m];
+        /* Keep k_c for the parameter pass below, which needs the same
+         * product. It is stored in the row's first parameter slot, which
+         * that pass overwrites after reading it. */
+        __builtin_memcpy(&par[3 * m], &k_c, 4);
         float bias = wt->b ? wt->b[m] : 0.0f;
         float hi = (float)cmax * k_c + bias;
         float lo = (float)cmin * k_c + bias;
-        float ah = dav2_fabsf(hi), al = dav2_fabsf(lo);
-        if (ah > amax) amax = ah;
-        if (al > amax) amax = al;
+        /* Compare the magnitudes as integers. For floats that are not
+         * negative, the order of the bit patterns is the order of the
+         * values, so this finds the same maximum without two library
+         * calls per row. */
+        uint32_t ah, al;
+        float fah = dav2_fabsf(hi), fal = dav2_fabsf(lo);
+        __builtin_memcpy(&ah, &fah, 4);
+        __builtin_memcpy(&al, &fal, 4);
+        if (ah > amax_bits) amax_bits = ah;
+        if (al > amax_bits) amax_bits = al;
     }
+    __builtin_memcpy(&amax, &amax_bits, 4);
     if (run == 2) {
         /* every row's statistics have been read, so the job is done or
          * failed; collect it (and learn which) */
@@ -523,8 +546,9 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
 #define PAR_UPTO(end_m) do {                                                  \
         for (; par_done < (end_m); par_done++) {                              \
             int m_ = par_done, sh_;                                           \
-            dav2_make_multiplier(a->scale * wt->s[m_] * inv_out,              \
-                                 &par[3 * m_], &sh_);                         \
+            float k_;                /* a->scale * wt->s[m_], see above */ \
+            __builtin_memcpy(&k_, &par[3 * m_], 4);                                     \
+            dav2_make_multiplier(k_ * inv_out, &par[3 * m_], &sh_);           \
             par[3 * m_ + 1] = sh_;                                            \
             par[3 * m_ + 2] = wt->b ? iround(wt->b[m_] * inv_out) : 0;        \
         }                                                                     \
@@ -967,12 +991,20 @@ void dav2_gelu(dav2_tensor_t *t)
     for (int i = 0; i < 257; i++)
         lut[i] = sat_act(iround(lut_f[i] * inv));
 
+    /* One 32-bit word per interval: the value at the left end in the low
+     * half and the step to the right end in the high half. The step is at
+     * most 2 * 8191 in magnitude, so it fits an int16. The interpolation
+     * below then needs one load per element instead of two; a load from
+     * on-chip RAM costs about 10 cycles on this core. Same arithmetic as
+     * lut[i] + ((lut[i+1] - lut[i]) * f >> 6). */
+    uint32_t lutp[256];
+    for (int i = 0; i < 256; i++)
+        lutp[i] = pack16(lut[i], lut[i + 1] - lut[i]);
+
     const int total = t->n * t->c;
 #define GELU_LUT(x) ({ int32_t u_ = (int32_t)(x) + 8192;   /* [1, 16383] */ \
-                       int32_t i_ = u_ >> 6;              /* [0, 255]   */ \
-                       int32_t f_ = u_ & 63;                               \
-                       int32_t l_ = lut[i_], h_ = lut[i_ + 1];             \
-                       l_ + (((h_ - l_) * f_) >> 6); })
+                       uint32_t e_ = lutp[u_ >> 6];       /* [0, 255]   */ \
+                       lo16(e_) + ((hi16(e_) * (u_ & 63)) >> 6); })
     int32_t omax = 0;
     if (words_ok(t->v, t->v, t->v, total)) {
         uint32_t *w = (uint32_t *)t->v;

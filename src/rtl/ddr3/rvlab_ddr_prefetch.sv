@@ -122,6 +122,18 @@ module rvlab_ddr_prefetch #(
     assign be_req_xchg = be_req_o.a_valid && be_rsp_i.a_ready;
     assign be_rsp_xchg = be_rsp_i.d_valid && be_req_o.d_ready;
 
+    // rsp_now[i]: entry i's DRAM data arrives in this cycle. An entry that
+    // is marked out of date in the same cycle must go to Invalid, not
+    // Stale: Stale means "a response is still on its way", and none is.
+    // A Stale entry cannot be allocated, so one wrongly left Stale is lost
+    // for good; with all SIZE of them lost, no read miss reaches DRAM and
+    // the port stops answering (seen on the board as a hung frame).
+    logic [SIZE-1:0] rsp_now;
+    always_comb
+        for (int i = 0; i < SIZE; i++)
+            rsp_now[i] = be_rsp_xchg && be_rsp_i.d_opcode == AccessAckData
+                      && be_rsp_i.d_anc == ADRW'(i);
+
     always_ff @(posedge clk_i or negedge rst_ni) begin
         if (~rst_ni) begin
             for (int i = 0; i < SIZE; i++) begin
@@ -154,7 +166,7 @@ module rvlab_ddr_prefetch #(
             if (fe_req_xchg && fe_req_i.a_opcode != Get) begin
                 for (int i = 0; i < SIZE; i++) begin
                     if (addr_match_mask[i] && (pending_mask[i] || valid_mask[i])) begin
-                        entry_states[i] <= (pending_mask[i] ? Stale : Invalid);
+                        entry_states[i] <= (pending_mask[i] && !rsp_now[i]) ? Stale : Invalid;
                     end
                 end
             end
@@ -168,8 +180,9 @@ module rvlab_ddr_prefetch #(
                 // is still on the way. Decide by the entry's own state.
                 for (int i = 0; i < SIZE; i++) begin
                     if (addr_le_mask[i] && entry_states[i] != Invalid)
-                        entry_states[i] <= (entry_states[i] == Pending ||
-                                            entry_states[i] == Stale) ? Stale : Invalid;
+                        entry_states[i] <= ((entry_states[i] == Pending ||
+                                             entry_states[i] == Stale) && !rsp_now[i])
+                                           ? Stale : Invalid;
                 end
             end
         end
@@ -264,5 +277,39 @@ module rvlab_ddr_prefetch #(
             be_req_o.a_valid = '1;
         end
     end
+
+`ifndef SYNTHESIS
+    // Simulation-only checks for entries that can never be reused.
+    // (1) Stale means "a DRAM response is still on its way, and its data is
+    //     out of date". An entry that is Stale in the cycle after its
+    //     response arrived will never receive another one, so it is lost.
+    // (2) No entry can be allocated for a long time while a request waits.
+    int sim_lost_entries = 0;
+    int sim_noalloc_cnt  = 0;
+    logic [SIZE-1:0] sim_rsp_q;
+    always_ff @(posedge clk_i) begin
+        if (!rst_ni) begin
+            sim_rsp_q <= '0;
+        end else begin
+            for (int i = 0; i < SIZE; i++) begin
+                sim_rsp_q[i] <= be_rsp_xchg && be_rsp_i.d_opcode == AccessAckData
+                             && be_rsp_i.d_anc == i;
+                if (sim_rsp_q[i] && entry_states[i] == Stale) begin
+                    sim_lost_entries++;
+                    $display("PREFETCH CHECK @%0t: entry %0d is Stale after its response arrived -- lost (%0d so far)",
+                             $time, i, sim_lost_entries);
+                end
+            end
+            if (fe_req_i.a_valid && !can_allocate) begin
+                sim_noalloc_cnt++;
+                if (sim_noalloc_cnt == 5000)
+                    $display("PREFETCH CHECK @%0t: no entry could be allocated for 5000 cycles while a request waits",
+                             $time);
+            end else begin
+                sim_noalloc_cnt = 0;
+            end
+        end
+    end
+`endif
 
 endmodule

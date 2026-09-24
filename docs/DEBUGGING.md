@@ -274,8 +274,53 @@ and the drop decides from each entry's own state. The alias test fails
 with the repair and the prefetcher in the path. The GEMM-through-cache
 testbench passes with it too. Only the first route was shown to fail
 before its fix; the second was found by reading and has no failing test.
-The prefetcher is back on (`USE_PREFETCH = 1'b1`). **Not yet run on the
-board.**
+The prefetcher is back on (`USE_PREFETCH = 1'b1`).
+
+### The repair introduced a hang
+
+On the board the repaired prefetcher ran two full frames correctly. The
+third frame stopped in the DPT head and printed nothing more.
+
+**Symptom.** The accelerator's registers, read over JTAG while the core
+was stuck, showed the block in DRAIN with 8 writes sent and none of them
+acknowledged (1336 issued, 1328 acknowledged), and no retries. The DDR3
+watchdog showed exactly one request waiting at the DDR3 port. It was a read
+of `0x817b05c0` from the accelerator's read slot 7, and its stall counter
+was saturated. The DDR3 block answers requests in order, so the writes were
+waiting behind that one read.
+
+**Cause.** The repair made `Stale` entries unusable for new requests,
+because a `Stale` entry still has a DRAM response on its way. But an entry
+can become `Stale` in the same cycle that its response arrives. Two places
+mark entries out of date: a write to the entry's address, and the drop of
+entries at or below an answered address. Both run after the response
+handling in the same clock cycle, so their `Stale` overrides the `Valid` or
+`Invalid` that the response set. After that no response is on its way, so
+nothing ever changes the entry again. It is lost for good. The table has
+four entries. When all four are lost, no read miss can be sent to DRAM,
+and the port stops answering. That is the stall the watchdog showed.
+
+**Evidence.** A simulation-only check in `rvlab_ddr_prefetch.sv` reports
+any entry that is `Stale` in the cycle after its response arrived. On the
+code with the defect, `rvlab_ddr_alias_tb` loses entries 0 and 1 during its
+first phase, the cold-cache write phase. The test still passes only because
+it ends before the other two are lost. The full hang was not reproduced in
+simulation: longer mixed and repeated phases lost no more entries, and a
+two-entry table (`PF_SIZE=2`) changes the timing so that none are lost. The
+board showed the hang after about three frames.
+
+**Fix.** When an entry is marked out of date in the same cycle its
+response arrives, it becomes `Invalid`, not `Stale` (`rsp_now` in
+`rvlab_ddr_prefetch.sv`). With the fix the same test loses no entries, and
+it finishes in 16.3 ms of simulated time instead of 18.2 ms, because all
+four entries stay available. `student_gemm_ddrpath_tb` passes as well.
+`rvlab_ddr_alias_tb` gained two phases for this: a mixed read/write stress
+with a stall detector, and repeated aliasing writes.
+
+The earlier repair caused this failure. It changed which states count as
+free, and it did not check every place that writes the state in the same
+cycle. When several blocks write the same state in one cycle, each pair of
+writers needs a check, not only each writer.
 
 ---
 
@@ -477,14 +522,14 @@ not testing what you think.
 |---|---|---|
 | `a_ready` from the idle error responder; requests accepted by nobody | `rvlab_tlul_ddr.sv` | source `a_ready` from the module that will accept |
 | write-back uses stale RAM output for a line written the previous cycle | `rvlab_ddr_block_cache.sv` | `a_data: data_rdata` |
-| prefetcher returns aliased lines | `rvlab_ddr_prefetch.sv` | slot reused while its response was in flight; **repaired** (not yet on the board) |
+| prefetcher returns aliased lines | `rvlab_ddr_prefetch.sv` | slot reused while its response was in flight; **repaired**. The repair could lose entries and hang the port; fixed too, confirmed on the board |
 
 Plus the cache's `d_ready` defect, **worked around** by the skid buffer and
 the accelerator's retry rather than fixed at source.
 
 **Not done.**
 
-- ~~The prefetcher is bypassed~~ Repaired and back on; see §5. Board run owed.
+- ~~The prefetcher is bypassed~~ Repaired and back on; see §5. Confirmed on the board.
 - `student_gemm`'s retry covers reads only; a lost write ack would still
   wedge it. Unlikely now that requests are never swallowed, but real. The
   retry is per reorder slot since the block runs with eight reads in flight;

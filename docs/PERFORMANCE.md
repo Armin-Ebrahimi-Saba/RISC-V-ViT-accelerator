@@ -1,4 +1,4 @@
-# Performance — how one frame went from 93.6 s to 8.7 s
+# Performance — how one frame went from 93.6 s to 8.2 s
 
 This is the record of the speed-up work: what was measured, what each change
 did, and what is left. Every step kept the FPGA output **bit-exact with the
@@ -8,7 +8,8 @@ reference on the demo image went from 0.999836 to 0.999872 along the way
 for speed). Sections 5–7 (rounds two to five) were developed and verified in
 simulation and on the accelerator emulator while the board was unavailable;
 §6 has the measurement taken once the board came back, confirming bit-exact
-output at 8.667 s per frame.
+output at 8.667 s per frame. §6 also covers round six, which brought the
+frame to 8.187 s.
 
 Terms used below: *frame* — one 126×126 depth map; *GEMM* — a matrix
 multiplication, the accelerator's job; *requantisation* — turning the int32
@@ -21,32 +22,32 @@ sums a GEMM produces back into int16 activations with a per-row scale;
 
 | | Start of the work | After round 1 (measured) | **Current (measured, §6)** |
 |---|---|---|---|
-| Frame time (inference only) | 93.6 s | 14.2 s | **8.667 s** |
-| Frames per second | 0.0107 | 0.0704 | **0.1153** |
+| Frame time (inference only) | 93.6 s | 14.2 s | **8.187 s** |
+| Frames per second | 0.0107 | 0.0704 | **0.1221** |
 | Result readout to the PC | ~30 s (hex text over the console) | 0.7 s (JTAG system bus) | 0.74 s |
-| Accelerator | 16 multipliers, 1 read in flight, 8.3 cycles/beat | 64 multipliers, 8 in flight, 3.2 cycles/beat | **128 multipliers, 8 in flight, 2.2 cycles/beat** |
+| Accelerator | 16 multipliers, 1 read in flight, 8.3 cycles/beat | 64 multipliers, 8 in flight, 3.2 cycles/beat | **128 multipliers, 8 in flight, 2.1 cycles/beat** |
 | FPGA output vs host build | bit-exact | bit-exact | **bit-exact (15876/15876)** |
 | Correlation with PyTorch (demo) | 0.999836 | 0.999872 | 0.999872 |
 | LUT / BRAM / DSP | 12.4 % / 23.0 % / 3.1 % | 14.8 % / 36.9 % / 10.4 % | **18.9 % / 54.4 % / 20.4 %** |
-| Timing (WNS, 50 MHz) | +0.287 ns | +0.121 ns | **+0.173 ns** |
+| Timing (WNS, 50 MHz) | +0.287 ns | +0.121 ns | **+0.395 ns** |
 
-Where the 8.667 s goes now (cycles at 50 MHz, measured on the board — see
+Where the 8.187 s goes now (cycles at 50 MHz, measured on the board — see
 §6 for the full profile and how it compares to the 14.2 s breakdown below):
 
-| Operator | Mcycles (14.2 s) | Mcycles (8.7 s) | Runs on |
+| Operator | Mcycles (14.2 s) | Mcycles (8.2 s) | Runs on |
 |---|---|---|---|
-| LayerNorm | 128 | 98 | CPU |
-| requantisation | 101 | 97 | CPU sets up, accelerator converts (+ fused add/ReLU) |
-| attention | 114 | 89 | CPU; the two matmuls on the accelerator |
-| GELU | 51 | 60 | CPU |
-| other | — | 31 | mixed |
+| LayerNorm | 128 | 97 | CPU |
+| attention | 114 | 87 | CPU; the two matmuls on the accelerator |
+| requantisation | 101 | 82 | CPU sets up, accelerator converts (+ fused add/ReLU) |
+| GELU | 51 | 57 | CPU |
 | interpolate | 63* | 30 | CPU |
+| other | — | 28 | mixed |
 | GEMM | 93 | **15** | accelerator (128-row tile, repaired prefetcher) |
 | add/relu | 92 | **12** | fused into the requantisation job (accelerator) |
 | im2col | 67 | **1** | gather mode (accelerator) |
 
 *the 14.2 s column's "interpolate, misc" bucket is split into "interpolate"
-and "other" in the 8.7 s profile.
+and "other" in the 8.2 s profile.
 
 GEMM, the residual add/ReLU, and im2col are no longer worth optimising —
 gather mode and the fused epilogue removed nearly all of their CPU-side and
@@ -409,17 +410,46 @@ requantisation setup, and attention are now the largest shares, and all
 three are CPU arithmetic that never touches the accelerator.** This
 replaces the estimate-based priority list that follows; §7 reflects it.
 
+### Round six — fewer float library calls, and a prefetcher hang fixed
+
+Measured on the board: **8.187 s per frame (0.1221 FPS)**, five frames in a
+row, each 8.186 to 8.196 s, all five bit-exact with the host build. All
+three boot self-tests printed `ok`.
+
+| Change | Where | Effect (Mcycles) |
+|---|---|---|
+| The per-row range pass compares the float magnitudes as integers (the bit patterns of floats that are not negative have the same order as the values), and keeps the product `a->scale * s[m]` for the parameter pass instead of computing it twice. `iround` reads the float's sign bit instead of calling a float comparison. | `dav2_ops.c` | requantisation 97 → 82 |
+| The GELU table stores one 32-bit word per interval: the value in the low half and the step to the next value in the high half. One load per element instead of two. | `dav2_ops.c` | GELU 60 → 57 |
+| Every 4-byte bit copy uses `__builtin_memcpy`. The flow compiles with `-fno-builtin`, so a plain `memcpy` is a call to libsys's byte-by-byte copy. `dav2_make_multiplier` had called it once per weight row since round two. | `dav2_ops.c` | included above |
+
+The first build of these changes used a plain `memcpy` for the bit copies
+and made the frame *slower* (8.829 s): requantisation rose from 97 to 103
+Mcycles. The disassembly showed the calls to the byte-copy `memcpy`.
+
+The first board run of the corrected build hung in the third frame. The
+cause was a defect in the round-three prefetcher repair: an entry could be
+lost for good when its DRAM response arrived in the same cycle it was
+marked out of date, and with all four entries lost no read reached DRAM.
+`DEBUGGING.md` §5 has the full account. The fix is in
+`rvlab_ddr_prefetch.sv`; the bitstream was rebuilt (WNS +0.395 ns). The
+five-frame run above is on the fixed bitstream.
+
+The accelerator report printed 1270 and 1265 jobs for two of the frames,
+against 1268 in earlier runs. The outputs are bit-exact, so the work done
+is the same; the job count depends on where the CPU and the accelerator
+meet during the overlapped parts.
+
 ## 7. What is left, in order of expected gain
 
-Based on the measured 8.667 s profile (§6), not the earlier estimate.
+Based on the measured 8.187 s profile (§6, round six), not the earlier estimate.
 
 | Item | Now (measured) | Estimate | How |
 |---|---|---|---|
-| LayerNorm | 98 Mcycles | −40 | per-row `1/sqrt` still calls the soft-float library; a fixed-point Newton iteration or a small LUT plus one correction step would remove it. A third accelerator job (row and column parameters, per-row `1/sqrt`) is the alternative considered and rejected in round three: real gain, real hardware risk. |
-| requantisation setup | 97 | −40 | `make_multiplier` still runs once per weight row per GEMM (~45 000 calls/frame) on the CPU. Half of it could move into the requant job itself: the block already knows the row range from its own drain, so shift/multiplier derivation could become a small per-row hardware step instead of a CPU one, ahead of the streamed conversion. |
-| attention | 89 | −30 | the softmax's 2^-x approximation and the per-head gather/split loops are the largest remaining scalar loops on the CPU; further unrolling and moving the score-shift search into the accelerator's own row-max output (already available from `S_hi`/`S_lo`'s GEMM) would help. |
-| GELU | 60 | −15 | already unrolled and packed two elements per word (`GELU_LUT` on `lo16`/`hi16`); the per-element cost is two data-dependent loads from the 257-entry table for the interpolation, which is inherent to linear interpolation and not removable without a coarser table. The 257-entry table itself is rebuilt in float once per call (12 times/frame); a cheaper table build is the more likely gain here. |
-| interpolate + other | 61 | −15 | never profiled in detail; the bilinear resize loops in the DPT head are the largest remaining candidate. |
+| LayerNorm | 97 Mcycles | −40 | per-row `1/sqrt` still calls the soft-float library; a fixed-point Newton iteration or a small LUT plus one correction step would remove it. A third accelerator job (row and column parameters, per-row `1/sqrt`) is the alternative considered and rejected in round three: real gain, real hardware risk. |
+| requantisation setup | 82 | −25 | `make_multiplier` still runs once per weight row per GEMM (~45 000 calls/frame) on the CPU. Half of it could move into the requant job itself: the block already knows the row range from its own drain, so shift/multiplier derivation could become a small per-row hardware step instead of a CPU one, ahead of the streamed conversion. |
+| attention | 87 | −30 | the softmax's 2^-x approximation and the per-head gather/split loops are the largest remaining scalar loops on the CPU; further unrolling and moving the score-shift search into the accelerator's own row-max output (already available from `S_hi`/`S_lo`'s GEMM) would help. |
+| GELU | 57 | −10 | already unrolled and packed two elements per word (`GELU_LUT` on `lo16`/`hi16`); the per-element cost is two data-dependent loads from the 257-entry table for the interpolation, which is inherent to linear interpolation and not removable without a coarser table. The 257-entry table itself is rebuilt in float once per call (12 times/frame); a cheaper table build is the more likely gain here. |
+| interpolate + other | 58 | −15 | never profiled in detail; the bilinear resize loops in the DPT head are the largest remaining candidate. |
 | GEMM, add/relu, im2col | 28 combined | ~0 | at 2.2 cycles/beat and mostly overlapped with CPU work, these are no longer worth further hardware changes on their own. |
 
 All of these together would land around 6–6.5 s per frame. Beyond that the
