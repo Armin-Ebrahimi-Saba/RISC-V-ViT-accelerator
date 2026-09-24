@@ -86,6 +86,16 @@ class Program(Block):
         r.mem = cwd / "sw.mem"
         r.disasm = cwd / "sw.disasm"
 
+        # Optional extra compiler/linker flags for this program, one per
+        # line, "#" starts a comment. Absent file: no extra flags.
+        extra_flags = []
+        flags_file = main_dir / "build_flags.txt"
+        if flags_file.exists():
+            for line in flags_file.read_text().splitlines():
+                line = line.split("#", 1)[0].strip()
+                if line:
+                    extra_flags.append(line)
+
         build_sw(
             cwd=cwd,
             srcs=srcs,
@@ -99,6 +109,7 @@ class Program(Block):
                 reggen.c_include_dir,
             ],
             include_quote=[],
+            extra_flags=extra_flags,
         )
 
         return r

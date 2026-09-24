@@ -439,6 +439,40 @@ against 1268 in earlier runs. The outputs are bit-exact, so the work done
 is the same; the job count depends on where the CPU and the accelerator
 meet during the overlapped parts.
 
+### How much time the soft-float routines take
+
+The CV32E40P has no FPU, so every float operation in C is a call to a
+libgcc routine (`__mulsf3`, `__addsf3`, ...). To measure them, the linker
+option `--wrap` sends each call to a wrapper that counts it and times the
+real routine (`dav2_floatprof.c`). It is switched on in
+`src/sw/project/build_flags.txt`, which is read by `flow/sw.py`.
+`tools/dav2_floatprof_map.py` maps the call sites to functions and source
+lines. The counter costs about 93 cycles per call, so it is off by default.
+
+Measured on the board, one frame: **1.11 million calls, 102 Mcycles**. That
+is about 2.0 s of the 8.19 s frame, or 25 %.
+
+| Routine | Calls | Cycles per call |
+|---|---|---|
+| `__mulsf3` | 429,803 | 115 |
+| `__addsf3` | 221,042 | 97 |
+| `__floatsisf` | 154,804 | 64 |
+| `__fixsfsi` | 107,827 | 35 |
+| `__subsf3` | 73,303 | 110 |
+| `__lesf2` | 50,345 | 44 |
+| `__gtsf2` | 37,784 | 54 |
+| `__divsf3` | 21,010 | 194 |
+| others | 14,628 | 35 to 46 |
+
+| Where the float time goes | Mcycles |
+|---|---|
+| Requantisation parameters per weight row (`qgemm_impl` range and parameter passes, bias rounding, `dav2_make_multiplier`) | ~48 |
+| Token matrix, built once per frame but element by element in float (`dav2_engine.c` class and position embedding, then `dav2_quantize_f32`) | ~17 |
+| GELU table (`dav2_gelu_f`, `dav2_erff`, `dav2_expf`) | ~16 |
+| LayerNorm row statistics and γ/β conversion (`dav2_layernorm`, `dav2_sqrtf`) | ~14 |
+| Final depth map to float | ~2 |
+| Resize weights, softmax scale, adds | <1 |
+
 ## 7. What is left, in order of expected gain
 
 Based on the measured 8.187 s profile (§6, round six), not the earlier estimate.

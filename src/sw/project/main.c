@@ -439,6 +439,7 @@ int main(void)
         dav2_set_image(image, *image_scale);
         printf("frame %u: image scale %d/1e6\n", frame, (int)(*image_scale * 1e6f));
 
+        dav2_floatprof_reset();     /* count only this frame's float calls */
         uint64_t t0 = cycles64();
         dav2_infer(&cfg, depth);
         uint64_t t1 = cycles64();
@@ -461,6 +462,7 @@ int main(void)
         }
         printf("arena peak %u KB\n", (unsigned)(dav2_arena_peak() / 1024u));
         dav2_accel_report();        /* jobs, cycles/beat and retries this frame */
+        dav2_floatprof_report(t1 - t0);   /* prints only with build_flags.txt */
 
         print_ascii_depth(depth, out_size, 63);
 

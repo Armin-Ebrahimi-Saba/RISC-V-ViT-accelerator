@@ -212,4 +212,9 @@ void     dav2_prof_add(int bucket, uint64_t cycles);
 uint64_t dav2_prof_get(int bucket);
 void     dav2_prof_report(uint64_t frame_cycles);   /* prints the table */
 
+/* Soft-float call counter, dav2_floatprof.c. Does nothing unless the
+ * program is built with build_flags.txt (see that file). */
+void     dav2_floatprof_reset(void);
+void     dav2_floatprof_report(uint64_t frame_cycles);
+
 #endif /* DAV2_H */

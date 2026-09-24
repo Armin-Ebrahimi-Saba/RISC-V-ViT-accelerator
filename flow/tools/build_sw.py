@@ -68,7 +68,8 @@ def build_static_lib(cwd, srcs: list[Path], output_a_filename:Path,
 
 def build_sw(cwd, srcs: list[Path], ldscript: Path,
     output_elf_filename:Path, output_disasm_filename:Path=None, output_mem_filename:Path=None,
-    arch: str=cfg_arch, abi: str=cfg_abi, include_system: list[Path]=[], include_quote: list[Path]=[], static_libs: list[Path]=[]):
+    arch: str=cfg_arch, abi: str=cfg_abi, include_system: list[Path]=[], include_quote: list[Path]=[], static_libs: list[Path]=[],
+    extra_flags: list[str]=[]):
     
     prefix, zicsr_compat = find_toolchain_prefix()
     if not zicsr_compat and arch.endswith('_zicsr'):
@@ -86,6 +87,7 @@ def build_sw(cwd, srcs: list[Path], ldscript: Path,
     for path in include_quote:
         cc_cmdline += ["-iquote", str(path)]
     cc_cmdline += get_cflags(abi, arch)
+    cc_cmdline += list(extra_flags)
     cc_cmdline += libs
     for l in static_libs:
         cc_cmdline += [str(l)]

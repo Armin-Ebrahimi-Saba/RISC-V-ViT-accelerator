@@ -1,0 +1,24 @@
+# Extra compiler and linker flags for this program, read by flow/sw.py.
+# One flag per line; "#" starts a comment.
+#
+# The lines below switch on the soft-float call counter in dav2_floatprof.c.
+# Each --wrap sends calls of one libgcc float routine to a wrapper that
+# counts and times it, then calls the real routine. Results are unchanged.
+# Measured cost: about 93 cycles per float call, which made one frame
+# 10.26 s instead of 8.19 s. So the counter is off by default. To switch it
+# on, remove the "#" in front of every line below, then run
+#   flow sw_project.build
+# and afterwards map the call sites with tools/dav2_floatprof_map.py.
+#-DDAV2_FLOAT_PROFILE=1
+#-Wl,--wrap=__addsf3
+#-Wl,--wrap=__subsf3
+#-Wl,--wrap=__mulsf3
+#-Wl,--wrap=__divsf3
+#-Wl,--wrap=__floatsisf
+#-Wl,--wrap=__floatunsisf
+#-Wl,--wrap=__fixsfsi
+#-Wl,--wrap=__fixsfdi
+#-Wl,--wrap=__gesf2
+#-Wl,--wrap=__gtsf2
+#-Wl,--wrap=__lesf2
+#-Wl,--wrap=__ltsf2
