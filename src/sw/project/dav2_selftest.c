@@ -104,13 +104,15 @@ uint32_t dav2_selftest(void)
         dav2_tensor_t a = dav2_tensor_new(6, 64);
         for (int i = 0; i < 6 * 64; i++) a.v[i] = rng_act();
         a.scale = xf_norm(577, 20);               /* ~5.5e-4 */
+        dav2_tensor_t out = dav2_tensor_new(6, 64);
         static int32_t g[64], b[64];              /* Q15 and Q16 */
         for (int i = 0; i < 64; i++) {
             g[i] = 16384 + (int32_t)(rng_next() % 100u) * 328;         /* 0.5..1.5 */
             b[i] = ((int32_t)(rng_next() % 200u) - 100) * 66;          /* +-0.1 */
         }
-        dav2_tensor_t out = dav2_tensor_new(6, 64);
         dav2_layernorm(&a, g, b, &out);
+        h = hash_tensor(h, &out);
+        dav2_layernorm(&a, 0, 0, &out);           /* the folded final norm */
         h = hash_tensor(h, &out);
     }
 

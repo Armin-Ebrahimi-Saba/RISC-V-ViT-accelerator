@@ -3,12 +3,34 @@
 The board has no FPU. export_dav2.py writes every weight matrix as int8, but
 it keeps the small per-row and per-channel parameters in float32. This
 script replaces them by integer forms, so the engine needs no floating
-point at all. It reads a version 2 blob and writes a version 3 blob:
+point at all. It reads a version 2 blob and writes a version 4 blob.
+
+First it folds the final LayerNorm's parameters into the four DPT
+projections, the only layers that read its output. LayerNorm computes
+z = (x - mean) / std, and then y = z * gamma + beta. For a linear layer
+W y + b = (W diag(gamma)) z + (W beta + b). So gamma is multiplied into the
+columns of W and W beta is added to the bias, in float64 from the float32
+weights of the checkpoint, and the result is quantised to int8 per row as
+export_dav2.py quantises every weight. The engine then skips gamma and
+beta for this norm, which makes it about four times faster. This needs the
+checkpoint (--ckpt, default: the Hugging Face cache).
+
+The block norms (norm1, norm2) are not folded. Folding them into qkv and
+fc1 was tried and lowers the accuracy: gamma spreads the columns of W, so
+the per-row int8 scale gets coarser. Over five test images the mean of
+1 - r (correlation with the float model) rose from 1.6e-4 to 1.0e-3. The
+final norm's fold leaves it at 1.5e-4.
+
+Then the float parameters become integers:
 
   <layer>.s   row scale       float32 (M)    -> int32 (M, 2): (m, sh)
   <layer>.b   row bias        float32 (M)    -> int32 (M, 2): (m, sh)
-  *norm*.w    LayerNorm gamma float32 (C)    -> int32 (C): Q15
-  *norm*.b    LayerNorm beta  float32 (C)    -> int32 (C): Q16
+  norm.w, norm.b              removed (folded, see above)
+  blk*.norm*.w  LayerNorm gamma float32 (C)  -> int32 (C): Q15
+  blk*.norm*.b  LayerNorm beta  float32 (C)  -> int32 (C): Q16
+
+gamma and beta are rounded exactly as the engine used to round them at run
+time (float32 product, then +-0.5 in float32, then truncation).
   cls_token, pos_embed        float32        -> int32: Q24
   image, image_scale          removed (images are sent separately)
 
@@ -21,13 +43,9 @@ because the boot self-test uses GELU before the weights are loaded.
 A float32 has a 24-bit mantissa, so this form holds it exactly. It is also
 the (multiplier, shift) pair the engine's integer arithmetic uses.
 
-gamma and beta are rounded exactly as the engine used to round them at run
-time (float32 product, then +-0.5 in float32, then truncation), so
-LayerNorm gets the same integers as before.
-
 Usage:
-    python3 dav2_blob_int.py build/dav2/dav2_weights.bin            # in place
-    python3 dav2_blob_int.py in.bin out.bin
+    python3 dav2_blob_int.py build/dav2/dav2_weights_f32.bin build/dav2/dav2_weights.bin
+    python3 dav2_blob_int.py in.bin out.bin --ckpt depth_anything_v2_vits.pth
     python3 dav2_blob_int.py --phi-header src/sw/project/dav2_gelu_phi.h
 """
 import math
@@ -39,7 +57,7 @@ import numpy as np
 
 MAGIC = 0x32564144
 VERSION_FLOAT = 2
-VERSION_INT = 3
+VERSION_INT = 4     # 3 was integer parameters without the final-norm fold
 DT_F32, DT_I8, DT_I16, DT_I32 = 0, 1, 2, 3
 NAME_LEN = 40
 REC_SIZE = NAME_LEN + 8 * 4
@@ -115,6 +133,64 @@ def round_like_engine(f32, factor):
     return np.trunc(r).astype("<i4")
 
 
+def quant_rows(w2d):
+    """Per-row symmetric int8, exactly as export_dav2.Blob.add_quant_weight."""
+    w2d = np.asarray(w2d, dtype=np.float32)
+    amax = np.abs(w2d).max(axis=1)
+    scale = np.where(amax > 0, amax / 127.0, 1.0).astype(np.float32)
+    q = np.clip(np.rint(w2d / scale[:, None]), -127, 127).astype(np.int8)
+    return q, scale
+
+
+def default_ckpt():
+    """The checkpoint dav2_common.py uses (DAV2_CKPT, else the Hugging Face
+    hub or its cache). dav2_common itself needs the model code; this does
+    not."""
+    import os
+    if os.environ.get("DAV2_CKPT"):
+        return os.environ["DAV2_CKPT"]
+    cached = sorted(Path.home().glob(".cache/huggingface/hub/models--depth-anything--"
+                                     "Depth-Anything-V2-Small/snapshots/*/"
+                                     "depth_anything_v2_vits.pth"))
+    if cached:
+        return str(cached[-1])
+    from huggingface_hub import hf_hub_download
+    return hf_hub_download("depth-anything/Depth-Anything-V2-Small",
+                           "depth_anything_v2_vits.pth")
+
+
+def fold_layernorm(recs, sd):
+    """Fold the final LayerNorm's gamma and beta into proj0..3.
+
+    sd is the checkpoint's state dict (numpy arrays or tensors). Each
+    (name, W, bias, norm) below is the float32 weight matrix the exporter
+    quantised for that layer, with its bias, and the LayerNorm in front."""
+    def g(k):
+        v = sd[k]
+        return np.asarray(v.numpy() if hasattr(v, "numpy") else v, dtype=np.float32)
+
+    layers = []
+    for i in range(4):
+        layers.append((f"proj{i}", g(f"depth_head.projects.{i}.weight")[:, :, 0, 0],
+                       g(f"depth_head.projects.{i}.bias"), "pretrained.norm"))
+
+    by_name = {r[0]: r for r in recs}
+    for name, w, bias, norm in layers:
+        old_q = np.frombuffer(by_name[name + ".w"][3], dtype=np.int8)
+        q0, _ = quant_rows(w)
+        if q0.tobytes() != old_q.tobytes():
+            raise SystemExit(f"{name}: the checkpoint does not match the blob")
+        gamma = g(norm + ".weight").astype(np.float64)
+        beta = g(norm + ".bias").astype(np.float64)
+        w64 = w.astype(np.float64)
+        q, scale = quant_rows((w64 * gamma[None, :]).astype(np.float32))
+        b_new = (bias.astype(np.float64) + w64 @ beta).astype(np.float32)
+        by_name[name + ".w"][3] = q.tobytes()
+        by_name[name + ".s"][3] = scale.tobytes()
+        by_name[name + ".b"][3] = b_new.tobytes()
+    return [r for r in recs if r[0] not in ("norm.w", "norm.b")]
+
+
 def phi_table():
     n = 16 * (1 << PHI_STEP_LOG2) + 1
     z = PHI_Z0 + np.arange(n, dtype=np.float64) / (1 << PHI_STEP_LOG2)
@@ -131,15 +207,15 @@ def convert(recs):
             out.append([name, dt, dims, data])
             continue
         f = np.frombuffer(data, dtype="<f4")
-        if name in ("cls_token", "pos_embed"):
+        if "norm" in name and name.endswith(".w"):
+            out.append([name, DT_I32, dims, round_like_engine(f, 32768.0).tobytes()])
+        elif "norm" in name and name.endswith(".b"):
+            out.append([name, DT_I32, dims, round_like_engine(f, 65536.0).tobytes()])
+        elif name in ("cls_token", "pos_embed"):
             if np.abs(f).max() >= (1 << (31 - POS_Q)):
                 raise SystemExit(f"{name} too large for Q{POS_Q}")
             q = np.rint(f.astype(np.float64) * (1 << POS_Q)).astype("<i4")
             out.append([name, DT_I32, dims, q.tobytes()])
-        elif "norm" in name and name.endswith(".w"):
-            out.append([name, DT_I32, dims, round_like_engine(f, 32768.0).tobytes()])
-        elif "norm" in name and name.endswith(".b"):
-            out.append([name, DT_I32, dims, round_like_engine(f, 65536.0).tobytes()])
         elif name.endswith(".s") or name.endswith(".b"):
             out.append([name, DT_I32, [len(f), 2], mant_shift(f).tobytes()])
         else:
@@ -172,8 +248,14 @@ def main():
     if sys.argv[1] == "--phi-header":
         write_phi_header(sys.argv[2])
         return
-    src = Path(sys.argv[1])
-    dst = Path(sys.argv[2]) if len(sys.argv) > 2 else src
+    args = sys.argv[1:]
+    ckpt = None
+    if "--ckpt" in args:
+        k = args.index("--ckpt")
+        ckpt = args[k + 1]
+        del args[k:k + 2]
+    src = Path(args[0])
+    dst = Path(args[1]) if len(args) > 1 else src
     ver, recs = read_blob(src.read_bytes())
     if ver == VERSION_INT:
         print(f"{src} is already version {VERSION_INT}; nothing to do")
@@ -182,7 +264,9 @@ def main():
         return
     if ver != VERSION_FLOAT:
         raise SystemExit(f"{src}: version {ver}, expected {VERSION_FLOAT}")
-    new = convert(recs)
+    import torch
+    sd = torch.load(ckpt or default_ckpt(), map_location="cpu")
+    new = convert(fold_layernorm(recs, sd))
     raw = write_blob(new, VERSION_INT)
     dst.write_bytes(raw)
     n_f32 = sum(1 for r in new if r[1] == DT_F32)

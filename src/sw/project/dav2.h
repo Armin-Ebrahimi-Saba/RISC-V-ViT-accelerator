@@ -48,12 +48,12 @@
 /* ------------------------------------------------------------------ blob */
 
 #define DAV2_MAGIC    0x32564144u   /* 'DAV2' */
-#define DAV2_VERSION  3u   /* 3: integer parameters (tools/dav2_blob_int.py) */
+#define DAV2_VERSION  4u   /* 4: integer parameters, final norm folded (tools/dav2_blob_int.py) */
 #define DAV2_NAME_LEN 40
 
 enum { DAV2_DT_F32 = 0, DAV2_DT_I8 = 1, DAV2_DT_I16 = 2, DAV2_DT_I32 = 3 };
 
-/* Integer formats of the parameters in a version 3 blob. */
+/* Integer formats of the parameters in a version 4 blob. */
 #define DAV2_POS_Q        24   /* cls_token, pos_embed: value = int / 2^24     */
 #define DAV2_LN_G_Q       15   /* LayerNorm gamma                              */
 #define DAV2_LN_B_Q       16   /* LayerNorm beta                               */
@@ -131,7 +131,10 @@ void dav2_qgemm(const dav2_tensor_t *a, const dav2_qw_t *w, dav2_tensor_t *out);
 void dav2_qgemm_ex(const dav2_tensor_t *a, const dav2_qw_t *wt,
                    const dav2_tensor_t *res, int relu, dav2_tensor_t *out);
 
-/* LayerNorm over channels, producing a fresh dynamic scale. */
+/* LayerNorm over channels, producing a fresh dynamic scale. g_q15 = NULL
+ * means no gamma and beta: out = (in - mean) / std. That is the final norm,
+ * whose gamma and beta are folded offline into proj0..3
+ * (tools/dav2_blob_int.py). */
 void dav2_layernorm(const dav2_tensor_t *in, const int32_t *g_q15,
                     const int32_t *b_q16, dav2_tensor_t *out);
 
@@ -226,6 +229,26 @@ void     dav2_prof_reset(void);
 void     dav2_prof_add(int bucket, uint64_t cycles);
 uint64_t dav2_prof_get(int bucket);
 void     dav2_prof_report(uint64_t frame_cycles);   /* prints the table */
+
+/* A finer split of some buckets above, printed after the table. Each
+ * detail is part of one bucket; the rest of the bucket is not itemised. */
+enum {
+    DAV2_SUB_LN_STATS,      /* layernorm: row statistics                   */
+    DAV2_SUB_LN_Y,          /* layernorm: gamma, beta, int32 intermediate  */
+    DAV2_SUB_LN_OUT,        /* layernorm: requantise the intermediate      */
+    DAV2_SUB_RQ_RANGE,      /* requantise: output range from row extremes  */
+    DAV2_SUB_RQ_PAR,        /* requantise: per-row multiplier and bias     */
+    DAV2_SUB_ATT_PREP_QK,   /* attention: gather, shift and split q, k     */
+    DAV2_SUB_ATT_PREP_V,    /* attention: gather and split v^T             */
+    DAV2_SUB_ATT_SOFTMAX,   /* attention: scores to probabilities          */
+    DAV2_SUB_ATT_NORM,      /* attention: context / sum                    */
+    DAV2_SUB_ATT_WAIT,      /* attention: waiting for the accelerator      */
+    DAV2_SUB_GELU_TABLE,    /* gelu: build the table                       */
+    DAV2_SUB_N
+};
+extern const char *const dav2_sub_name[DAV2_SUB_N];
+void     dav2_sub_add(int d, uint64_t cycles);
+uint64_t dav2_sub_get(int d);
 
 /* Soft-float call counter, dav2_floatprof.c. Does nothing unless the
  * program is built with build_flags.txt (see that file). */

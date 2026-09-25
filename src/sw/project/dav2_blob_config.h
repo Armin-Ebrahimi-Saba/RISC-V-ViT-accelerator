@@ -11,6 +11,6 @@
 #define DAV2_PATCH_GRID   9
 #define DAV2_N_TOKENS     82
 #define DAV2_N_PATCHES    81
-#define DAV2_BLOB_BYTES   25140616u
+#define DAV2_BLOB_BYTES   25137352u
 
 #endif

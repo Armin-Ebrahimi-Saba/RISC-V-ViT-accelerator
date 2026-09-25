@@ -213,13 +213,13 @@
 <circle cx="60" cy="1259" r="11" fill="#1c7ed6"/>
 <text x="60" y="1263" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">11</text>
 <text x="76" y="1263" font-weight="600" font-size="11">softmax per query row:  S = 16·S_hi + S_lo;  P[t][m] = 2^((S[t][m] −</text>
-<text x="76" y="1277" font-weight="600" font-size="11">max_t)·scale·log2e) in Q15</text>
+<text x="76" y="1277" font-weight="600" font-size="11">max_t)·scale·log2e) in Q15, then divided by the row sum</text>
 <rect x="70" y="1284.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="74" y="1294" font-size="9">arena</text>
 <text x="111.0" y="1293" font-size="10">R  S_hi, S_lo [82 × 82]</text>
 <rect x="70" y="1297.5" width="49" height="12" rx="3" fill="#fff3bf" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="74" y="1307" font-size="9">scratch</text>
-<text x="122.6" y="1306" font-size="10">R  score row [82] int32</text>
+<text x="122.6" y="1306" font-size="10">(none: S is read twice)</text>
 <rect x="70" y="1310.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="74" y="1320" font-size="9">arena</text>
 <text x="111.0" y="1319" font-size="10">W  P [82 × 84] int16 (Q15, padded), sum[82] int32, 1/sum[82] int64</text>
@@ -257,11 +257,11 @@
 <rect x="60" y="1461" width="520" height="87" rx="6" fill="#fff" stroke="#1c7ed6" stroke-width="1.6"/>
 <circle cx="60" cy="1473" r="11" fill="#1c7ed6"/>
 <text x="60" y="1477" text-anchor="middle" fill="#fff" font-weight="700" font-size="10.5">13</text>
-<text x="76" y="1477" font-weight="600" font-size="11">normalise:  ctx[t][d] = (64·C_hi + C_lo)[d][t] / sum[t]   (reciprocal + one</text>
-<text x="76" y="1491" font-weight="600" font-size="11">correction step: exact)</text>
+<text x="76" y="1477" font-weight="600" font-size="11">normalise:  ctx[t][d] = ((64·C_hi + C_lo)[d][t] + 2^14) >> 15   (P already</text>
+<text x="76" y="1491" font-weight="600" font-size="11">sums to 2^15 per row, so no division)</text>
 <rect x="70" y="1498.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="74" y="1508" font-size="9">arena</text>
-<text x="111.0" y="1507" font-size="10">R  C_hi, C_lo [64 × 82], sum, 1/sum</text>
+<text x="111.0" y="1507" font-size="10">R  C_hi, C_lo [64 × 82]</text>
 <rect x="70" y="1511.5" width="49" height="12" rx="3" fill="#fff3bf" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="74" y="1521" font-size="9">scratch</text>
 <text x="122.6" y="1520" font-size="10">W  ctx head slice [82 × 64], assembled then copied out</text>
@@ -379,7 +379,7 @@
 <text x="91.0" y="2198" font-size="10">R  x [82 × 384]</text>
 <rect x="50" y="2202.5" width="31" height="12" rx="3" fill="#c3fae8" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="2212" font-size="9">blob</text>
-<text x="85.2" y="2211" font-size="10">R  norm γ, β [384] Q15, Q16 (the final norm)</text>
+<text x="85.2" y="2211" font-size="10">final norm: γ, β folded into proj0..3 offline</text>
 <rect x="50" y="2215.5" width="37" height="12" rx="3" fill="#e5dbff" stroke="#2b8a3e" stroke-width="0.6"/>
 <text x="54" y="2225" font-size="9">arena</text>
 <text x="91.0" y="2224" font-size="10">W  feats[i] [81 × 384] int16,  i = 0..3  (a 9 × 9 grid of 384-vectors)</text>

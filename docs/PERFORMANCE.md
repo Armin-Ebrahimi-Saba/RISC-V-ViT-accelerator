@@ -512,11 +512,94 @@ correlation is 0.999862 (before: 0.999872). The mean relative error is
 gain is fitted, the mean relative error is 0.66 % (before: 0.65 %). The
 new and the old output differ by at most 1.9 % of the largest value.
 
+### Round eight — CPU work, estimated without the board (not yet measured)
+
+The board was not connected for this round. The changes were checked on
+the PC, and their cycles were estimated with a new tool,
+`tools/cyclemodel/`. It runs the engine's RISC-V build in the Unicorn CPU
+emulator with a timing model of the CV32E40P:
+
+| Cost | Cycles |
+|---|---|
+| any instruction | 1 |
+| taken branch | +3 |
+| `mulh`, `mulhu`, `mulhsu` | +5 |
+| load / store in the on-chip RAM | +4 / +2 |
+| load / store in DDR3 (cache hit) | +0.2 / +0.2 |
+
+These constants reproduce all eight results of the board's boot
+microbenchmark within 0.3 cycles per iteration. The accelerator is
+replaced by stubs whose jobs finish at once, so the tool counts CPU time
+only. For the committed round-seven engine it gives these totals per
+frame, next to the board's profile:
+
+| Operator | Tool (Mcycles) | Board (Mcycles) |
+|---|---|---|
+| attention | 88.3 | 86.6 |
+| layernorm | 85.3 | 86.4 |
+| gelu | 43.8 | 43.3 |
+| interpolate | 28.3 | 29.1 |
+| add/relu | 13.4 | 12.3 |
+| requantise | 59.4 | 74.2 |
+
+The requantise bucket differs because on the board it also contains the
+time the CPU waits for the drain.
+
+One result of the model changed the plan. A load from the on-chip RAM
+costs about 4 cycles more than a DDR3 cache hit (board: 11.0 against 7.1
+cycles per loop iteration). Staging data in `dav2_scratch` or on the stack
+is therefore slower than reading it again from DDR3.
+
+| Change | Where | Tool, per call (Mcycles) |
+|---|---|---|
+| Requantisation parameters: every row scale and bias is shifted to one exponent per matrix. The range pass and the parameter pass then need a few `mulh` per row instead of the general (m, sh) routines. All rows of a GEMM share one shift; the multipliers are not normalised, which the block and `apply_multiplier` allow. | `dav2_ops.c` | qkv GEMM 1.36 → 0.33 |
+| Softmax divides each row of probabilities by its sum (one reciprocal per row). The context is then `(64 c_hi + c_lo + 2^14) >> 15` in 32 bits, without a 64-bit division trick per element. The scores are read twice from DDR3 instead of stored in on-chip RAM. The shift is fixed per head, and the loops are unrolled. | `dav2_engine.c` | attention, one block 6.9 → 4.6 |
+| q and k are read directly from DDR3, two values per load. Their range is the OR of the absolute values (the shift depends only on the highest set bit), without compares. | `dav2_engine.c` | in the line above |
+| LayerNorm with γ and β: squares summed in 32 bits, 64 at a time; every product is one `mulh` with the shift fixed per row or per tensor. The output range comes from the extremes of y. | `dav2_ops.c` | 3.34 → 2.04 |
+| The final LayerNorm (4 calls) has no γ and β: they are folded offline into proj0..3 (`dav2_blob_int.py`, blob version 4). | `dav2_ops.c`, `dav2_blob_int.py` | 3.34 → 1.10 |
+| GELU: the table is in the DDR3 arena instead of on the stack, and the output range is not tracked (only fc2's GEMM reads the output, and it needs the scale alone). | `dav2_ops.c` | 3.63 → 2.14 |
+| Bilinear resize: separable, each source row resampled horizontally once and kept in one of two row buffers; two channels per word. Same arithmetic, the same output bit for bit. | `dav2_ops.c` | 72→126 × 32: 15.1 → 9.2 |
+
+Folding γ and β of the block LayerNorms into qkv and fc1 was also tried.
+It was rejected: γ spreads the columns of W, and the per-row int8 scale
+gets coarser. Measured with the NumPy model (`dav2_numpy.py`, 14-bit
+activations) against its float version over five images, the mean of
+1 − r rose from 1.6e-4 to 1.0e-3. With 16-bit weights the folded model is
+as good as the unfolded one, so the loss is the weights' quantisation.
+Only the final norm's fold is neutral (1.5e-4).
+
+Estimated whole frame, CPU time only (tool):
+
+| Operator | Round seven (Mcycles) | Round eight (Mcycles) |
+|---|---|---|
+| requantise | 59.4 | 16.5 |
+| attention | 88.3 | 57.1 |
+| layernorm | 85.3 | 62.7 |
+| gelu | 43.8 | 25.9 |
+| interpolate | 28.3 | 16.8 |
+| add/relu | 13.4 | 13.1 |
+| other | 10.8 | 10.8 |
+| total | 329.2 | 202.9 |
+
+On the board round seven took 360 Mcycles, of which about 15 were waits
+for the accelerator. If the waits stay the same, round eight would take
+about 220 to 235 Mcycles, 4.4 to 4.7 s per frame. The waits may grow,
+because the CPU now finishes its work sooner. This has to be measured.
+
+Checked on the PC: `dav2_host` and `dav2_host_emu` give the same output
+on all five test images. The results changed in the last bits, as
+expected. Against the float model over five images, the mean of 1 − r is
+1.9e-4 (round seven: 3.1e-4). On the demo image the correlation with
+PyTorch is 0.999897 (round seven: 0.999862). `sw.elf` still contains no
+soft-float routine. The profile now also prints a detail table (row
+statistics, parameter passes, the phases of attention).
+
 ## 7. What is left, in order of expected gain
 
 Based on the measured 8.187 s profile (§6, round six), not the earlier
 estimate. Round seven removed the float routines named in this table;
-LayerNorm is now 86, requantisation 74 and GELU 43 Mcycles.
+LayerNorm is now 86, requantisation 74 and GELU 43 Mcycles. Round eight
+addresses most rows of this table; its estimate is in §6.
 
 | Item | Now (measured) | Estimate | How |
 |---|---|---|---|

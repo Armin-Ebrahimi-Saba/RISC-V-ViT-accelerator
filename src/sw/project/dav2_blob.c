@@ -35,8 +35,8 @@ int dav2_blob_check(void)
     if (blob_hdr->version != DAV2_VERSION) {
         printf("dav2: blob version %lu, engine expects %lu%s\n",
                (unsigned long)blob_hdr->version, (unsigned long)DAV2_VERSION,
-               blob_hdr->version == 2u
-                   ? " -- convert it with tools/dav2_blob_int.py" : "");
+               blob_hdr->version < DAV2_VERSION
+                   ? " -- convert the float blob with tools/dav2_blob_int.py" : "");
         return 1;
     }
     return 0;

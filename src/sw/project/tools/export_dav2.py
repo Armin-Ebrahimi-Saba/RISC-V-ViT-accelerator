@@ -26,7 +26,8 @@ the FPGA flow. Run this in a separate Python environment.
 The exporter first builds a version 2 blob, in which the small per-row
 and per-channel parameters are float32. It keeps that file as
 build/dav2/dav2_weights_f32.bin. It then converts it with dav2_blob_int.py
-to version 3, in which every parameter is an integer, and writes that as
+to version 4, in which the LayerNorm parameters are folded into the next
+layers and every parameter is an integer, and writes that as
 build/dav2/dav2_weights.bin. The engine reads only version 3; the board has
 no FPU. Images travel separately (dav2_image.py), not in the blob.
 
@@ -246,7 +247,8 @@ def build(sd, pos_embed, image_chw, size, out_dir):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import dav2_blob_int
     _, recs = dav2_blob_int.read_blob(raw_f32)
-    raw = dav2_blob_int.write_blob(dav2_blob_int.convert(recs), dav2_blob_int.VERSION_INT)
+    raw = dav2_blob_int.write_blob(dav2_blob_int.convert(dav2_blob_int.fold_layernorm(recs, sd)),
+                                   dav2_blob_int.VERSION_INT)
     (out_dir / "dav2_weights.bin").write_bytes(raw)
 
     cfg_text = f"""/* SPDX-License-Identifier: CC0-1.0

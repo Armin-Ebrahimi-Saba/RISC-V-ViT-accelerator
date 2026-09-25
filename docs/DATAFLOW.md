@@ -161,9 +161,9 @@ approximation.
 |---|---|
 | 9 | The CPU gathers this head's slice of the query, key and value vectors. It splits the query and value vectors into high and low int8 halves. |
 | 10a, 10b | Two GEMMs compute the attention scores, one from the high halves and one from the low halves. They do not depend on each other, but run one after another today. |
-| 11 | Softmax. The CPU turns each row of scores into probabilities. |
+| 11 | Softmax. The CPU turns each row of scores into probabilities and divides them by the row sum, so that each row sums to 2^15. |
 | 12a, 12b | Two more GEMMs combine the probabilities with the value vector's high and low halves. |
-| 13 | The CPU divides by each row's probability sum and writes this head's result. |
+| 13 | The CPU rounds the result to the value scale (a shift by 15) and writes this head's result. No division is needed, because the probabilities are already divided by their sum. |
 
 **DPT decoder**
 

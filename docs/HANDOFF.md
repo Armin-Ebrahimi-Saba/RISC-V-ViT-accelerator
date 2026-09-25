@@ -33,9 +33,17 @@ address, each a 95 kB transfer (~0.26 s), and runs them in turn. Any
 JPEG/PNG works — PIL, numpy and torch are installed in the venv.
 
 **The weight file has no floats.** `build/dav2/dav2_weights.bin` is blob
-version 3: every parameter is an integer. The engine rejects version 2.
+version 4: every parameter is an integer, and the final LayerNorm's gamma
+and beta are folded into proj0..3. The engine rejects other versions.
 `tools/dav2_blob_int.py` converts a version 2 file (the float version is
-kept as `dav2_weights_f32.bin`), and `export_dav2.py` calls it itself.
+kept as `dav2_weights_f32.bin`); it needs the checkpoint for the fold (the
+Hugging Face cache, or `--ckpt`). `export_dav2.py` calls it itself.
+
+**Round eight is not measured on the board yet.** The board was not
+connected. Its changes are verified on the PC (host build, accelerator
+emulator, five test images) and estimated with `tools/cyclemodel/`
+(`PERFORMANCE.md` §6, round eight). The next board run must confirm the
+frame time and that the output is bit-exact with `dav2_host`.
 
 | Measurement | Value |
 |---|---|
