@@ -142,6 +142,8 @@ void dav2_layernorm(const dav2_tensor_t *in, const int32_t *g_q15,
 void dav2_add(const dav2_tensor_t *a, const dav2_tensor_t *b, dav2_tensor_t *out);
 
 void dav2_relu(dav2_tensor_t *t);
+/* dst = relu(src), in one pass (dst preallocated with src's shape) */
+void dav2_copy_relu(dav2_tensor_t *dst, const dav2_tensor_t *src);
 void dav2_gelu(dav2_tensor_t *t);
 
 /* NHWC bilinear resize with align_corners=true, matching F.interpolate. */

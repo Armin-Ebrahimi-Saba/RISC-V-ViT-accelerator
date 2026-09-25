@@ -132,23 +132,40 @@ import os
 BYFN = os.environ.get("BYFN") == "1"
 
 def line_profile(elf, prof, top=25):
+    import pickle
+    pickle.dump(prof, open(elf + ".prof", "wb"))
     import subprocess, glob, collections
     import shutil, os
     a2l = shutil.which("riscv-none-elf-addr2line") or sorted(glob.glob(
         os.path.expanduser("~/Public/xpack-riscv-none-elf-gcc-*/bin/riscv-none-elf-addr2line")))[-1]
     addrs = sorted(prof)
-    out = subprocess.run([a2l, "-f", "-i", "-e", elf] + ["%x" % a for a in addrs], capture_output=True, text=True).stdout.splitlines()
-    # with -i, inlined frames add lines; take the first (innermost) pair per address
-    # by re-running per address is slow, so use -f without -i
-    out = subprocess.run([a2l, "-f", "-e", elf] + ["%x" % a for a in addrs], capture_output=True, text=True).stdout.splitlines()
+    # -i lists the inline chain, innermost first; an address without code
+    # after each address marks where its chain ends
+    args = []
+    for a in addrs:
+        args += ["%x" % a, "fffffff0"]
+    out = subprocess.run([a2l, "-f", "-i", "-e", elf] + args, capture_output=True,
+                         text=True).stdout.splitlines()
     by = collections.Counter()
-    for i, a in enumerate(addrs):
-        fn, loc = out[2 * i], out[2 * i + 1]
-        key = fn if BYFN else "%s %s" % (fn, loc.split("/")[-1].split(" ")[0])
+    k = 0
+    for a in addrs:
+        chain = []
+        while not (out[k] == "??" and out[k + 1].startswith("??:")):
+            chain.append((out[k], out[k + 1]))
+            k += 2
+        k += 2
+        fn, loc = chain[0] if chain else ("??", "??")
+        outer = chain[-1][0] if chain else "??"
+        key = outer if BYFN else "%s %s" % (fn, loc.split("/")[-1].split(" ")[0])
         by[key] += prof[a]
     tot = sum(by.values())
     for loc, c in by.most_common(top):
         print("  %-44s %9.0f %5.1f%%" % (loc, c, 100.0 * c / tot))
+
+if __name__ == "__main__" and len(sys.argv) > 2 and sys.argv[2] == "reuse":
+    import pickle
+    line_profile(sys.argv[1], pickle.load(open(sys.argv[1] + ".prof", "rb")), 30)
+    sys.exit(0)
 
 if __name__ == "__main__":
     ph = int(sys.argv[2]) if len(sys.argv) > 2 else -1

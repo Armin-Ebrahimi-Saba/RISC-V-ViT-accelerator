@@ -1,4 +1,4 @@
-# Performance — how one frame went from 93.6 s to 7.2 s
+# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 4 s (estimated)
 
 This is the record of the speed-up work: what was measured, what each change
 did, and what is left. Every step kept the FPGA output **bit-exact with the
@@ -593,6 +593,55 @@ expected. Against the float model over five images, the mean of 1 − r is
 PyTorch is 0.999897 (round seven: 0.999862). `sw.elf` still contains no
 soft-float routine. The profile now also prints a detail table (row
 statistics, parameter passes, the phases of attention).
+
+### Round nine — small exact changes (estimated, not yet measured)
+
+The board was still not connected. Every change below gives the same
+output as round eight, bit for bit (host build, accelerator emulator,
+five test images).
+
+| Change | Where | Tool (Mcycles) |
+|---|---|---|
+| GELU: a direct table with one int16 per input value (32 kB in the DDR3 arena), each entry the interpolated value of round eight. The element loop is one load per element. | `dav2_ops.c` | one call 2.14 → 1.25 |
+| `dav2_add`: the int16 inputs are moved up by 16 bits, so the shift becomes at least 33 and `apply_multiplier`'s fast branch (one `mulh`) applies. The same values. | `dav2_ops.c` | add/relu per frame 13.1 → 10.1, with the next row |
+| `dav2_copy_relu`: the copy and the ReLU at the start of each residual conv unit are one pass. | `dav2_ops.c`, `dav2_engine.c` | in the line above |
+| Tensor lookup by name starts after the previous hit. The engine asks for the tensors almost in file order, so most lookups compare one or two names instead of up to 300. | `dav2_blob.c` | about 3 per frame |
+| Softmax: the reciprocal of the row sum is a 32-bit division instead of a 64-bit library call. | `dav2_engine.c` | about 1.5 per frame |
+
+The GELU estimate does not include cache misses: the tool counts every
+DDR3 access as a hit. The table is 32 kB and the cache 16 kB, so some
+lookups will miss. The activations cluster near zero, so most lookups use
+a small part of the table.
+
+Two changes to LayerNorm were tried and not kept:
+
+- The output scale from a bound known after the statistics
+  (max|z| * max|g| + max|b|), so that g and b combine with the output
+  scale into one factor per channel: 2.04 → 1.81 Mcycles per call, but the
+  mean of 1 − r over five images rose from 1.9e-4 to 2.0e-4. The gain,
+  about 5 Mcycles per frame, did not justify a coarser output.
+- The same with a 32-bit `mul` instead of the second `mulh`: 1.70 Mcycles
+  per call, but 1 − r rose to 2.4e-4.
+
+Estimated whole frame, CPU time only: 202.9 → 183.8 Mcycles.
+
+| Operator | Round eight | Round nine |
+|---|---|---|
+| requantise | 16.5 | 16.5 |
+| attention | 57.1 | 53.7 |
+| layernorm | 62.7 | 62.7 |
+| gelu | 25.9 | 15.2 |
+| add/relu | 13.1 | 10.1 |
+| interpolate | 16.8 | 16.8 |
+| other | 10.8 | 8.8 |
+| total | 202.9 | 183.8 |
+
+With about 15 Mcycles of accelerator waits this is about 200 Mcycles,
+4.0 s per frame, if the board confirms the model. LayerNorm and attention
+are now 63 % of the CPU time. The software options for them that remain
+either lose accuracy (above) or save 1 to 2 Mcycles. The next large step
+is hardware: the LayerNorm row statistics or the softmax on the
+accelerator.
 
 ## 7. What is left, in order of expected gain
 

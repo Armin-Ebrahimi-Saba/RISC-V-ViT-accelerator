@@ -312,7 +312,7 @@ static void attn_softmax(const dav2_tensor_t *qkv, int n, attn_bufs_t *b)
          * p' = round(p * 2^15 / sum). The row's maximum is 32767, so
          * sum >= 32767 and inv = round(2^31 / sum) <= 65538; p * inv < 2^32.
          * The p' of a row add up to 2^15 within rounding. */
-        const uint32_t inv = (uint32_t)((((uint64_t)1 << 31) + sum / 2) / sum);
+        const uint32_t inv = (0x80000000u + sum / 2u) / sum;   /* 32-bit divu */
         #pragma GCC unroll 4
         for (int m = 0; m < n; m++) {
             uint32_t q = ((uint32_t)pr[m] * inv + 32768u) >> 16;
@@ -516,9 +516,7 @@ static dav2_tensor_t res_conv_unit(const dav2_tensor_t *x, int h, int w,
     size_t mark = dav2_arena_mark();
 
     dav2_tensor_t t = dav2_tensor_new(h * w, x->c);
-    dav2_copy16(t.v, x->v, (size_t)h * w * x->c);
-    t.scale = x->scale;
-    dav2_relu(&t);
+    dav2_copy_relu(&t, x);
 
     /* relu(conv1) and x + conv2 each fused into the conv's requantisation */
     dav2_tensor_t a = dav2_conv2d_ex(&t, h, w, &c1, 3, 1, 1, 0, 1, 0, 0);

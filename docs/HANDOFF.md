@@ -39,11 +39,12 @@ and beta are folded into proj0..3. The engine rejects other versions.
 kept as `dav2_weights_f32.bin`); it needs the checkpoint for the fold (the
 Hugging Face cache, or `--ckpt`). `export_dav2.py` calls it itself.
 
-**Round eight is not measured on the board yet.** The board was not
-connected. Its changes are verified on the PC (host build, accelerator
-emulator, five test images) and estimated with `tools/cyclemodel/`
-(`PERFORMANCE.md` §6, round eight). The next board run must confirm the
-frame time and that the output is bit-exact with `dav2_host`.
+**Rounds eight and nine are not measured on the board yet.** The board
+was not connected. Their changes are verified on the PC (host build,
+accelerator emulator, five test images) and estimated with
+`tools/cyclemodel/` (`PERFORMANCE.md` §6): about 4.0 s per frame. The next
+board run must confirm the frame time, that the output is bit-exact with
+`dav2_host`, and that the boot self-test prints `DAV2_SELFTEST 812128bd`.
 
 | Measurement | Value |
 |---|---|

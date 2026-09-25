@@ -42,6 +42,25 @@ int dav2_blob_check(void)
     return 0;
 }
 
+/* The index of a tensor, or -1. The search starts after the previous hit
+ * and wraps around: the engine asks for the tensors almost in the order
+ * the exporter wrote them, so most lookups compare one or two names
+ * instead of scanning up to 300 (about 3 Mcycles per frame before). */
+static int find_index(const char *name)
+{
+    static uint32_t last;
+    const uint32_t n = blob_hdr->n_tensors;
+    if (last >= n)
+        last = 0;
+    for (uint32_t k = 0, i = last; k < n; k++, i = (i + 1 == n) ? 0 : i + 1) {
+        if (strcmp(blob_dir[i].name, name) == 0) {
+            last = i + 1;
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
 const void *dav2_find(const char *name, uint32_t *nbytes)
 {
     /* Retry a miss once -- a diagnostic that stays because it is cheap and
@@ -56,14 +75,12 @@ const void *dav2_find(const char *name, uint32_t *nbytes)
      * prefetcher out of the path there are no misses at all, and this loop
      * finds every tensor on its first pass. */
     for (int attempt = 0; attempt < 2; attempt++) {
-        for (uint32_t i = 0; i < blob_hdr->n_tensors; i++) {
-            if (strcmp(blob_dir[i].name, name) == 0) {
-                if (nbytes) *nbytes = blob_dir[i].nbytes;
-                if (attempt)
-                    printf("dav2: '%s' found on retry (transient bad read)\n",
-                           name);
-                return blob_base + blob_dir[i].offset;
-            }
+        int i = find_index(name);
+        if (i >= 0) {
+            if (nbytes) *nbytes = blob_dir[i].nbytes;
+            if (attempt)
+                printf("dav2: '%s' found on retry (transient bad read)\n", name);
+            return blob_base + blob_dir[i].offset;
         }
     }
     /* Report the header as the scan just saw it. n_tensors is re-read from
@@ -79,18 +96,14 @@ const void *dav2_find(const char *name, uint32_t *nbytes)
 /* Same lookup, but a miss is legitimate (e.g. layers without a bias). */
 const void *dav2_find_quiet(const char *name)
 {
-    for (uint32_t i = 0; i < blob_hdr->n_tensors; i++)
-        if (strcmp(blob_dir[i].name, name) == 0)
-            return blob_base + blob_dir[i].offset;
-    return 0;
+    int i = find_index(name);
+    return i >= 0 ? blob_base + blob_dir[i].offset : 0;
 }
 
 const uint32_t *dav2_find_dims(const char *name)
 {
-    for (uint32_t i = 0; i < blob_hdr->n_tensors; i++)
-        if (strcmp(blob_dir[i].name, name) == 0)
-            return blob_dir[i].dims;
-    return 0;
+    int i = find_index(name);
+    return i >= 0 ? blob_dir[i].dims : 0;
 }
 
 void dav2_qw(dav2_qw_t *out, const char *base, int expect_k)

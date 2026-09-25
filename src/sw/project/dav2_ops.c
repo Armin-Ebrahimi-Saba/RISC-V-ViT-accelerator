@@ -1198,7 +1198,30 @@ void dav2_add(const dav2_tensor_t *a, const dav2_tensor_t *b, dav2_tensor_t *out
     add_params(amax_a, a->scale, amax_b, b->scale, &out_scale, &ma, &sa, &mb, &sb);
 
     int32_t omax = 0;
-    if (wide) {
+    if (wide && sa >= 17 && sb >= 17) {
+        /* The factors are near 1, so the shifts are about 31 and
+         * apply_multiplier takes its slower branch (shift <= 32). With the
+         * int16 input moved up by 16 bits the shift becomes >= 33 and one
+         * mulh does it: round(v m / 2^s) = round((v 2^16) m / 2^(s+16)),
+         * the same value. |v| < 2^15, so v << 16 fits. */
+        const int32_t ra = 1 << (sa + 16 - 33), rb = 1 << (sb + 16 - 33);
+        const int ka = sa + 16 - 32, kb = sb + 16 - 32;
+        const uint32_t *aw = (const uint32_t *)a->v, *bw = (const uint32_t *)b->v;
+        uint32_t *ow = (uint32_t *)out->v;
+        #pragma GCC unroll 2
+        for (int i = 0; i < total / 2; i++) {
+            uint32_t x = aw[i], y = bw[i];
+            int32_t r0 = sat_act(((mulh32(lo16(x) << 16, ma) + ra) >> ka)
+                               + ((mulh32(lo16(y) << 16, mb) + rb) >> kb));
+            int32_t r1 = sat_act(((mulh32(hi16(x) << 16, ma) + ra) >> ka)
+                               + ((mulh32(hi16(y) << 16, mb) + rb) >> kb));
+            ow[i] = pack16(r0, r1);
+            if (r0 < 0) r0 = -r0;
+            if (r1 < 0) r1 = -r1;
+            if (r0 > omax) omax = r0;
+            if (r1 > omax) omax = r1;
+        }
+    } else if (wide) {
         const uint32_t *aw = (const uint32_t *)a->v, *bw = (const uint32_t *)b->v;
         uint32_t *ow = (uint32_t *)out->v;
         #pragma GCC unroll 4
@@ -1256,6 +1279,38 @@ void dav2_relu(dav2_tensor_t *t)
     PROF_STOP(DAV2_PROF_ADD_RELU);
 }
 
+void dav2_copy_relu(dav2_tensor_t *dst, const dav2_tensor_t *src)
+{
+    const int total = src->n * src->c;
+    PROF_START();
+    int32_t omax = 0;
+    if (words_ok(dst->v, src->v, src->v, total)) {
+        const uint32_t *sw = (const uint32_t *)src->v;
+        uint32_t *dw = (uint32_t *)dst->v;
+        #pragma GCC unroll 4
+        for (int i = 0; i < total / 2; i++) {
+            uint32_t x = sw[i];
+            /* clear each half whose sign bit is set */
+            x &= ~(((x >> 15) & 1u) * 0xffffu | ((x >> 31) & 1u) * 0xffff0000u);
+            dw[i] = x;
+            int32_t v0 = (int32_t)(x & 0xffffu), v1 = (int32_t)(x >> 16);
+            if (v0 > omax) omax = v0;
+            if (v1 > omax) omax = v1;
+        }
+    } else {
+        for (int i = 0; i < total; i++) {
+            int16_t v = src->v[i] < 0 ? 0 : src->v[i];
+            dst->v[i] = v;
+            if (v > omax) omax = v;
+        }
+    }
+    dst->n = src->n;
+    dst->c = src->c;
+    dst->scale = src->scale;
+    dst->amax_q = omax;
+    PROF_STOP(DAV2_PROF_ADD_RELU);
+}
+
 /* GELU is an elementwise map on a 14-bit input, so a 257-entry table with
  * linear interpolation reproduces it to well below quantisation noise. The
  * table costs 257 float evaluations per call, versus 126k for direct
@@ -1297,45 +1352,54 @@ void dav2_gelu(dav2_tensor_t *t)
     for (int i = 0; i < 257; i++)
         lut[i] = sat_act((int32_t)xf_round(xf_mul(g[i], inv), 0));
 
-    /* One 32-bit word per interval: the value at the left end in the low
-     * half and the step to the right end in the high half. The step is at
-     * most 2 * 8191 in magnitude, so it fits an int16. The interpolation
-     * below then needs one load per element instead of two. Same
-     * arithmetic as lut[i] + ((lut[i+1] - lut[i]) * f >> 6).
+    /* A direct table: one int16 output per input value, T[x + 8192] for
+     * x in -8192..8191, each entry the linear interpolation between the
+     * 257 points above,
      *
-     * The table lives in the DDR3 arena, not on the stack: the stack is in
-     * the on-chip RAM, where a load takes about 4 cycles longer than a DDR3
-     * cache hit, and the 1 kB table stays in the cache. */
+     *   lut[i] + ((lut[i+1] - lut[i]) * f >> 6),  i = u >> 6, f = u & 63,
+     *
+     * so the element loop is one load per element and no arithmetic. The
+     * table is built interval by interval with a running product (one add
+     * per entry) and costs about a tenth of the element loop. It lives in
+     * the DDR3 arena (32 kB): the stack is in the on-chip RAM, where a load
+     * takes about 4 cycles longer than a DDR3 cache hit. The activations
+     * cluster near zero, so the part of the table in use stays mostly in
+     * the cache. */
     const size_t mark = dav2_arena_mark();
-    uint32_t *lutp = (uint32_t *)dav2_arena_alloc(256 * sizeof(uint32_t));
-    uint32_t lutp_stack[256];
-    if (!lutp)
-        lutp = lutp_stack;
-    for (int i = 0; i < 256; i++)
-        lutp[i] = pack16(lut[i], lut[i + 1] - lut[i]);
+    int16_t *tab = (int16_t *)dav2_arena_alloc(16384 * sizeof(int16_t));
+    if (!tab) { dav2_arena_release(mark); PROF_STOP(DAV2_PROF_GELU); return; }
+    for (int i = 0; i < 256; i++) {
+        const int32_t lo = lut[i], step = lut[i + 1] - lut[i];
+        uint32_t *tw = (uint32_t *)(tab + 64 * i);
+        int32_t acc = 0;
+        #pragma GCC unroll 4
+        for (int f = 0; f < 64; f += 2) {
+            int32_t v0 = lo + (acc >> 6);
+            acc += step;
+            int32_t v1 = lo + (acc >> 6);
+            acc += step;
+            tw[f >> 1] = pack16(v0, v1);
+        }
+    }
+    const int16_t *T = tab + 8192;
 
     SUB_LAP(DAV2_SUB_GELU_TABLE);
     const int total = t->n * t->c;
-#define GELU_LUT(x) ({ int32_t u_ = (int32_t)(x) + 8192;   /* [1, 16383] */ \
-                       uint32_t e_ = lutp[u_ >> 6];       /* [0, 255]   */ \
-                       lo16(e_) + ((hi16(e_) * (u_ & 63)) >> 6); })
     /* The output's largest |value| is not tracked (amax_q = -1): GELU's
-     * output only feeds fc2's GEMM, which needs the scale alone. Tracking
-     * it cost about 3.5 cycles per element. */
+     * output only feeds fc2's GEMM, which needs the scale alone. */
     if (words_ok(t->v, t->v, t->v, total)) {
         uint32_t *w = (uint32_t *)t->v;
         #pragma GCC unroll 4
         for (int i = 0; i < total / 2; i++) {
             uint32_t x = w[i];
-            w[i] = pack16(GELU_LUT(lo16(x)), GELU_LUT(hi16(x)));
+            w[i] = pack16(T[lo16(x)], T[hi16(x)]);
         }
     } else {
         for (int i = 0; i < total; i++)
-            t->v[i] = (int16_t)GELU_LUT(t->v[i]);
+            t->v[i] = T[t->v[i]];
     }
     t->amax_q = -1;
     dav2_arena_release(mark);
-#undef GELU_LUT
     t->scale = out_scale;
     PROF_STOP(DAV2_PROF_GELU);
     trace_tensor("gelu", t);
