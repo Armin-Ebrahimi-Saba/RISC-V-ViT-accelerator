@@ -898,7 +898,7 @@ static void layernorm_affine(const dav2_tensor_t *in, const int32_t *gq,
      * accelerator the CPU runs the same arithmetic (apply_multiplier), so
      * both give the same result. */
     int32_t *zc = (int32_t *)dav2_arena_alloc((size_t)N * C * sizeof(int32_t));
-    int32_t *rowp = (int32_t *)dav2_arena_alloc((size_t)N * 4 * sizeof(int32_t));
+    int32_t *rowp = (int32_t *)dav2_arena_alloc((size_t)N * 5 * sizeof(int32_t));
     int32_t *par = (int32_t *)dav2_arena_alloc((size_t)C * 3 * sizeof(int32_t));
     if (!zc || !rowp || !par) { dav2_arena_release(mark); return; }
 
@@ -908,7 +908,7 @@ static void layernorm_affine(const dav2_tensor_t *in, const int32_t *gq,
     const dav2_xf_t inv_s  = xf_recip(in->scale);
     const dav2_xf_t eps_s2 = xf_mul(xf_from_f32_bits(0x358637bdu), xf_mul(inv_s, inv_s));
     const int wide = (((uintptr_t)in->v | (uintptr_t)out->v) & 3u) == 0 && (C & 3) == 0;
-    int fast = wide;                  /* every row's shift >= 33 (always, in this model) */
+    const int fast = wide;
     SUB_START();
     for (int n = 0; n < N; n++) {
         const int16_t *row = in->v + (size_t)n * C;
@@ -944,12 +944,19 @@ static void layernorm_affine(const dav2_tensor_t *in, const int32_t *gq,
         xf_to_mult(xf_rsqrt(v), &am, &ash);                   /* r */
         /* mean in Q16, rounded half away from zero */
         int64_t s16 = (int64_t)sum * 65536;
-        int32_t *p = rowp + (size_t)n * 4;
+        /* z = round(d16 * am / 2^ash) as one mulh: (mulh(d16 << up, am) +
+         * rnd) >> (sh - 32) with sh = max(ash, 33), up = sh - ash. A row with
+         * ash < 33 has a small spread: r ~ 1/std = am 2^-ash gives std <
+         * 2^(ash - 30), and |d16| <= sqrt(C - 1) std 2^16 < 2^(ash - 10), so
+         * d16 << up < 2^23 fits. The rounding constant is a multiple of 2^32,
+         * so this is exactly apply_multiplier's result. */
+        const int shz = ash > 33 ? ash : 33;
+        int32_t *p = rowp + (size_t)n * 5;
         p[0] = (int32_t)(s16 >= 0 ? (s16 + C / 2) / C : -((-s16 + C / 2) / C));
         p[1] = am;
-        p[2] = ash;
-        p[3] = ash >= 33 ? 1 << (ash - 33) : 0;
-        if (ash < 33) fast = 0;
+        p[2] = shz - 32;
+        p[3] = 1 << (shz - 33);
+        p[4] = shz - ash;
     }
     SUB_LAP(DAV2_SUB_LN_STATS);
 
@@ -964,11 +971,11 @@ static void layernorm_affine(const dav2_tensor_t *in, const int32_t *gq,
             const int16_t *col = in->v + c;
             #pragma GCC unroll 2
             for (int n = 0; n < N; n++) {
-                const int32_t *p = rowp + (size_t)n * 4;
+                const int32_t *p = rowp + (size_t)n * 5;
                 uint32_t x = *(const uint32_t *)(col + (size_t)n * C);
-                const int sh = p[2] - 32;
-                int32_t a = (mulh32((lo16(x) << 16) - p[0], p[1]) + p[3]) >> sh;
-                int32_t b = (mulh32((hi16(x) << 16) - p[0], p[1]) + p[3]) >> sh;
+                const int sh = p[2], up = p[4];
+                int32_t a = (mulh32(((lo16(x) << 16) - p[0]) << up, p[1]) + p[3]) >> sh;
+                int32_t b = (mulh32(((hi16(x) << 16) - p[0]) << up, p[1]) + p[3]) >> sh;
                 z0[n] = a;
                 z1[n] = b;
                 if (a < lo0) lo0 = a;
@@ -978,9 +985,9 @@ static void layernorm_affine(const dav2_tensor_t *in, const int32_t *gq,
             }
         } else {
             for (int n = 0; n < N; n++) {
-                const int32_t *p = rowp + (size_t)n * 4;
-                int32_t a = apply_multiplier(((int32_t)in->v[(size_t)n * C + c] << 16) - p[0],
-                                             p[1], p[2]);
+                const int32_t *p = rowp + (size_t)n * 5;
+                int32_t a = (mulh32((((int32_t)in->v[(size_t)n * C + c] << 16) - p[0]) << p[4],
+                                    p[1]) + p[3]) >> p[2];
                 z0[n] = a;
                 if (a < lo0) lo0 = a;
                 if (a > hi0) hi0 = a;

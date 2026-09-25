@@ -1,4 +1,4 @@
-# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 3.5 s (estimated)
+# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 3.1 s (estimated)
 
 This is the record of the speed-up work: what was measured, what each change
 did, and what is left. Every step kept the FPGA output **bit-exact with the
@@ -682,6 +682,46 @@ Estimated whole frame, CPU time only: 183.8 → 161.2 Mcycles.
 With about 15 Mcycles of accelerator waits this is about 176 Mcycles,
 3.5 s per frame, if the board confirms the model. The boot self-test hash
 is now `7ca6973c`.
+
+### Round eleven — exact fixes found in the frame profile (estimated, not yet measured)
+
+The board was still not connected.
+
+| Change | Where | Tool (Mcycles per frame) |
+|---|---|---|
+| LayerNorm: round ten's fast loop needed every row's shift to be at least 33; in real data some rows have a smaller shift, and then the whole call took the slow path. A row with a small shift has a small spread, so (x − mean) 2^16 can be moved up by 33 − shift bits (it stays below 2^23) and one `mulh` gives exactly the same value. Every row now takes the fast loop. Output unchanged. | `dav2_ops.c` | layernorm 46.1 → 35.1 |
+| Softmax exponent t = d kf with one 32-bit multiply: only d below the underflow cutoff matters, and there d >> j has 16 bits. The error is below 2^-11 in t, under the exp2 table's resolution. | `dav2_engine.c` | attention 47.7 → 42.5, with the next row |
+| The residual updates write into a second buffer for x and swap the two, instead of writing a temporary and copying it back (24 copies of 31.5 k values per frame). A failed job still leaves x intact. Output unchanged. | `dav2_engine.c` | in the line above, and requantise 16.5 → 15.0 |
+| The DPT fusion block adds its input directly instead of a copy of it; the copy had lost the known range and made `dav2_add` scan both operands. Output unchanged. | `dav2_engine.c` | add/relu 10.1 → 6.8 |
+
+Estimated whole frame, CPU time only: 161.2 → 140.0 Mcycles; with about
+15 Mcycles of accelerator waits about 155 Mcycles, 3.1 s per frame.
+
+**Accuracy, measured more carefully.** Small rounding changes that do not
+change the accuracy of any kernel still move the per-image 1 − r by up to
+a factor 2, because the quantisation errors of the whole network add up
+differently. A handful of images therefore cannot show a change of 10 %.
+Two methods were used for this round:
+
+- The softmax exponent was checked at the kernel level: on 3000 random
+  score rows, the largest error of a probability against float softmax is
+  24 Q15 units for both the exact and the 32-bit form, and the mean error
+  3.3e-5 against 3.7e-5.
+- A second test set of 24 natural images (random crops, scales and flips
+  of the two photographs) was compared image by image (mean of
+  log(1 − r) ratios, ± one standard error):
+
+| Comparison | Change of 1 − r |
+|---|---|
+| round eleven against round ten | −2 % ± 4 % |
+| round ten against round nine | −3 % ± 5 % |
+| round nine against round seven | +13 % ± 8 % |
+
+Rounds ten and eleven do not change the accuracy. Rounds eight and nine
+may cost a little on photographs (less than two standard errors; on the
+synthetic scenes they were better). In absolute terms all of them stay
+near r = 0.999: the median 1 − r over the 24 crops is 4.1e-4 for both
+round seven and round eleven.
 
 ## 7. What is left, in order of expected gain
 

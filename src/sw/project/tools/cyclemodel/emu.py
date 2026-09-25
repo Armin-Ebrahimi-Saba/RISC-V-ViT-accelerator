@@ -132,6 +132,7 @@ def run(elf_path, limit=4_000_000_000, profile_phase=-1, files=()):
 
 import os
 BYFN = os.environ.get("BYFN") == "1"
+ONLY = os.environ.get("ONLY")          # only code whose outer function is this
 
 def line_profile(elf, prof, top=25):
     import pickle
@@ -158,6 +159,8 @@ def line_profile(elf, prof, top=25):
         k += 2
         fn, loc = chain[0] if chain else ("??", "??")
         outer = chain[-1][0] if chain else "??"
+        if ONLY and outer != ONLY:
+            continue
         key = outer if BYFN else "%s %s" % (fn, loc.split("/")[-1].split(" ")[0])
         by[key] += prof[a]
     tot = sum(by.values())

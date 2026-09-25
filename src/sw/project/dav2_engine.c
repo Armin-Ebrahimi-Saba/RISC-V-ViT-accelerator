@@ -248,24 +248,30 @@ static void attn_softmax(const dav2_tensor_t *qkv, int n, attn_bufs_t *b)
     score_scale.sh -= b->q_sh;                          /* * 2^q_sh */
     /* -> exponent base 2: * log2(e), the float32 1.4426950f (0x3fb8aa3b) */
     dav2_xf_t kf = xf_mul(score_scale, xf_from_f32_bits(0x3fb8aa3bu));
-    int32_t kmult; int kshift;
-    xf_to_mult(kf, &kmult, &kshift);
-
-    /* t_q16 = floor(d * kf * 2^16) = floor(d * kmult / 2^ks), ks constant
-     * for the head. d < 2^30 and kmult < 2^31: the product is split into
-     * mulhu and mul, with the shift hoisted. */
-    int ks = kshift - 16;
-    if (ks > 31) {
-        /* keep one form in the loop: drop the multiplier's low bits instead
-         * (it keeps at least 31 - (ks - 31) of them; in this model ks is
-         * about 30) */
-        kmult = (int32_t)((uint32_t)kmult >> (ks - 31));
-        ks = 31;
-    } else if (ks < 1) {
-        /* kf >= 2^15: every nonzero gap underflows Q15. kmult = 2^31 - 1
-         * with ks = 1 gives the same: d >= 1 maps to >= 2^30. */
-        kmult = 2147483647;
-        ks = 1;
+    /* t = d * kf in Q16 with one 32-bit multiply per element. At t >= 16
+     * the probability underflows Q15, so only d < cutoff = ceil(16 / kf)
+     * matters. Below the cutoff, d >> j has at most 16 bits (j from the
+     * cutoff's length), and K = kf 2^(16 + j + 11) has 16 bits, so
+     *
+     *   t = ((d >> j) * K) >> 11      (d >> j) * K < 2^32.
+     *
+     * Dropping d's low j bits changes t by less than 2^-11, below the exp2
+     * table's resolution (2^-10). Checked on 3000 random score rows with
+     * this model's range of kf: the largest error of a probability against
+     * float softmax is 24 Q15 units, the same as with the exact t (64-bit
+     * product), and the mean error is 3.7e-5 against 3.3e-5. */
+    uint32_t cutoff = 0xffffffffu;
+    int j = 0;
+    uint32_t K = 0;
+    if (kf.m > 0) {
+        int64_t c = xf_round(xf_div(xf_from_int(16), kf), 0) + 1;
+        if (c < 0xffffffffLL)
+            cutoff = (uint32_t)c;
+        while ((cutoff >> j) > 0xffffu) j++;
+        dav2_xf_t kk = kf;
+        kk.sh -= 16 + j + 11;
+        int64_t kr = xf_round(kk, 0);
+        K = kr > 0xffff ? 0xffffu : (uint32_t)kr;
     }
     const uint32_t over = 16u << 16;               /* underflows Q15 */
     const uint16_t *exp2t = b->exp2;
@@ -285,9 +291,7 @@ static void attn_softmax(const dav2_tensor_t *qkv, int n, attn_bufs_t *b)
              * less than a store and a load of on-chip RAM */
             /* >= 0 and < 2^32: unsigned, since |s| < 1.07e9 each */
             uint32_t d = (uint32_t)smax - (uint32_t)(sh[m] * 16 + sl[m]);
-            uint32_t hi = (uint32_t)(((uint64_t)d * (uint32_t)kmult) >> 32);
-            uint32_t lo = d * (uint32_t)kmult;
-            uint32_t t_q16 = (hi >> ks) ? over : (hi << (32 - ks)) | (lo >> ks);
+            uint32_t t_q16 = d < cutoff ? ((d >> j) * K) >> 11 : over;
             /* 2^-t = 2^-frac >> int: the fraction's 10 high bits index the
              * table (Q15, error below 11 units), the integer part shifts */
             int32_t p = t_q16 >= over ? 0
@@ -441,7 +445,21 @@ static void load_block(block_w_t *bw, int i)
 }
 
 /* One transformer block, in place on x. */
-static void run_block(dav2_tensor_t *x, int i, int n_tokens)
+/* x = x + f(...) into the spare buffer, then swap the two: the GEMM's
+ * requantisation job writes a buffer other than its residual input, so no
+ * temporary and no copy back are needed, and a failed job still leaves x
+ * intact for the CPU redo. */
+static void residual_update(const dav2_tensor_t *a, const dav2_qw_t *w,
+                            dav2_tensor_t *x, int16_t **spare)
+{
+    dav2_tensor_t y = *x;
+    y.v = *spare;
+    dav2_qgemm_ex(a, w, x, 0, &y);
+    *spare = x->v;
+    *x = y;
+}
+
+static void run_block(dav2_tensor_t *x, int16_t **spare, int i, int n_tokens)
 {
 #ifdef DAV2_TRACE
 #define BDUMP(nm, t) do { if (i == 0) dav2_dump("/tmp/dav2_b0_" nm ".bin", (t)); } while (0)
@@ -472,8 +490,8 @@ static void run_block(dav2_tensor_t *x, int i, int n_tokens)
 
     BDUMP("ctx", &ctx);
     /* x = x + proj(ctx): the residual add is the requantisation job's
-     * epilogue on the accelerator, and x is updated in place */
-    dav2_qgemm_ex(&ctx, &bw.proj, x, 0, x);
+     * epilogue on the accelerator; the result goes to the spare buffer */
+    residual_update(&ctx, &bw.proj, x, spare);
     BDUMP("res1", x);
     dav2_arena_release(mark);
 
@@ -488,8 +506,8 @@ static void run_block(dav2_tensor_t *x, int i, int n_tokens)
     dav2_gelu(&h1);
     BDUMP("gelu", &h1);
 
-    /* x = x + fc2(h1), likewise fused and in place */
-    dav2_qgemm_ex(&h1, &bw.fc2, x, 0, x);
+    /* x = x + fc2(h1), likewise fused */
+    residual_update(&h1, &bw.fc2, x, spare);
     BDUMP("res2", x);
     dav2_arena_release(mark);
 }
@@ -533,9 +551,9 @@ static dav2_tensor_t fusion(int idx, const dav2_tensor_t *a,
     dav2_tensor_t out = dav2_tensor_new(oh * ow, DAV2_FEATURES);
     size_t mark = dav2_arena_mark();
 
-    dav2_tensor_t cur = dav2_tensor_new(h * w, DAV2_FEATURES);
-    dav2_copy16(cur.v, a->v, (size_t)h * w * DAV2_FEATURES);
-    cur.scale = a->scale;
+    /* a is read, never written: no copy of it. Its amax_q (known from the
+     * producing conv) spares dav2_add a scan; a scan gives the same value. */
+    dav2_tensor_t cur = *a;
 
     if (b) {
         dav2_tensor_t res = res_conv_unit(b, h, w, prefix, 1);
@@ -553,6 +571,7 @@ static dav2_tensor_t fusion(int idx, const dav2_tensor_t *a,
     dav2_tensor_t o = dav2_conv2d(&up, oh, ow, &oc, 1, 1, 0, 0, 0);
     dav2_copy16(out.v, o.v, (size_t)oh * ow * DAV2_FEATURES);
     out.scale = o.scale;
+    out.amax_q = o.amax_q;
 
     dav2_arena_release(mark);
     return out;
@@ -628,6 +647,7 @@ void dav2_infer(const dav2_cfg_t *cfg, int16_t *depth_q, dav2_xf_t *depth_scale)
     dav2_qw(&pe_w, "patch_embed", DAV2_PATCH * DAV2_PATCH * 3);
 
     dav2_tensor_t x = dav2_tensor_new(n_tokens, ED);
+    int16_t *x_spare = dav2_tensor_new(n_tokens, ED).v;   /* see residual_update */
     {
         dav2_tensor_t patches = dav2_conv2d(&image, cfg->size, cfg->size,
                                             &pe_w, DAV2_PATCH, DAV2_PATCH, 0,
@@ -652,7 +672,7 @@ void dav2_infer(const dav2_cfg_t *cfg, int16_t *depth_q, dav2_xf_t *depth_scale)
         char msg[32];
         sprintf(msg, "block %d/12", i + 1);
         dav2_progress(msg);
-        run_block(&x, i, n_tokens);
+        run_block(&x, &x_spare, i, n_tokens);
 #ifdef DAV2_TRACE
         { char fn[64]; sprintf(fn, "/tmp/dav2_blk%d.bin", i); dav2_dump(fn, &x); }
 #endif
