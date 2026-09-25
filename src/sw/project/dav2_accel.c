@@ -86,6 +86,7 @@
 #define CTRL_A16      0x80u
 #define CTRL_W16      0x100u
 #define CTRL_OSTATS   0x200u
+#define CTRL_ONCHIP   0x400u
 
 #define STATUS_BUSY 0x1u
 #define STATUS_DONE 0x2u
@@ -116,6 +117,7 @@ static int      accel_lut_ok;          /* CAPS bit 24, cleared if its self-test 
 static int      accel_a16_ok;          /* CAPS bit 25, cleared if its self-test fails */
 static int      accel_w16_ok;          /* CAPS bit 26, cleared if its self-test fails */
 static int      accel_ostats_ok;       /* CAPS bit 27, cleared if its self-test fails */
+static int      accel_onchip_ok;       /* CAPS bit 28, cleared if its self-test fails */
 static uint32_t accel_gemm_ctrl;       /* extra CTRL bits for accel_run (CTRL.w16) */
 static int      accel_out_stride;      /* requant output row length in int16, 0 = M */
 static int      accel_ok;
@@ -142,6 +144,7 @@ int dav2_accel_init(void)
     accel_a16_ok = (int)((caps >> 25) & 1u);
     accel_w16_ok = (int)((caps >> 26) & 1u);
     accel_ostats_ok = (int)((caps >> 27) & 1u);
+    accel_onchip_ok = (int)((caps >> 28) & 1u);
 
     /* A missing block reads back as zero (or the bus errors out, which the
      * core reports separately); either way we simply stay on the CPU path. */
@@ -255,7 +258,9 @@ static int accel_run(const int16_t *av, uint32_t a_stride,
     REG32(GEMM_W_ADDR)   = (uint32_t)(uintptr_t)w;
     REG32(GEMM_A_STRIDE) = a_stride;
     REG32(GEMM_W_STRIDE) = w_stride;
-    REG32(GEMM_C_STRIDE) = (uint32_t)N * 4u;
+    /* with CTRL.onchip C_ADDR/C_STRIDE count words of the result RAM */
+    const int onchip = (accel_gemm_ctrl & CTRL_ONCHIP) != 0;
+    REG32(GEMM_C_STRIDE) = onchip ? (uint32_t)N : (uint32_t)N * 4u;
     REG32(GEMM_K_LEN)    = (uint32_t)K;
     REG32(GEMM_M_LEN)    = (uint32_t)M;
 
@@ -265,7 +270,7 @@ static int accel_run(const int16_t *av, uint32_t a_stride,
             nt = nrows;
 
         REG32(GEMM_A_ADDR) = (uint32_t)(uintptr_t)(av + (size_t)n0 * a_row);
-        REG32(GEMM_C_ADDR) = (uint32_t)(uintptr_t)(acc + n0);
+        REG32(GEMM_C_ADDR) = onchip ? (uint32_t)n0 : (uint32_t)(uintptr_t)(acc + n0);
         REG32(GEMM_N_ROWS) = (uint32_t)nt;
         /* per-row {max, min} of this tile, 2 words per weight row */
         REG32(GEMM_S_ADDR) = stats ? (uint32_t)(uintptr_t)(stats + (size_t)tile * M * 2) : 0u;
@@ -452,8 +457,11 @@ static int accel_requant_rows(const void *acc, int N, int M, int m0, int mc,
     int lut_load = epi && epi->lut && epi->lut_load;
     if (epi && epi->ostats)
         ctrl |= CTRL_OSTATS;
+    const int onchip = epi && epi->onchip;
+    if (onchip)
+        ctrl |= CTRL_ONCHIP;
     const size_t orow = accel_out_stride ? (size_t)accel_out_stride : (size_t)M;
-    REG32(GEMM_A_STRIDE) = (uint32_t)N * esz;
+    REG32(GEMM_A_STRIDE) = onchip ? (uint32_t)N : (uint32_t)N * esz;
     REG32(GEMM_C_STRIDE) = (uint32_t)orow * 2u;
     REG32(GEMM_S_ADDR)   = 0u;
     REG32(GEMM_P_ADDR)   = (uint32_t)(uintptr_t)(params + (size_t)m0 * 3);
@@ -463,8 +471,9 @@ static int accel_requant_rows(const void *acc, int N, int M, int m0, int mc,
         if (nc > nc_max) nc = nc_max;
         unsigned long beats = (unsigned long)mc * 3u + (unsigned long)mc * nc * esz / 4u
                             + (unsigned long)mc * nc / 2u + (lut_load ? 8192u : 0u);
-        REG32(GEMM_A_ADDR) = (uint32_t)(uintptr_t)((const uint8_t *)acc
-                                                    + ((size_t)m0 * N + n0) * esz);
+        REG32(GEMM_A_ADDR) = onchip ? (uint32_t)((size_t)m0 * N + n0)
+                                    : (uint32_t)(uintptr_t)((const uint8_t *)acc
+                                                            + ((size_t)m0 * N + n0) * esz);
         REG32(GEMM_C_ADDR) = (uint32_t)(uintptr_t)(out + (size_t)n0 * orow + m0);
         if (epi && epi->add)
             REG32(GEMM_X_ADDR) = (uint32_t)(uintptr_t)(epi->x + (size_t)n0 * M + m0);
@@ -527,6 +536,8 @@ int dav2_accel_requant_rows_async(const int32_t *acc, int N, int M, int m0, int 
     if (epi && epi->lut && (!accel_lut_ok || (((uintptr_t)epi->lut) & 3u)))
         return 0;
     if (epi && epi->ostats && (!accel_ostats_ok || (((uintptr_t)epi->ostats) & 3u)))
+        return 0;
+    if (epi && epi->onchip && (!accel_onchip_ok || (long)N * M > DAV2_ACCEL_CR_WORDS))
         return 0;
     if (m0 < 0 || mc < 2 || (mc & 1) || m0 + mc > M
         || mc > (int)(accel_kmax / (add ? 4u : 2u)))
@@ -971,7 +982,7 @@ static int accel_check_epilogue(void)
         par[3 * m + 1] = 38 + (int32_t)(chk_rand(&seed) % 4u);
         par[3 * m + 2] = (int32_t)(chk_rand(&seed) % 2001u) - 1000;
     }
-    dav2_rq_epi_t epi = { x, 0x5a000000, 0x61000000, 31, 32, 1, 0, 0, 0, 0 };
+    dav2_rq_epi_t epi = { x, 0x5a000000, 0x61000000, 31, 32, 1, 0, 0, 0, 0, 0 };
     int bad = 0;
     for (int pass = 0; pass < 2 && !bad; pass++) {
         int32_t amax = 0;
@@ -1030,7 +1041,7 @@ static int accel_check_lut(void)
     }
     int bad = 0;
     for (int pass = 0; pass < 2 && !bad; pass++) {
-        dav2_rq_epi_t epi = { 0, 0, 0, 0, 0, 0, pass, tab, pass == 0, 0 };
+        dav2_rq_epi_t epi = { 0, 0, 0, 0, 0, 0, pass, tab, pass == 0, 0, 0 };
         int32_t amax = 0;
         int r = dav2_accel_requant_rows_async(acc, N, M, 0, M, par, out, &amax, &epi);
         if (r == 0 || !dav2_accel_finish()) {
@@ -1063,6 +1074,92 @@ static int accel_check_lut(void)
 
 int dav2_accel_lut_ok(void) { return accel_ok && accel_lut_ok; }
 int dav2_accel_ostats_ok(void) { return dav2_accel_init() && accel_ostats_ok; }
+int dav2_accel_onchip_ok(void) { return dav2_accel_init() && accel_onchip_ok; }
+
+int dav2_accel_qgemm_onchip_async(const dav2_tensor_t *a, const dav2_qw_t *wt,
+                                  dav2_accel_stats_t *st)
+{
+    st->v = 0; st->tiles = 0;
+    if (!dav2_accel_init() || !accel_onchip_ok)
+        return 0;
+    const int N = a->n, K = a->c, M = wt->m;
+    if (K < 4 || (K & 3) || (unsigned)K > accel_kmax || N < 1 || M < 1
+        || N > (int)accel_nrows || (long)N * M > DAV2_ACCEL_CR_WORDS)
+        return 0;
+    if ((((uintptr_t)a->v) | ((uintptr_t)wt->w)) & 3u)
+        return 0;
+    /* the statistics are the only way back: without them, no result */
+    int32_t *stats = (int32_t *)dav2_arena_alloc((size_t)M * 2 * sizeof(int32_t));
+    if (!stats)
+        return 0;
+    st->v = stats; st->tiles = 1;
+    accel_defer = 1;
+    accel_gemm_ctrl = CTRL_ONCHIP;
+    int r = accel_run(a->v, 0, wt->w, 0, 0, N, K, M, stats);
+    accel_gemm_ctrl = 0;
+    accel_defer = 0;
+    if (!r) { st->v = 0; st->tiles = 0; }
+    return r;
+}
+
+/* The result RAM (CTRL.onchip): a 20 x 64 x 8 GEMM left on chip, then its
+ * requantisation read from there, against the CPU. */
+static int accel_check_onchip(void)
+{
+    if (!accel_onchip_ok)
+        return 0;
+    enum { N = 20, K = 64, M = 8 };
+    static int32_t par[3 * M] __attribute__((aligned(4)));
+    int16_t *a   = chk_a;              /* N x K */
+    int16_t *out = chk_a + N * K;      /* N x M */
+    int8_t  *w   = (int8_t *)(chk_a + N * K + N * M);   /* M x K */
+    uint32_t seed = 0x5bd1e995u;
+    for (int i = 0; i < N * K; i++)
+        a[i] = (int16_t)((int32_t)(chk_rand(&seed) % 16383u) - 8191);
+    for (int i = 0; i < M * K; i++)
+        w[i] = (int8_t)((int32_t)(chk_rand(&seed) % 255u) - 127);
+    for (int m = 0; m < M; m++) {
+        par[3 * m]     = (int32_t)(0x40000000u + chk_rand(&seed) % 0x3fffffffu);
+        par[3 * m + 1] = 44 + (int32_t)(chk_rand(&seed) % 4u);
+        par[3 * m + 2] = (int32_t)(chk_rand(&seed) % 2001u) - 1000;
+    }
+    dav2_tensor_t at = { a, XF_ONE, N, K, -1, 0 };
+    dav2_qw_t wq = { w, 0, 0, M, K };
+    dav2_accel_stats_t st;
+    dav2_rq_epi_t epi;
+    memset(&epi, 0, sizeof epi);
+    epi.onchip = 1;
+    int32_t amax = 0;
+    const size_t mark = dav2_arena_mark();
+    int ok = dav2_accel_qgemm_onchip_async(&at, &wq, &st) && dav2_accel_finish()
+          && dav2_accel_requant_rows_async(0, N, M, 0, M, par, out, &amax, &epi)
+          && dav2_accel_finish();
+    int bad = 0;
+    for (int m = 0; ok && m < M; m++) {
+        int32_t mx = -2147483647 - 1, mn = 2147483647;
+        for (int n = 0; n < N; n++) {
+            int32_t acc = 0;
+            for (int k = 0; k < K; k++)
+                acc += (int32_t)a[n * K + k] * w[m * K + k];
+            if (acc > mx) mx = acc;
+            if (acc < mn) mn = acc;
+            int32_t e = chk_sat(chk_apply(acc, par[3 * m], par[3 * m + 1]) + par[3 * m + 2]);
+            if (out[n * M + m] != e) bad++;
+        }
+        if (st.v[2 * m] != mx || st.v[2 * m + 1] != mn) bad++;
+    }
+    dav2_arena_release(mark);
+    if (!ok) {
+        printf("GEMM accelerator: result-RAM self-test could not run\n");
+        accel_onchip_ok = 0;
+    } else if (bad) {
+        printf("GEMM accelerator: RESULT-RAM SELF-TEST FAILED (%d), results via DDR3\n", bad);
+        accel_onchip_ok = 0;
+    } else {
+        printf("GEMM accelerator: result-RAM self-test ok\n");
+    }
+    return 0;
+}
 
 /* Output row statistics (CTRL.ostats) on an int16-input job: 20 rows of
  * 8 columns, each row's {max, min} against the output itself. */
@@ -1280,6 +1377,8 @@ int dav2_accel_check(void)
         bad = accel_check_w16();
     if (!bad)
         bad = accel_check_ostats();
+    if (!bad)
+        bad = accel_check_onchip();
     return bad;
 }
 
@@ -1302,6 +1401,10 @@ int  dav2_accel_requant16(const int16_t *in, int N, int M, const int32_t *params
                           int16_t *out, int32_t *amax, uint32_t *ostats)
 { (void)in; (void)N; (void)M; (void)params; (void)out; (void)amax; (void)ostats; return 0; }
 int  dav2_accel_ostats_ok(void) { return 0; }
+int  dav2_accel_onchip_ok(void) { return 0; }
+int  dav2_accel_qgemm_onchip_async(const dav2_tensor_t *a, const dav2_qw_t *wt,
+                                   dav2_accel_stats_t *st)
+{ (void)a; (void)wt; st->v = 0; st->tiles = 0; return 0; }
 
 int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc,
                      dav2_accel_stats_t *st)

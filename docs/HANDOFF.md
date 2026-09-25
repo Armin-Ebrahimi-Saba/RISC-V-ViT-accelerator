@@ -39,10 +39,10 @@ and beta are folded into proj0..3. The engine rejects other versions.
 kept as `dav2_weights_f32.bin`); it needs the checkpoint for the fold (the
 Hugging Face cache, or `--ckpt`). `export_dav2.py` calls it itself.
 
-**Rounds eight to fifteen are not measured on the board yet.** The board was
+**Rounds eight to sixteen are not measured on the board yet.** The board was
 not connected. Their changes are verified on the PC (host build,
 accelerator emulator, 11 test images) and estimated with
-`tools/cyclemodel/` (`PERFORMANCE.md` §6): about 2.75 s per frame
+`tools/cyclemodel/` (`PERFORMANCE.md` §6): about 2.47 s per frame
 (the model now includes the accelerator's job times; it is 4 % high for
 the measured round seven). The next
 board run must confirm the frame time, that the output is bit-exact with
@@ -50,8 +50,9 @@ board run must confirm the frame time, that the output is bit-exact with
 Round twelve changes the hardware (lookup table and int16 input in the
 requantisation job): program the new bitstream first. The boot log must
 show "lookup-table self-test ok", "int16-input self-test ok" and
-"int16-weight self-test ok" (round thirteen) and "row-statistics self-test
-ok" (round fourteen), and the accelerator report about 1297 jobs per frame.
+"int16-weight self-test ok" (round thirteen), "row-statistics self-test ok"
+(round fourteen) and "result-RAM self-test ok" (round sixteen), and the
+accelerator report about 1301 jobs per frame.
 
 | Measurement | Value |
 |---|---|

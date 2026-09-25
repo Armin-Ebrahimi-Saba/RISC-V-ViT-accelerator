@@ -154,7 +154,7 @@ module student_gemm #(
   logic [31:0] cycles_q;        // cycle counter, running while busy_q, for CYCLES
 
   assign hw2reg.status.d = {err_q, done_q, busy_q};        // STATUS register readback
-  assign hw2reg.caps.d   = {8'd15, 16'(KMAX), 8'(NROWS)};   // CAPS: what this instance supports
+  assign hw2reg.caps.d   = {8'd31, 16'(KMAX), 8'(NROWS)};   // CAPS: what this instance supports
   assign hw2reg.cycles.d = cycles_q;                       // CYCLES register readback
 
   logic start_strobe, start_requant, start_gather;
@@ -177,6 +177,8 @@ module student_gemm #(
   assign start_w16      = reg2hw.ctrl.w16.q;      // GEMM job: int16 weights
   logic start_ostats;
   assign start_ostats   = reg2hw.ctrl.ostats.q;   // requant job: output row statistics
+  logic start_onchip;
+  assign start_onchip   = reg2hw.ctrl.onchip.q;   // results in the on-chip RAM
 
   // Configuration snapshot, taken when a job starts so software may reprogram
   // the registers for the next tile while this one runs.
@@ -203,6 +205,12 @@ module student_gemm #(
   logic           a16_q;                     // requant input is int16, two per word
   logic           w16_q;                     // GEMM weights are int16, two per word
   logic           ostats_q;                  // requant: write each output row's {max, min}
+  logic           onchip_q;                  // GEMM: drain to / requant: load from the result RAM
+  localparam int unsigned CRW = 131072;      // result RAM words (128 BRAM36)
+  localparam int unsigned CRA = $clog2(CRW);
+  logic [31:0]    cr_rdata_q;                // result RAM: the word read for the load
+  logic           cr_v_q;                    // cr_rdata_q holds the next input word
+  logic           acc_valid;                 // requant load: an input word arrives
   // Gather parameters (snapshot at start) and the walker signals the read
   // engine and the A-load writer use; the walkers themselves are further down.
   logic [31:0]    g_addr_q;
@@ -480,14 +488,14 @@ module student_gemm #(
   assign ld_valid = gather_q ? (gw_inb ? rd_valid : 1'b1) : rd_valid;
   assign ld_data  = (gather_q & ~gw_inb) ? 32'd0 : rd_data;
 
-  assign a_wr_data = ld_data;
+  assign a_wr_data = (onchip_q && state_q == RQ_LOAD_ACC) ? cr_rdata_q : ld_data;
   always_comb begin
     a_we      = '0;
     a_wr_addr = a_ld_word_q;
     if ((state_q == ST_LOAD_A) && ld_valid) a_we[a_ld_row_q[RW-1:0]] = 1'b1;
     if (state_q == RQ_LOAD_ACC) begin
       a_wr_addr = rq_m_q;
-      if (rd_valid) begin
+      if (acc_valid) begin
         a_we[rq_n_q[RW-1:0]] = 1'b1;
         if (a16_q) a_we[RW'(rq_n_q[RW-1:0] + 1'b1)] = 1'b1;  // A16: the pair's 2nd column
       end
@@ -565,7 +573,10 @@ module student_gemm #(
   //   s4  DSP multiplier registers (MREG)
   //   s5  DSP output registers (PREG): the two products
   //   then the accumulator adds both products (in logic)
-  logic              v_s1, v_s2, v_s3, v_s4, v_s5;   // valid bit per stage (adv delayed by 1..5 cycles)
+  logic              v_s1, v_s2, v_s3, v_s4;   // valid bit per stage (adv delayed by 1..4 cycles)
+  // v_s5 enables all NROWS*32 accumulator bits. max_fanout makes synthesis
+  // copy the register, so no single net spans the whole lane array.
+  (* max_fanout = 64 *) logic v_s5;
   logic signed [15:0] w_s1, w_s2, w_s3, w1_s1, w1_s2, w1_s3;   // weights k and k+1, pipelined to s3
   // keep: without it the DSP48 takes both a_s2 and the RAM read register
   // a_q as its input registers, and the row RAMs become LUT RAM.
@@ -646,7 +657,7 @@ module student_gemm #(
 
   assign n_wr     = {1'b0, n_rows_q} + (stats_en_q ? 2 : 0);
   assign t_is_acc = t_q < {1'b0, n_rows_q};
-  assign drain_wr_req  = (state_q == ST_DRAIN) & (t_q != n_wr);
+  assign drain_wr_req  = (state_q == ST_DRAIN) & (t_q != n_wr) & ~(onchip_q & t_is_acc);
   assign drain_wr_addr = t_is_acc ? c_ptr_q + 32'(t_q) * 32'd4
                                   : s_ptr_q + (t_q[0] ^ n_rows_q[0] ? 32'd4 : 32'd0);
   assign drain_wr_data = t_is_acc            ? acc_q[t_q[RW-1:0]]
@@ -716,6 +727,7 @@ module student_gemm #(
       a16_q <= 1'b0;
       w16_q <= 1'b0;
       ostats_q <= 1'b0;
+      onchip_q <= 1'b0;
       // rq_m_q, rq_p_cnt_q and lut_cnt_q have no reset: they address block
       // RAMs (an asynchronous reset there is DRC REQP-1840), and every job
       // sets them before use.
@@ -832,6 +844,7 @@ module student_gemm #(
             a16_q      <= start_a16 & start_requant;
             w16_q      <= start_w16 & ~start_requant;
             ostats_q   <= start_ostats & start_requant;
+            onchip_q   <= start_onchip;
             p_addr_q   <= reg2hw.p_addr.q;
             lut_cnt_q  <= '0;
             x_addr_q   <= reg2hw.x_addr.q;
@@ -955,7 +968,7 @@ module student_gemm #(
         ST_DRAIN: begin
           // Track max/min as accumulators go out (for the trailing stats
           // words), and advance to the next W row once this run is done.
-          if (issue_wr) begin
+          if (issue_wr | (onchip_q & t_is_acc & (t_q != n_wr))) begin
             t_q <= t_q + 1'b1;
             if (t_is_acc) begin
               if (t_q == '0 || $signed(drain_wr_data) > acc_max_q) acc_max_q <= drain_wr_data;
@@ -1010,7 +1023,7 @@ module student_gemm #(
             rd_row_beats_q <= (a16_q ? 32'(n_rows_q >> 1) : 32'(n_rows_q));
             rd_row_left_q  <= (a16_q ? 32'(n_rows_q >> 1) : 32'(n_rows_q));
             rd_stride_q    <= a_stride_q;
-            rd_left_q      <= 32'(m_len_q) * (a16_q ? 32'(n_rows_q >> 1) : 32'(n_rows_q));
+            rd_left_q      <= onchip_q ? 32'd0 : 32'(m_len_q) * (a16_q ? 32'(n_rows_q >> 1) : 32'(n_rows_q));
             rq_m_q <= '0;
             rq_n_q <= '0;
           end
@@ -1019,7 +1032,7 @@ module student_gemm #(
         RQ_LOAD_ACC: begin
           // Walk rq_m_q (row, outer) / rq_n_q (column, inner) over the
           // incoming acc words, matching the write-side transpose above.
-          if (rd_valid) begin
+          if (acc_valid) begin
             if (rq_n_q == n_rows_q - (a16_q ? NRW'(2) : NRW'(1))) begin
               rq_n_q <= '0;
               rq_m_q <= rq_m_q + 1'b1;
@@ -1272,7 +1285,7 @@ module student_gemm #(
   // rq_acc_done: the acc chunk's last word (last row, last column) has just arrived.
   assign rq_x_done   = (state_q == RQ_LOAD_X) & rd_valid
                      & (rq_n_q == n_rows_q - 1'b1) & (rq_xw_q == rq_xwords - 1'b1);
-  assign rq_acc_done = (state_q == RQ_LOAD_ACC) & rd_valid
+  assign rq_acc_done = (state_q == RQ_LOAD_ACC) & acc_valid
                      & (rq_n_q == n_rows_q - (a16_q ? NRW'(2) : NRW'(1))) & (rq_m_q == rq_mlen - 1'b1);
 
   // Output pipeline. One element per cycle:
@@ -1503,6 +1516,51 @@ module student_gemm #(
   assign os_wr_req  = (state_q == RQ_STATS) & (t_q != {1'b0, n_rows_q});
   assign os_wr_addr = s_ptr_q + 32'(t_q) * 32'd4;
   assign os_wr_data = os_ram[t_q[RW-1:0]];
+  // Result RAM (CTRL.onchip). The drain writes accumulator t of weight row
+  // m at C_ADDR + m*C_STRIDE + t (words); a requantisation job reads its
+  // chunk at A_ADDR + m*A_STRIDE + n, one word per cycle, into the tile
+  // RAM as a bus load would (acc_valid / cr_rdata_q replace rd_valid /
+  // rd_data). Saves the int32 results' trip to DDR3 and back.
+  (* ram_style = "block" *) logic [31:0] cr_ram [CRW];
+  logic [CRA-1:0] cr_base_q;             // request side: current row's first word
+  logic [NRW-1:0] cr_n_q;                // request side: column
+  logic [AW-1:0]  cr_m_q;                // request side: row
+  logic           cr_act_q;              // request side: words left to read
+  assign acc_valid = onchip_q ? cr_v_q : rd_valid;
+  always_ff @(posedge clk_i) begin
+    if ((state_q == ST_DRAIN) && onchip_q && t_is_acc && (t_q != n_wr))
+      cr_ram[CRA'(c_ptr_q) + CRA'(t_q)] <= acc_q[t_q[RW-1:0]];
+    cr_rdata_q <= cr_ram[cr_base_q + CRA'(cr_n_q)];
+  end
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      cr_v_q   <= 1'b0;
+      cr_act_q <= 1'b0;
+    end else begin
+      cr_v_q <= (state_q == RQ_LOAD_ACC) & onchip_q & cr_act_q;
+      if (rq_p_done & onchip_q) begin
+        cr_act_q <= 1'b1;
+      end else if ((state_q == RQ_LOAD_ACC) & cr_act_q
+                   & (cr_n_q == n_rows_q - 1'b1) & (cr_m_q == rq_mlen - 1'b1)) begin
+        cr_act_q <= 1'b0;
+      end
+    end
+  end
+  always_ff @(posedge clk_i) begin
+    if (rq_p_done) begin
+      cr_base_q <= CRA'(a_addr_q);
+      cr_n_q    <= '0;
+      cr_m_q    <= '0;
+    end else if ((state_q == RQ_LOAD_ACC) & cr_act_q) begin
+      if (cr_n_q == n_rows_q - 1'b1) begin
+        cr_n_q    <= '0;
+        cr_m_q    <= cr_m_q + 1'b1;
+        cr_base_q <= cr_base_q + CRA'(a_stride_q);
+      end else begin
+        cr_n_q <= cr_n_q + 1'b1;
+      end
+    end
+  end
   logic [31:0] rq_amax_q;
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin

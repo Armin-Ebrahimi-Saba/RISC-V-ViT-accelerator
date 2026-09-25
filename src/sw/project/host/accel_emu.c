@@ -28,7 +28,7 @@ static uint32_t regs[NREGS];
 
 /* the latched job */
 static struct {
-    int      busy, requant, gather, add, relu, lut, lut_load, a16, w16, ostats;
+    int      busy, requant, gather, add, relu, lut, lut_load, a16, w16, ostats, onchip;
     uint32_t lut_addr;
     uint32_t x_addr, add_mx, add_mh, add_shift;
     uint32_t a_addr, a_stride, w_addr, w_stride, c_addr, c_stride, s_addr, p_addr;
@@ -42,6 +42,7 @@ static void *ptr(uint32_t a) { return (void *)(uintptr_t)a; }
 
 /* the block's lookup-table RAM (CTRL.lut), kept between jobs */
 static int16_t lut_tab[16384];
+static int32_t cr_ram[131072];          /* the result RAM (CTRL.onchip) */
 static int     lut_valid;
 
 static void fail(const char *what)
@@ -79,7 +80,8 @@ static void gemm_row(uint32_t m)
     uint32_t wstride = job.w_stride ? job.w_stride : (job.w16 ? 2u * job.k : job.k);
     const int8_t *wr = (const int8_t *)ptr(job.w_addr + m * wstride);
     const int16_t *wr16 = (const int16_t *)ptr(job.w_addr + m * wstride);
-    int32_t *cr = (int32_t *)ptr(job.c_addr + m * job.c_stride);
+    int32_t *cr = job.onchip ? cr_ram + job.c_addr + m * job.c_stride
+                             : (int32_t *)ptr(job.c_addr + m * job.c_stride);
     int32_t mx = 0, mn = 0;
     for (uint32_t t = 0; t < job.n; t++) {
         int32_t s = 0;
@@ -118,7 +120,8 @@ static void requant_all(void)
     for (uint32_t n = 0; n < job.n; n++) {
         int16_t *orow = (int16_t *)ptr(job.c_addr + n * job.c_stride);
         for (uint32_t m = 0; m < job.m; m++) {
-            int64_t acc = job.a16 ? ((const int16_t *)ptr(job.a_addr + m * job.a_stride))[n]
+            int64_t acc = job.onchip ? cr_ram[job.a_addr + m * job.a_stride + n]
+                        : job.a16 ? ((const int16_t *)ptr(job.a_addr + m * job.a_stride))[n]
                                   : ((const int32_t *)ptr(job.a_addr + m * job.a_stride))[n];
             int64_t mult = par[3 * m];
             int     sh   = par[3 * m + 1];
@@ -172,6 +175,7 @@ static void latch(void)
     job.a16      = ((ctrl >> 7) & 1u) && job.requant;
     job.w16      = ((ctrl >> 8) & 1u) && !job.requant;
     job.ostats   = ((ctrl >> 9) & 1u) && job.requant;
+    job.onchip   = (ctrl >> 10) & 1u;
     if (job.a16 && (job.n & 1u)) fail("requant A16: N_ROWS odd");
     if (job.lut_load && (job.lut_addr & 3u)) fail("LUT_ADDR unaligned");
     job.x_addr   = R(X_ADDR);   job.add_mx = R(ADD_MULT_X);
@@ -188,7 +192,7 @@ static void latch(void)
     if (job.n < 1 || job.n > NROWS) fail("N_ROWS out of range");
     if (job.requant) {
         if (job.m < 2 || (job.m & 1u) || job.m > KMAX / 2) fail("requant M_LEN out of range");
-        if (job.a_stride & 3u) fail("requant A_STRIDE not word aligned");
+        if (!job.onchip && (job.a_stride & 3u)) fail("requant A_STRIDE not word aligned");
         if (job.add && job.m > KMAX / 4) fail("requant+add: M_LEN over KMAX/4");
         if (job.add && (job.x_addr & 3u)) fail("requant+add: X_ADDR unaligned");
     } else {
@@ -197,8 +201,12 @@ static void latch(void)
             fail("gather: K_LEN != kernel positions * C");
         if (job.gather && (job.g_chan & 1u)) fail("gather: C odd");
     }
-    if ((job.a_addr | job.w_addr | job.c_addr | job.s_addr | job.p_addr | job.g_addr) & 3u)
+    /* with CTRL.onchip A_ADDR (requant) or C_ADDR (GEMM) count words */
+    if (((job.onchip && job.requant ? 0u : job.a_addr) | job.w_addr
+         | (job.onchip && !job.requant ? 0u : job.c_addr)
+         | job.s_addr | job.p_addr | job.g_addr) & 3u)
         fail("unaligned address");
+    if (job.onchip && job.requant && job.a16) fail("requant: CTRL.onchip with CTRL.a16");
 }
 
 /* Advance the running job; called on every STATUS read. */
@@ -236,7 +244,7 @@ volatile uint32_t *dav2_emu_reg(uint32_t addr)
     static int init;
     if (!init) {
         init = 1;
-        R(CAPS) = (15u << 24) | ((uint32_t)KMAX << 8) | NROWS;   /* bits 24-27: table, int16 input and weights, row statistics */
+        R(CAPS) = (31u << 24) | ((uint32_t)KMAX << 8) | NROWS;   /* bits 24-28: table, int16 input and weights, row statistics, result RAM */
     }
     if (addr < STUDENT_GEMM0_BASE_ADDR || addr >= STUDENT_GEMM0_BASE_ADDR + NREGS * 4u)
         fail("register access outside the block");

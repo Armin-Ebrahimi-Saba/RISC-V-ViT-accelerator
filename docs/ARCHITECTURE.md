@@ -212,8 +212,13 @@ largest and smallest value to `S_ADDR` after the output. The residual
 updates use it for the tokens' ranges and LayerNorm's first job for the
 channels' ranges, so LayerNorm needs no compare per value.
 
-`CAPS` bits 24 to 27 announce the lookup table, the int16 input, the int16
-weights and the row statistics. The
+A **result RAM** of 131,072 words (**`CTRL.onchip`**) keeps a GEMM's int32
+result on chip: the drain writes it there instead of to DDR3, and the next
+requantisation job reads it from there. The encoder's results fit (82
+tokens); this removes two of the two and a half bus words per output.
+
+`CAPS` bits 24 to 28 announce the lookup table, the int16 input, the int16
+weights, the row statistics and the result RAM. The
 driver uses them only when the bit is set and its boot self-test passes;
 otherwise the same arithmetic runs on the CPU.
 

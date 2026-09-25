@@ -3,6 +3,7 @@
 #   build.sh [engine source dir]      (default: this repository's)
 # Needs the RISC-V GCC the flow uses. Run from this directory.
 # FRAME_FLAGS="-DMACW=1 -DPIPE=2" models the block before round fifteen.
+# FRAME_FLAGS=-DONCHIP_C=0 models it without the result RAM (before round sixteen).
 HERE=$(cd "$(dirname "$0")" && pwd)
 SRC=${1:-$HERE/../..}
 GCC=$(command -v riscv-none-elf-gcc || ls ~/Public/xpack-riscv-none-elf-gcc-*/bin/riscv-none-elf-gcc | tail -1)

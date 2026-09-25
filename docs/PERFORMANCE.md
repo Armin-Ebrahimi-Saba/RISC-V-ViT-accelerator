@@ -1,4 +1,4 @@
-# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 2.75 s (estimated)
+# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 2.47 s (estimated)
 
 This is the record of the speed-up work: what was measured, what each change
 did, and what is left. Every step kept the FPGA output **bit-exact with the
@@ -877,6 +877,35 @@ bus traffic: for an encoder row (K = 384, 82 tokens) the 96 weight words
 and the 84 words of int32 results written by the drain, and then the
 requantisation job reads the results back. The next step is to keep the
 results on chip.
+
+### Round sixteen — GEMM results kept on chip (hardware; estimated, not yet measured)
+
+A GEMM's int32 results went to DDR3 in the drain and came back in the
+requantisation job: 2 of the 2.5 bus words per output. For the encoder
+(82 tokens, one tile) the whole result fits on chip: fc1's is the largest,
+1536 × 82 words.
+
+| Change | Where | Model (Mcycles per frame) |
+|---|---|---|
+| **Result RAM** (`CTRL.onchip`, 131,072 words in 128 BRAM36): a GEMM job drains its accumulators into it, one word per cycle and without the bus (C_ADDR, C_STRIDE count its words); only the row statistics go to DDR3. A requantisation job loads its input from it, one word per cycle (A_ADDR, A_STRIDE count its words). CAPS bit 28, boot self-test (GEMM, then requantisation from the RAM, against the CPU). | `student_gemm.sv`, `dav2_accel.c` | — |
+| `qgemm_impl` uses it for every plain GEMM with N ≤ 128 and N·M ≤ 131,072 whose requantisation runs on the block: the encoder's qkv, proj, fc1, fc2 and the DPT projections. If a job fails or a chunk is declined, the whole GEMM is redone without the RAM (the results are not in DDR3). | `dav2_ops.c` | accelerator GEMM (encoder) 24.2 → 17.5, requantisation 13.8 → 7.8, requantisation with add 4.2 → 2.6 |
+
+Same output as before, bit for bit (11 images, host and emulator; the
+emulator models the RAM). Bus errors injected into jobs 20 to 23, 40, 41
+and 300 of a frame all end with the correct output. `student_gemm_tb`:
+GEMM into the RAM and requantisation from it over several chunks, the
+statistics, and memory left untouched. PASSED, 644,163 words. Bitstream:
+timing met, WNS +0.395 ns (DDR3 controller), WHS +0.024 ns; LUT 23.7 %, BRAM 91.6 % (334.5 of 365 tiles), DSP 37.7 %.
+
+The first build of this RAM failed in placement for the same reason as
+round fifteen's first build (the A-tile rows in LUT RAM); the `keep`
+there fixed both. With 128 more BRAM36 the lane array spreads out, and
+the valid bit `v_s5`, which enables all 4096 accumulator bits, had 19 ns
+of routing (slack +0.08 ns). `(* max_fanout = 64 *)` on it makes
+synthesis copy the register; the worst `sys_clk` path then has +1.67 ns.
+
+Model: 142.6 → 128.4 Mcycles per frame, **about 2.47 s** (2.57 s, less
+the model's 4 %).
 
 ## 7. What is left, in order of expected gain
 

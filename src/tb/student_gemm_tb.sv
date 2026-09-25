@@ -813,6 +813,96 @@ module student_gemm_tb;
       $display("  ok, %0d rows", ndim);
   endtask
 
+  // GEMM into the result RAM (CTRL.onchip), then its requantisation from
+  // there: nothing of the int32 result goes through memory, only the
+  // statistics. Chunks of 256 rows, one n-tile (ndim <= NROWS).
+  task automatic run_onchip(input int ndim, input int kdim, input int mdim);
+    int mismatches = 0;
+    logic [31:0] st;
+    int guard;
+    $display("--- ONCHIP GEMM+REQUANT N=%0d K=%0d M=%0d", ndim, kdim, mdim);
+    for (int n = 0; n < ndim; n++)
+      for (int k = 0; k < kdim; k++)
+        poke_a(n, k, kdim, 16'($signed($urandom % 16383) - 8191));
+    for (int m = 0; m < mdim; m++)
+      for (int k = 0; k < kdim; k++)
+        poke_w(m, k, kdim, 8'($signed($urandom % 255) - 127));
+    for (int m = 0; m < mdim; m++) begin
+      memory.mem[mem_word(P_BASE) + 3*m]     = 32'h4000_0000 + ($urandom % 32'h3fff_ffff);
+      memory.mem[mem_word(P_BASE) + 3*m + 1] = 44 + ($urandom % 4);
+      memory.mem[mem_word(P_BASE) + 3*m + 2] = 32'($signed($urandom % 2001) - 1000);
+      memory.mem[mem_word(S_BASE) + 2*m]     = 32'hdead_beef;
+    end
+    for (int i = 0; i < ndim * mdim / 2; i++)
+      memory.mem[mem_word(O_BASE) + i] = 32'hdead_beef;
+    for (int i = 0; i < ndim * mdim; i++)
+      memory.mem[mem_word(C_BASE) + i] = 32'h1234_5678;      // must stay untouched
+    // the GEMM: C_ADDR/C_STRIDE in words of the result RAM
+    stats_addr = S_BASE;
+    ctrl_extra = 32'h400;
+    run_job(A_BASE, W_BASE, 0, ndim, kdim, mdim, ndim, 0, 0);
+    ctrl_extra = 32'h0;
+    stats_addr = 0;
+    // the requantisation: A_ADDR/A_STRIDE in words of the result RAM
+    for (int m0 = 0; m0 < mdim; m0 += 256) begin
+      int mc = (mdim - m0 > 256) ? 256 : mdim - m0;
+      bus.put_word(R_A_ADDR,   m0 * ndim);
+      bus.put_word(R_A_STRIDE, ndim);
+      bus.put_word(R_P_ADDR,   P_BASE + 32'(m0 * 12));
+      bus.put_word(R_C_ADDR,   O_BASE + 32'(m0 * 2));
+      bus.put_word(R_C_STRIDE, mdim * 2);
+      bus.put_word(R_S_ADDR,   0);
+      bus.put_word(R_M_LEN,    mc);
+      bus.put_word(R_N_ROWS,   ndim);
+      bus.put_word(R_CTRL,     32'h403);
+      guard = 0;
+      forever begin
+        bus.get_word(R_STATUS, st);
+        if (!(st & 32'h1)) break;
+        if (++guard > 400000) begin
+          $display("FAIL: on-chip requant did not finish (status=0x%08x)", st);
+          errors++;
+          return;
+        end
+      end
+    end
+    for (int m = 0; m < mdim; m++) begin
+      int mx = -2147483647 - 1, mn = 2147483647;
+      for (int n = 0; n < ndim; n++) begin
+        int acc = 0, idx = n * mdim + m, e, got;
+        logic [31:0] w;
+        for (int k = 0; k < kdim; k++)
+          acc += int'(peek_a(n, k, kdim)) * int'(peek_w(m, k, kdim));
+        if (acc > mx) mx = acc;
+        if (acc < mn) mn = acc;
+        e = sat14(apply_mult(longint'(acc), longint'(int'(memory.mem[mem_word(P_BASE) + 3*m])),
+                             int'(memory.mem[mem_word(P_BASE) + 3*m + 1]))
+                  + longint'(int'(memory.mem[mem_word(P_BASE) + 3*m + 2])));
+        w = memory.mem[mem_word(O_BASE) + (idx >> 1)];
+        got = idx[0] ? int'($signed(w[31:16])) : int'($signed(w[15:0]));
+        checks++;
+        if (got !== e) begin
+          if (mismatches < 5)
+            $display("  FAIL n=%0d m=%0d: got %0d expected %0d (acc %0d)", n, m, got, e, acc);
+          mismatches++;
+        end
+      end
+      checks += 2;
+      if (int'(memory.mem[mem_word(S_BASE) + 2*m]) !== mx || int'(memory.mem[mem_word(S_BASE) + 2*m + 1]) !== mn)
+        mismatches++;
+    end
+    for (int i = 0; i < ndim * mdim; i++)
+      if (memory.mem[mem_word(C_BASE) + i] !== 32'h1234_5678) begin
+        mismatches++;
+        break;
+      end
+    if (mismatches) begin
+      $display("  %0d wrong", mismatches);
+      errors += mismatches;
+    end else
+      $display("  ok, %0d outputs, statistics, memory untouched", ndim * mdim);
+  endtask
+
   task automatic run_requant(input int ndim, input int mdim, input int sh_min = 33);
     int mismatches = 0;
     logic [31:0] st;
@@ -984,6 +1074,9 @@ module student_gemm_tb;
     run_requant_ostats(384, 82, 0, 0);
     run_requant_ostats(82, 30, 1, 0);
     run_requant_ostats(20, 30, 0, 1);
+    // results kept on chip: encoder shapes (82 rows), several chunks
+    run_onchip(82, 64, 600);
+    run_onchip(20, 128, 30);
     // and a plain job afterwards must not use the table
     run_gemm(20, 64, 30);    run_requant_epi(20, 30, 1);
     stats_addr = 0;

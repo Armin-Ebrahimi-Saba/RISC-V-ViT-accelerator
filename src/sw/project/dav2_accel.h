@@ -126,7 +126,18 @@ typedef struct {
     /* CTRL.ostats: each output row n's {max, min} of this job's columns,
      * as one word (max in bits 31:16), at ostats[n]. */
     uint32_t      *ostats;
+    /* CTRL.onchip: the input is the result the last GEMM left in the
+     * block's result RAM (dav2_accel_qgemm_onchip_async), not acc */
+    int            onchip;
 } dav2_rq_epi_t;
+/* A GEMM whose int32 result stays in the block's result RAM (CTRL.onchip,
+ * CAPS bit 28): N <= CAPS.NROWS, N*M <= DAV2_ACCEL_CR_WORDS. Only the row
+ * statistics come back (st, as for dav2_accel_qgemm_async); the next
+ * requantisation must read it with epi.onchip. 0 when not possible. */
+#define DAV2_ACCEL_CR_WORDS 131072
+int dav2_accel_onchip_ok(void);
+int dav2_accel_qgemm_onchip_async(const dav2_tensor_t *a, const dav2_qw_t *wt,
+                                  dav2_accel_stats_t *st);
 /* Non-zero if the block writes output row statistics (CAPS bit 27). */
 int dav2_accel_ostats_ok(void);
 /* Non-zero if the block has the lookup table (CAPS bit 24) and its boot

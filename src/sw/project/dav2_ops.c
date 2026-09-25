@@ -461,6 +461,7 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
                        const dav2_qw_t *wt, const dav2_tensor_t *res, int relu,
                        int gelu, dav2_tensor_t *out);
 static int16_t *gelu_table(dav2_xf_t in_scale, dav2_xf_t *out_scale_ret);
+static int qgemm_no_onchip;             /* set while redoing a GEMM on the CPU */
 
 void dav2_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, dav2_tensor_t *out)
 {
@@ -531,6 +532,9 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
      * m+1.. are still being computed. Profile: "gemm (accelerator)" counts
      * only the time the CPU actually waits for the block. */
     uint64_t t_start = dav2_cycles(), waited = 0;
+    int use_onchip = !cv && !qgemm_no_onchip && dav2_accel_onchip_ok()
+                  && (M & 1) == 0 && N <= 128 && (long)N * M <= DAV2_ACCEL_CR_WORDS
+                  && (!res || (res->n == N && res->c == M && (((uintptr_t)res->v) & 3u) == 0));
     dav2_accel_stats_t st;
     int run;
     if (cv && (run = dav2_accel_conv_async(a->v, cv->h, cv->w, a->c, cv->k, cv->stride,
@@ -544,7 +548,14 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
             dav2_im2col(a, cv->h, cv->w, cv->k, cv->k, cv->stride, cv->pad, &cols);
             t_start = dav2_cycles();          /* im2col counted in its own bucket */
         }
-        run = dav2_accel_qgemm_async(&cols, wt, acc, &st);
+        /* keep the int32 result on chip when it fits and the whole
+         * requantisation can run on the block (M even, no odd residual) */
+        if (use_onchip)
+            run = dav2_accel_qgemm_onchip_async(&cols, wt, &st);
+        if (!run) {
+            use_onchip = 0;
+            run = dav2_accel_qgemm_async(&cols, wt, acc, &st);
+        }
         if (!run) {
             dav2_qgemm_cpu(cols.v, wt->w, acc, N, K, M);
             dav2_prof_add(DAV2_PROF_GEMM_CPU, dav2_cycles() - t_start);
@@ -717,6 +728,7 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
         dav2_rq_epi_t epi;
         memset(&epi, 0, sizeof epi);
         epi.relu = relu;
+        epi.onchip = use_onchip;
         uint64_t gelu_cycles = 0;
         /* the output's row ranges, when the caller asks (out->rst): one
          * statistics word per row and chunk, combined below */
@@ -779,8 +791,8 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
             epi.ostats = rst_chunks ? rst_chunks + (size_t)(m0 / RQ_CHUNK) * N : 0;
             uint64_t w0 = dav2_cycles();
             ok = dav2_accel_requant_rows_async(acc, N, M, m0, mc, par, dst, &rq_amax,
-                                               (epi.add || epi.relu || epi.lut || epi.ostats)
-                                               ? &epi : 0) != 0;
+                                               (epi.add || epi.relu || epi.lut || epi.ostats
+                                                || epi.onchip) ? &epi : 0) != 0;
             epi.lut_load = 0;                     /* the block keeps the table */
             waited += dav2_cycles() - w0;         /* includes settling the previous */
         }
@@ -819,8 +831,13 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
             return;
         }
         /* Declined or failed: the CPU path below does the whole conversion
-         * (the residual is intact, see dst above). */
+         * (the residual is intact, see dst above). A result left on chip is
+         * not in acc: then the whole GEMM is redone on the CPU. */
+        if (use_onchip)
+            goto redo_on_cpu;
     }
+    if (use_onchip)
+        goto redo_on_cpu;
     PAR_UPTO(M);
 #undef PAR_UPTO
     dav2_prof_add(DAV2_PROF_GEMM_ACCEL, waited);
@@ -908,7 +925,9 @@ redo_on_cpu:
      * printed why); acc is incomplete. Start over -- every path is now the
      * CPU's. */
     dav2_arena_release(mark);
+    qgemm_no_onchip++;                    /* the redo keeps its result in DDR3 */
     qgemm_impl(a, cv, wt, res, relu, gelu, out);
+    qgemm_no_onchip--;
 }
 
 /* -------------------------------------------------------------- LayerNorm */

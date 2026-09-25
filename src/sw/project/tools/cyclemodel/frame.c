@@ -56,6 +56,8 @@ int putchar(int c) { return c; }
  *        time: K / MACW cycles (MACW weights per cycle), but not less than
  *        the row's weight words (K/4, or K/2 for int16 weights) at the bus
  *        rate. Pipeline tail: PIPE cycles from the last weight to the drain.
+ *        With the result RAM (ONCHIP_C) the drain takes nt/4 + 2 cycles and
+ *        the next requantisation reads no input words from the bus.
  *   requantisation: parameters 3*M words, input N*M words (int16: half),
  *        output one element per cycle, N*M/2 words written. */
 #define BEAT 21                         /* tenths of a cycle per bus word */
@@ -80,8 +82,17 @@ static void start_job(uint64_t cyc)
 #ifndef PIPE
 #define PIPE 5                          /* MAC pipeline stages (2 before round 15) */
 #endif
+#ifndef CR_WORDS
+#define CR_WORDS 131072                 /* result RAM words (round 16) */
+#endif
+#ifndef ONCHIP_C
+#define ONCHIP_C 1                      /* results kept on chip (round 16; 0 before) */
+#endif
+static int onchip_last;                 /* the last GEMM kept its result on chip */
 static uint64_t gemm_cycles(int N, int K, int M, int w16)
 {
+    const int onchip = ONCHIP_C && N <= 128 && (long)N * M <= CR_WORDS && !w16;
+    onchip_last = onchip;
     uint64_t c = 0;
     uint64_t mac = (uint64_t)K / MACW;
     uint64_t bus = (uint64_t)K / (w16 ? 2 : 4) * BEAT / 10;
@@ -89,7 +100,7 @@ static uint64_t gemm_cycles(int N, int K, int M, int w16)
     for (int n0 = 0; n0 < N; n0 += 128) {
         int nt = N - n0 < 128 ? N - n0 : 128;
         c += (uint64_t)nt * K / 2 * BEAT / 10;
-        c += (uint64_t)M * (row + (uint64_t)(nt + 2) * BEAT / 10);
+        c += (uint64_t)M * (row + (onchip ? (uint64_t)nt / 4 + 2 : (uint64_t)(nt + 2) * BEAT / 10));
     }
     return c;
 }
@@ -97,7 +108,7 @@ static uint64_t requant_cycles(int N, int M, int in16, int add)
 {
     uint64_t e = (uint64_t)N * M;
     uint64_t tiles = (uint64_t)(N + 127) / 128;
-    uint64_t words = 3u * M * tiles + (in16 ? e / 2 : e) + (add ? e / 2 : 0);
+    uint64_t words = 3u * M * tiles + (onchip_last && !in16 ? 0 : (in16 ? e / 2 : e)) + (add ? e / 2 : 0);
     uint64_t out = e > e / 2 * BEAT / 10 ? e : e / 2 * BEAT / 10;
     return words * BEAT / 10 + out;
 }
@@ -144,6 +155,12 @@ int dav2_accel_requant16(const int16_t *in, int N, int M, const int32_t *params,
   job_kind = K_RQ16; start_job(requant_cycles(N, M, 1, 0) + (ostats ? (uint64_t)N * BEAT / 10 : 0)); wait_done();
   *amax = 8000; return 1; }
 int dav2_accel_ostats_ok(void) { return 1; }
+int dav2_accel_onchip_ok(void) { return ONCHIP_C; }
+int dav2_accel_qgemm_onchip_async(const dav2_tensor_t *a, const dav2_qw_t *wt,
+                                  dav2_accel_stats_t *st)
+{ if ((long)a->n * wt->m > CR_WORDS) return 0;
+  job_kind = K_GEMM_ENC; start_job(gemm_cycles(a->n, a->c, wt->m, 0));
+  st->v = stats_buf; st->tiles = 1; return 2; }
 
 
 #define DDR ((uint8_t *)0x80000000u)

@@ -115,6 +115,11 @@
           desc: "Requantisation job only: 1 - after the output, write each output row n's largest and smallest final value to S_ADDR + n*4 as one word, max in bits 31:16 and min in bits 15:0 (int16). Present when CAPS bit 27 is set."
         }
         {
+          bits: 10
+          name: "onchip"
+          desc: "1 - use the result RAM (131072 words). GEMM job: the accumulators go to that RAM at C_ADDR + m*C_STRIDE + t, both in words, instead of to memory; S_ADDR still receives the statistics. Requantisation job: the input is read from that RAM at A_ADDR + m*A_STRIDE + n, in words (int32 only). Present when CAPS bit 28 is set."
+        }
+        {
           bits: 2
           name: "gather"
           desc: "GEMM job only: 1 - the A tile is gathered from an NHWC int16 image as im2col would lay it out (G_ADDR, G_GEOM, G_CHAN, G_CONV, G_START), instead of read from A_ADDR. K_LEN must equal kpos_count * C. C must be even."
@@ -226,7 +231,7 @@
     }
     {
       name: caps
-      desc: "Hardware capabilities: bits [7:0] = NROWS, bits [23:8] = KMAX, bit 24 = the requantisation lookup table (CTRL.lut) exists, bit 25 = the int16 requantisation input (CTRL.a16) exists, bit 26 = int16 GEMM weights (CTRL.w16) exist, bit 27 = requantisation output row statistics (CTRL.ostats) exist. Reads 0 when no accelerator is present."
+      desc: "Hardware capabilities: bits [7:0] = NROWS, bits [23:8] = KMAX, bit 24 = the requantisation lookup table (CTRL.lut) exists, bit 25 = the int16 requantisation input (CTRL.a16) exists, bit 26 = int16 GEMM weights (CTRL.w16) exist, bit 27 = requantisation output row statistics (CTRL.ostats) exist, bit 28 = the result RAM (CTRL.onchip) exists. Reads 0 when no accelerator is present."
       swaccess: ro
       hwaccess: hwo
       hwext: "true"
