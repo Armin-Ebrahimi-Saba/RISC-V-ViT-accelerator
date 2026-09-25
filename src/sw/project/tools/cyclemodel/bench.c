@@ -68,6 +68,16 @@ int dav2_accel_requant(const int32_t *acc, int N, int M, const int32_t *params,
 { (void)acc;(void)params;(void)out; MMIO[6] = (uint32_t)(3 * N * M); *amax_out = 8000; return 1; }
 int dav2_accel_finish(void) { return 1; }
 int dav2_accel_lut_ok(void) { return 1; }   /* GELU in the requantisation job */
+/* int16-weight GEMM (attention): instant, rows' statistics left as they are;
+ * strided requantisation (the context): 1.5 beats per element, 2 cycles each */
+int dav2_accel_w16_ok(void) { return 1; }
+int dav2_accel_present(void) { return 1; }
+int dav2_accel_gemm16_async(const int16_t *a, uint32_t as, const int16_t *w, uint32_t ws,
+                            int32_t *acc, int N, int K, int M, int32_t *st)
+{ (void)a;(void)as;(void)w;(void)ws;(void)acc;(void)N;(void)K;(void)M;(void)st; return 1; }
+int dav2_accel_requant_stride(const int32_t *acc, int N, int M, const int32_t *params,
+                              int16_t *out, int out_stride, int32_t *amax)
+{ (void)acc;(void)params;(void)out;(void)out_stride; MMIO[6] = (uint32_t)(3 * N * M); *amax = 8000; return 1; }
 /* int16-input requantisation (LayerNorm): N*M/2 words in and out, charged
  * at 2 cycles per beat */
 int dav2_accel_requant16(const int16_t *in, int N, int M, const int32_t *params,

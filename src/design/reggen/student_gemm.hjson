@@ -105,6 +105,11 @@
           desc: "Requantisation job only: 1 - the input acc[m][n] is int16 instead of int32: rows of N_ROWS int16 (N_ROWS even), two per word, rows A_STRIDE bytes apart. Present when CAPS bit 25 is set."
         }
         {
+          bits: 8
+          name: "w16"
+          desc: "GEMM job only: 1 - the weights W are int16, two per word (bits 15:0 first), instead of four int8. K_LEN must be even; W_STRIDE 0 then means K*2. Present when CAPS bit 26 is set."
+        }
+        {
           bits: 2
           name: "gather"
           desc: "GEMM job only: 1 - the A tile is gathered from an NHWC int16 image as im2col would lay it out (G_ADDR, G_GEOM, G_CHAN, G_CONV, G_START), instead of read from A_ADDR. K_LEN must equal kpos_count * C. C must be even."
@@ -216,7 +221,7 @@
     }
     {
       name: caps
-      desc: "Hardware capabilities: bits [7:0] = NROWS, bits [23:8] = KMAX, bit 24 = the requantisation lookup table (CTRL.lut) exists, bit 25 = the int16 requantisation input (CTRL.a16) exists. Reads 0 when no accelerator is present."
+      desc: "Hardware capabilities: bits [7:0] = NROWS, bits [23:8] = KMAX, bit 24 = the requantisation lookup table (CTRL.lut) exists, bit 25 = the int16 requantisation input (CTRL.a16) exists, bit 26 = int16 GEMM weights (CTRL.w16) exist. Reads 0 when no accelerator is present."
       swaccess: ro
       hwaccess: hwo
       hwext: "true"

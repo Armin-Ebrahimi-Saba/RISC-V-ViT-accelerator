@@ -39,16 +39,17 @@ and beta are folded into proj0..3. The engine rejects other versions.
 kept as `dav2_weights_f32.bin`); it needs the checkpoint for the fold (the
 Hugging Face cache, or `--ckpt`). `export_dav2.py` calls it itself.
 
-**Rounds eight to twelve are not measured on the board yet.** The board was
+**Rounds eight to thirteen are not measured on the board yet.** The board was
 not connected. Their changes are verified on the PC (host build,
 accelerator emulator, 11 test images) and estimated with
-`tools/cyclemodel/` (`PERFORMANCE.md` §6): about 2.9 s per frame. The next
+`tools/cyclemodel/` (`PERFORMANCE.md` §6): about 2.4 s per frame. The next
 board run must confirm the frame time, that the output is bit-exact with
 `dav2_host`, and that the boot self-test prints `DAV2_SELFTEST c1bf94c1`.
 Round twelve changes the hardware (lookup table and int16 input in the
 requantisation job): program the new bitstream first. The boot log must
-show "lookup-table self-test ok" and "int16-input self-test ok", and the
-accelerator report about 1368 jobs per frame.
+show "lookup-table self-test ok", "int16-input self-test ok" and
+"int16-weight self-test ok" (round thirteen), and the accelerator report
+about 1297 jobs per frame.
 
 | Measurement | Value |
 |---|---|
@@ -58,8 +59,8 @@ accelerator report about 1368 jobs per frame.
 | Image in / result out | 0.3 s / 0.36 s over the JTAG system bus |
 | Accelerator | 128 rows per tile, 8 reads in flight, 2.1 cycles/beat, 0 retries per frame |
 | Accelerator jobs | 1268 per frame, 585 overlapped with CPU work |
-| Timing, last build | pnr WNS +0.395 ns, WHS +0.029 ns, 0 failing (round twelve's bitstream, not yet run on the board) |
-| Resources | LUT 19.4 %, BRAM 56.6 %, DSP 20.4 % (round twelve; the measured rounds had LUT 18.9 %, BRAM 54.4 %) |
+| Timing, last build | pnr WNS +0.395 ns, WHS +0.041 ns, 0 failing (round thirteen's bitstream, not yet run on the board) |
+| Resources | LUT 19.5 %, BRAM 56.6 %, DSP 20.4 % (round thirteen; the measured rounds had LUT 18.9 %, BRAM 54.4 %) |
 
 Three defects were found and fixed in the platform's DDR3 path. None was in
 the accelerator or the model code. They are described fully in

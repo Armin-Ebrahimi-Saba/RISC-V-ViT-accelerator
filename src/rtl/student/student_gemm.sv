@@ -154,7 +154,7 @@ module student_gemm #(
   logic [31:0] cycles_q;        // cycle counter, running while busy_q, for CYCLES
 
   assign hw2reg.status.d = {err_q, done_q, busy_q};        // STATUS register readback
-  assign hw2reg.caps.d   = {8'd3, 16'(KMAX), 8'(NROWS)};   // CAPS: what this instance supports
+  assign hw2reg.caps.d   = {8'd7, 16'(KMAX), 8'(NROWS)};   // CAPS: what this instance supports
   assign hw2reg.cycles.d = cycles_q;                       // CYCLES register readback
 
   logic start_strobe, start_requant, start_gather;
@@ -173,6 +173,8 @@ module student_gemm #(
   assign start_lut_load = reg2hw.ctrl.lut_load.q; // requant job: load the LUT first
   logic start_a16;
   assign start_a16      = reg2hw.ctrl.a16.q;      // requant job: int16 input
+  logic start_w16;
+  assign start_w16      = reg2hw.ctrl.w16.q;      // GEMM job: int16 weights
 
   // Configuration snapshot, taken when a job starts so software may reprogram
   // the registers for the next tile while this one runs.
@@ -197,6 +199,7 @@ module student_gemm #(
   logic [12:0]    lut_cnt_q;                 // table load: word being filled
   logic           lut_ld_done;               // table load: the last word has arrived
   logic           a16_q;                     // requant input is int16, two per word
+  logic           w16_q;                     // GEMM weights are int16, two per word
   // Gather parameters (snapshot at start) and the walker signals the read
   // engine and the A-load writer use; the walkers themselves are further down.
   logic [31:0]    g_addr_q;
@@ -503,7 +506,7 @@ module student_gemm #(
   // klast: this is the last k of the current W row
 
   assign adv   = (state_q == ST_MAC) & wbuf_val_q;
-  assign wlast = (wsel_q == 2'd3);
+  assign wlast = (wsel_q == (w16_q ? 2'd1 : 2'd3));
   assign klast = adv & (kcnt_q == (k_len_q - 1'b1));
 
   // A-tile read address: the requant output stage reads row rq_m_q (one
@@ -533,13 +536,13 @@ module student_gemm #(
     end
   end
 
-  logic signed [7:0] wbyte;  // the one weight byte wsel_q currently selects out of wbuf_q
+  logic signed [15:0] wbyte;  // the one weight byte wsel_q currently selects out of wbuf_q
   always_comb begin
     case (wsel_q)
-      2'd0:    wbyte = $signed(wbuf_q[7:0]);
-      2'd1:    wbyte = $signed(wbuf_q[15:8]);
-      2'd2:    wbyte = $signed(wbuf_q[23:16]);
-      default: wbyte = $signed(wbuf_q[31:24]);
+      2'd0:    wbyte = w16_q ? $signed(wbuf_q[15:0]) : 16'($signed(wbuf_q[7:0]));
+      2'd1:    wbyte = w16_q ? $signed(wbuf_q[31:16]) : 16'($signed(wbuf_q[15:8]));
+      2'd2:    wbyte = 16'($signed(wbuf_q[23:16]));
+      default: wbyte = 16'($signed(wbuf_q[31:24]));
     endcase
   end
 
@@ -549,7 +552,7 @@ module student_gemm #(
   //   s2  multiply-accumulate (maps onto a DSP48E1 with A/B/P registers)
   logic              v_s1, v_s2;   // valid bit for pipeline stage s1 / s2 (adv delayed by 1 / 2 cycles)
   logic              ksel_s1;      // s1: which 16-bit half of the A word this k selects (k[0])
-  logic signed [7:0] w_s1, w_s2;   // the weight byte, pipelined alongside to reach s1 / s2 together
+  logic signed [15:0] w_s1, w_s2;   // the weight byte, pipelined alongside to reach s1 / s2 together
   logic signed [15:0] a_s2 [NROWS]; // s2: the A operand for each row, selected by ksel_s1
   logic signed [31:0] acc_q [NROWS]; // the running sum for each of the NROWS rows (this is C, in progress)
   logic              acc_clr;        // synchronously clear all NROWS accumulators this cycle
@@ -671,6 +674,7 @@ module student_gemm #(
       add_q <= 1'b0; relu_q <= 1'b0; x_addr_q <= '0;
       lut_q <= 1'b0; p_addr_q <= '0;
       a16_q <= 1'b0;
+      w16_q <= 1'b0;
       // rq_m_q, rq_p_cnt_q and lut_cnt_q have no reset: they address block
       // RAMs (an asynchronous reset there is DRC REQP-1840), and every job
       // sets them before use.
@@ -774,7 +778,7 @@ module student_gemm #(
 
             // A stride of 0 means "contiguous": one row length apart.
             w_stride_q <= (reg2hw.w_stride.q != 32'd0) ? reg2hw.w_stride.q
-                                                       : 32'(reg2hw.k_len.q);
+                                                       : start_w16 ? 32'(reg2hw.k_len.q) * 32'd2 : 32'(reg2hw.k_len.q);
             s_addr_q   <= reg2hw.s_addr.q;
             s_ptr_q    <= reg2hw.s_addr.q;
             a_addr_q   <= reg2hw.a_addr.q;
@@ -785,6 +789,7 @@ module student_gemm #(
             relu_q     <= start_relu & start_requant;
             lut_q      <= start_lut & start_requant;
             a16_q      <= start_a16 & start_requant;
+            w16_q      <= start_w16 & ~start_requant;
             p_addr_q   <= reg2hw.p_addr.q;
             lut_cnt_q  <= '0;
             x_addr_q   <= reg2hw.x_addr.q;
@@ -874,10 +879,10 @@ module student_gemm #(
             // K/4 beats, read exactly once for the whole tile.
             rd_addr_q      <= w_addr_q;
             rd_row_base_q  <= w_addr_q;
-            rd_row_beats_q <= 32'(k_len_q >> 2);
-            rd_row_left_q  <= 32'(k_len_q >> 2);
+            rd_row_beats_q <= (w16_q ? 32'(k_len_q >> 1) : 32'(k_len_q >> 2));
+            rd_row_left_q  <= (w16_q ? 32'(k_len_q >> 1) : 32'(k_len_q >> 2));
             rd_stride_q    <= w_stride_q;
-            rd_left_q      <= 32'(m_len_q) * 32'(k_len_q >> 2);
+            rd_left_q      <= 32'(m_len_q) * (w16_q ? 32'(k_len_q >> 1) : 32'(k_len_q >> 2));
           end
         end
 

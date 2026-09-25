@@ -1,4 +1,4 @@
-# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 2.9 s (estimated)
+# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 2.4 s (estimated)
 
 This is the record of the speed-up work: what was measured, what each change
 did, and what is left. Every step kept the FPGA output **bit-exact with the
@@ -762,6 +762,30 @@ LayerNorm is now mostly the CPU's range tracking: a compare per value in
 the statistics pass and in the channel pass (a taken branch costs 3
 cycles). Row statistics written by the job itself, as the GEMM drain
 already does, would remove the channel pass.
+
+### Round thirteen — int16 weights for attention (hardware; estimated, not yet measured)
+
+The block's multipliers are DSP48E1 slices, 25 × 18 bits, but the weights
+were int8. Attention has no int8 operand, so q and v were split into two
+int8 halves and every product ran twice.
+
+| Change | Where | Tool (Mcycles per frame) |
+|---|---|---|
+| **int16 weights** (`CTRL.w16`): two weights per word; the weight selector takes 16-bit halves, the weight pipeline registers are 16 bits, the multiply is 16 × 16 in the same DSPs (DSP count unchanged, 151). `W_STRIDE` 0 means K·2. CAPS bit 26, boot self-test. | `student_gemm.sv`, `dav2_accel.c` | — |
+| Attention with int16 weights: scores S = k·q in one GEMM (k in place as A, q shifted to 11 bits as the weights: 64 · 8191 · 2047 < 2^31); its row statistics give each query's maximum, so the softmax has no max pass and reads one matrix. Context C = P·v in one GEMM (fits int32 because P sums to 2^15). The requantisation job writes round(C / 2^15) straight into the head's slice of ctx (a new output stride). Per head 3 jobs instead of 4; no int8 split of q and v. | `dav2_engine.c`, `dav2_accel.c` | attention 47.4 → 25.2 |
+
+The numbers are the same as round twelve's bit for bit: k·q = 16 (k·q_hi)
++ k·q_lo, and round(C · 2^30 / 2^45) = (C + 2^14) >> 15. `dav2_host` and
+`dav2_host_emu` give round twelve's output on all 11 test images. With an
+older bitstream (no CAPS bit 26) the engine keeps the split path.
+
+Estimated whole frame, CPU time only: 128.8 → 106.6 Mcycles; with about
+15 Mcycles of accelerator waits about 122 Mcycles, 2.4 s per frame.
+
+Checks: `student_gemm_tb` has int16-weight GEMMs in attention's two shapes
+(K = 64 scores, K = 84 context with strided rows) and over two tiles:
+PASSED, 592,677 words checked. Bitstream: timing met, WNS +0.395 ns,
+WHS +0.041 ns; LUT 19.5 %, BRAM 56.6 %, DSP 20.4 %.
 
 ## 7. What is left, in order of expected gain
 

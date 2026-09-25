@@ -177,6 +177,7 @@ module student_gemm_tb;
   // ---------------------------------------------------------------- driver
 
   logic [31:0] stats_addr = 32'h0;    // S_ADDR for the next GEMM jobs (0 = off)
+  logic [31:0] ctrl_extra = 32'h0;    // extra CTRL bits for the next GEMM jobs (CTRL.w16)
 
   // One accelerator job, i.e. one tile of nt activation rows.
   task automatic run_job(input logic [31:0] a_addr,
@@ -201,7 +202,7 @@ module student_gemm_tb;
     bus.put_word(R_K_LEN,    kdim);
     bus.put_word(R_M_LEN,    mdim);
     bus.put_word(R_N_ROWS,   nt);
-    bus.put_word(R_CTRL,     32'h1);
+    bus.put_word(R_CTRL,     32'h1 | ctrl_extra);
 
     guard = 0;
     forever begin
@@ -226,6 +227,54 @@ module student_gemm_tb;
   // long reduction, and to read one attention head out of a qkv tensor.
   // A stride of 0 is sent whenever the rows are contiguous, so the default
   // path is exercised too.
+  // GEMM with int16 weights (CTRL.w16), two per word. |A| <= 8191 and
+  // |W| <= 2047 keep K <= 128 sums within int32. wstride_mode: 0 = W_STRIDE
+  // 0 (contiguous, K*2), 1 = explicit rows twice as wide.
+  task automatic run_gemm_w16(input int ndim, input int kdim, input int mdim,
+                              input int wstride_mode);
+    int mismatches = 0;
+    int wrow = wstride_mode ? kdim * 2 : kdim;     // int16 per W row in memory
+    $display("--- GEMM W16 N=%0d K=%0d M=%0d%s", ndim, kdim, mdim,
+             wstride_mode ? " (strided W rows)" : "");
+    for (int n = 0; n < ndim; n++)
+      for (int k = 0; k < kdim; k++)
+        poke_a(n, k, kdim, 16'($signed($urandom % 16383) - 8191));
+    for (int i = 0; i < mdim * wrow / 2; i++)
+      memory.mem[mem_word(W_BASE) + i] = {16'($signed($urandom % 4095) - 2047),
+                                          16'($signed($urandom % 4095) - 2047)};
+    for (int i = 0; i < mdim * ndim; i++)
+      memory.mem[mem_word(C_BASE) + i] = 32'hdead_beef;
+    ctrl_extra = 32'h100;
+    for (int n0 = 0; n0 < ndim; n0 += NROWS) begin
+      int nt = (ndim - n0 > int'(NROWS)) ? NROWS : ndim - n0;
+      run_job(A_BASE + 32'(n0 * kdim * 2), W_BASE, C_BASE + 32'(n0 * 4),
+              ndim * 4, kdim, mdim, nt, 0, wstride_mode ? wrow * 2 : 0);
+    end
+    ctrl_extra = 32'h0;
+    for (int m = 0; m < mdim; m++)
+      for (int n = 0; n < ndim; n++) begin
+        int expected = 0, got;
+        for (int k = 0; k < kdim; k++) begin
+          int wi = m * wrow + k;
+          logic [31:0] ww = memory.mem[mem_word(W_BASE) + (wi >> 1)];
+          int w = wi[0] ? int'($signed(ww[31:16])) : int'($signed(ww[15:0]));
+          expected += int'(peek_a(n, k, kdim)) * w;
+        end
+        got = int'(memory.mem[mem_word(C_BASE) + m * ndim + n]);
+        checks++;
+        if (got !== expected) begin
+          if (mismatches < 5)
+            $display("  FAIL m=%0d n=%0d: got %0d expected %0d", m, n, got, expected);
+          mismatches++;
+        end
+      end
+    if (mismatches) begin
+      $display("  %0d/%0d words wrong", mismatches, mdim * ndim);
+      errors += mismatches;
+    end else
+      $display("  ok, %0d words", mdim * ndim);
+  endtask
+
   task automatic run_gemm(input int ndim, input int kdim, input int mdim,
                           input int kfull = 0, input int koff = 0);
     int nt;
@@ -848,6 +897,12 @@ module student_gemm_tb;
     run_requant_lut(82, 600, 0, 1);
     run_gemm(20, 64, 30);    run_requant_lut(20, 30, 1, 0);
     run_gemm(130, 64, 8);    run_requant_lut(130, 8, 1, 1);    // two n-tiles
+    // int16 weights: attention's shapes (K = 64 scores, K = 84 context),
+    // two tiles, strided rows, with statistics on; then an int8 GEMM again
+    run_gemm_w16(82, 64, 82, 0);
+    run_gemm_w16(82, 84, 64, 1);
+    run_gemm_w16(130, 64, 8, 0);
+    run_gemm(20, 64, 30);
     // int16 input: LayerNorm's two shapes (tokens as rows, channels as
     // rows), n-tiles, negative multipliers, and with the table
     run_requant_a16(384, 82, 0);                     // 3 n-tiles of 128

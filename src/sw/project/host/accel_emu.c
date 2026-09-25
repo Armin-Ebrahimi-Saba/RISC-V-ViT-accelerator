@@ -28,7 +28,7 @@ static uint32_t regs[NREGS];
 
 /* the latched job */
 static struct {
-    int      busy, requant, gather, add, relu, lut, lut_load, a16;
+    int      busy, requant, gather, add, relu, lut, lut_load, a16, w16;
     uint32_t lut_addr;
     uint32_t x_addr, add_mx, add_mh, add_shift;
     uint32_t a_addr, a_stride, w_addr, w_stride, c_addr, c_stride, s_addr, p_addr;
@@ -76,14 +76,15 @@ static int32_t a_elem(uint32_t t, uint32_t kk)
 
 static void gemm_row(uint32_t m)
 {
-    uint32_t wstride = job.w_stride ? job.w_stride : job.k;
+    uint32_t wstride = job.w_stride ? job.w_stride : (job.w16 ? 2u * job.k : job.k);
     const int8_t *wr = (const int8_t *)ptr(job.w_addr + m * wstride);
+    const int16_t *wr16 = (const int16_t *)ptr(job.w_addr + m * wstride);
     int32_t *cr = (int32_t *)ptr(job.c_addr + m * job.c_stride);
     int32_t mx = 0, mn = 0;
     for (uint32_t t = 0; t < job.n; t++) {
         int32_t s = 0;
         for (uint32_t kk = 0; kk < job.k; kk++)
-            s += a_elem(t, kk) * (int32_t)wr[kk];
+            s += a_elem(t, kk) * (job.w16 ? (int32_t)wr16[kk] : (int32_t)wr[kk]);
         cr[t] = s;
         if (t == 0 || s > mx) mx = s;
         if (t == 0 || s < mn) mn = s;
@@ -161,6 +162,7 @@ static void latch(void)
     job.lut_load = ((ctrl >> 6) & 1u) && job.requant;
     job.lut_addr = R(LUT_ADDR);
     job.a16      = ((ctrl >> 7) & 1u) && job.requant;
+    job.w16      = ((ctrl >> 8) & 1u) && !job.requant;
     if (job.a16 && (job.n & 1u)) fail("requant A16: N_ROWS odd");
     if (job.lut_load && (job.lut_addr & 3u)) fail("LUT_ADDR unaligned");
     job.x_addr   = R(X_ADDR);   job.add_mx = R(ADD_MULT_X);
@@ -225,7 +227,7 @@ volatile uint32_t *dav2_emu_reg(uint32_t addr)
     static int init;
     if (!init) {
         init = 1;
-        R(CAPS) = (3u << 24) | ((uint32_t)KMAX << 8) | NROWS;   /* bits 24, 25: table, int16 input */
+        R(CAPS) = (7u << 24) | ((uint32_t)KMAX << 8) | NROWS;   /* bits 24-26: table, int16 input, int16 weights */
     }
     if (addr < STUDENT_GEMM0_BASE_ADDR || addr >= STUDENT_GEMM0_BASE_ADDR + NREGS * 4u)
         fail("register access outside the block");

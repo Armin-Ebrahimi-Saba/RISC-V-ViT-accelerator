@@ -83,6 +83,7 @@
 #define CTRL_LUT      0x20u
 #define CTRL_LUT_LOAD 0x40u
 #define CTRL_A16      0x80u
+#define CTRL_W16      0x100u
 
 #define STATUS_BUSY 0x1u
 #define STATUS_DONE 0x2u
@@ -111,6 +112,9 @@ static int      accel_gather_ok = 1;   /* cleared if the gather self-test fails 
 static int      accel_epi_ok = 1;      /* cleared if the add/ReLU self-test fails */
 static int      accel_lut_ok;          /* CAPS bit 24, cleared if its self-test fails */
 static int      accel_a16_ok;          /* CAPS bit 25, cleared if its self-test fails */
+static int      accel_w16_ok;          /* CAPS bit 26, cleared if its self-test fails */
+static uint32_t accel_gemm_ctrl;       /* extra CTRL bits for accel_run (CTRL.w16) */
+static int      accel_out_stride;      /* requant output row length in int16, 0 = M */
 static int      accel_ok;
 static unsigned accel_nrows;
 static unsigned accel_kmax;
@@ -133,6 +137,7 @@ int dav2_accel_init(void)
     accel_kmax  = (caps >> 8) & 0xffffu;
     accel_lut_ok = (int)((caps >> 24) & 1u);
     accel_a16_ok = (int)((caps >> 25) & 1u);
+    accel_w16_ok = (int)((caps >> 26) & 1u);
 
     /* A missing block reads back as zero (or the bus errors out, which the
      * core reports separately); either way we simply stay on the CPU path. */
@@ -262,11 +267,11 @@ static int accel_run(const int16_t *av, uint32_t a_stride,
         REG32(GEMM_S_ADDR) = stats ? (uint32_t)(uintptr_t)(stats + (size_t)tile * M * 2) : 0u;
         if (stats && accel_defer && n0 + nt >= N)
             accel_prefill_stats(stats + (size_t)tile * M * 2, M);
-        REG32(GEMM_CTRL)   = CTRL_START;
+        REG32(GEMM_CTRL)   = CTRL_START | accel_gemm_ctrl;
         tile++;
         if (accel_maybe_defer(n0 + nt >= N,
-                              (unsigned long)M * (K / 4) + (unsigned long)nt * (K / 2)
-                              + (unsigned long)nt * M, 0))
+                              (unsigned long)M * (K / ((accel_gemm_ctrl & CTRL_W16) ? 2 : 4))
+                              + (unsigned long)nt * (K / 2) + (unsigned long)nt * M, 0))
             return 2;
 
         /* Bounded wait. The block has only ever been exercised against BRAM
@@ -441,8 +446,9 @@ static int accel_requant_rows(const void *acc, int N, int M, int m0, int mc,
         ctrl |= CTRL_LUT;
     }
     int lut_load = epi && epi->lut && epi->lut_load;
+    const size_t orow = accel_out_stride ? (size_t)accel_out_stride : (size_t)M;
     REG32(GEMM_A_STRIDE) = (uint32_t)N * esz;
-    REG32(GEMM_C_STRIDE) = (uint32_t)M * 2u;
+    REG32(GEMM_C_STRIDE) = (uint32_t)orow * 2u;
     REG32(GEMM_S_ADDR)   = 0u;
     REG32(GEMM_P_ADDR)   = (uint32_t)(uintptr_t)(params + (size_t)m0 * 3);
     REG32(GEMM_M_LEN)    = (uint32_t)mc;
@@ -453,7 +459,7 @@ static int accel_requant_rows(const void *acc, int N, int M, int m0, int mc,
                             + (unsigned long)mc * nc / 2u + (lut_load ? 8192u : 0u);
         REG32(GEMM_A_ADDR) = (uint32_t)(uintptr_t)((const uint8_t *)acc
                                                     + ((size_t)m0 * N + n0) * esz);
-        REG32(GEMM_C_ADDR) = (uint32_t)(uintptr_t)(out + (size_t)n0 * M + m0);
+        REG32(GEMM_C_ADDR) = (uint32_t)(uintptr_t)(out + (size_t)n0 * orow + m0);
         if (epi && epi->add)
             REG32(GEMM_X_ADDR) = (uint32_t)(uintptr_t)(epi->x + (size_t)n0 * M + m0);
         REG32(GEMM_N_ROWS) = (uint32_t)nc;
@@ -623,6 +629,39 @@ int dav2_accel_conv(const int16_t *img, int h, int w, int C, int k, int stride,
     /* stats (if any) must outlive this call: keep them, drop only part */
     if (!stats) dav2_arena_release(mark);
     return 1;
+}
+
+int dav2_accel_w16_ok(void) { return dav2_accel_init() && accel_w16_ok; }
+
+int dav2_accel_gemm16_async(const int16_t *a, uint32_t a_stride,
+                            const int16_t *w, uint32_t w_stride,
+                            int32_t *acc, int N, int K, int M, int32_t *stats)
+{
+    if (!dav2_accel_init() || !accel_w16_ok)
+        return 0;
+    if (K < 2 || (K & 1) || (unsigned)K > accel_kmax || N < 1 || M < 1)
+        return 0;
+    if ((((uintptr_t)a) | ((uintptr_t)w) | ((uintptr_t)acc) | ((uintptr_t)stats)
+         | a_stride | w_stride) & 3u)
+        return 0;
+    if (stats && N > (int)accel_nrows)
+        return 0;                          /* one tile: one set of statistics */
+    accel_defer = 1;
+    accel_gemm_ctrl = CTRL_W16;
+    int r = accel_run(a, a_stride, (const int8_t *)w, w_stride ? w_stride : (uint32_t)K * 2u,
+                      acc, N, K, M, stats);
+    accel_gemm_ctrl = 0;
+    accel_defer = 0;
+    return r;
+}
+
+int dav2_accel_requant_stride(const int32_t *acc, int N, int M, const int32_t *params,
+                              int16_t *out, int out_stride, int32_t *amax)
+{
+    accel_out_stride = out_stride;
+    int r = dav2_accel_requant(acc, N, M, params, out, amax);
+    accel_out_stride = 0;
+    return r;
 }
 
 int dav2_accel_gemm_raw_async(const int16_t *a, uint32_t a_stride,
@@ -1014,6 +1053,55 @@ static int accel_check_lut(void)
 
 int dav2_accel_lut_ok(void) { return accel_ok && accel_lut_ok; }
 
+/* int16 weights (CTRL.w16): 20 x 64 x 8 against the CPU, with statistics. */
+static int accel_check_w16(void)
+{
+    if (!accel_w16_ok)
+        return 0;                      /* an older bitstream: attention as before */
+    enum { N = 20, K = 64, M = 8 };
+    int16_t *a = chk_a;                /* N x K */
+    int16_t *w = chk_a + N * K;        /* M x K */
+    int32_t *acc = chk_sw;             /* M x N */
+    static int32_t st[2 * M] __attribute__((aligned(4)));
+    uint32_t seed = 0x1b873593u;
+    for (int i = 0; i < N * K; i++)
+        a[i] = (int16_t)((int32_t)(chk_rand(&seed) % 16383u) - 8191);
+    for (int i = 0; i < M * K; i++)
+        w[i] = (int16_t)((int32_t)(chk_rand(&seed) % 4095u) - 2047);
+    int r = dav2_accel_gemm16_async(a, 0, w, 0, acc, N, K, M, st);
+    if (r == 0 || !dav2_accel_finish()) {
+        printf("GEMM accelerator: int16-weight self-test could not run\n");
+        accel_w16_ok = 0;
+        return 0;
+    }
+    int bad = 0;
+    for (int m = 0; m < M; m++) {
+        int32_t mx = -2147483647 - 1, mn = 2147483647;
+        for (int n = 0; n < N; n++) {
+            int32_t e = 0;
+            for (int k = 0; k < K; k++)
+                e += (int32_t)a[n * K + k] * w[m * K + k];
+            if (e > mx) mx = e;
+            if (e < mn) mn = e;
+            if (acc[m * N + n] != e) {
+                if (bad < 4)
+                    printf("  int16-weight mismatch m=%d n=%d: hw %ld != %ld\n",
+                           m, n, (long)acc[m * N + n], (long)e);
+                bad++;
+            }
+        }
+        if (st[2 * m] != mx || st[2 * m + 1] != mn)
+            bad++;
+    }
+    if (bad) {
+        printf("GEMM accelerator: INT16-WEIGHT SELF-TEST FAILED (%d), attention as before\n", bad);
+        accel_w16_ok = 0;
+    } else {
+        printf("GEMM accelerator: int16-weight self-test ok\n");
+    }
+    return 0;
+}
+
 /* int16 input (CTRL.a16): 8 rows of 20 int16, negative multipliers too,
  * against the CPU's arithmetic. */
 static int accel_check_a16(void)
@@ -1128,6 +1216,8 @@ int dav2_accel_check(void)
         bad = accel_check_lut();
     if (!bad)
         bad = accel_check_a16();
+    if (!bad)
+        bad = accel_check_w16();
     return bad;
 }
 
@@ -1138,6 +1228,14 @@ int  dav2_accel_present(void) { return 0; }
 void dav2_accel_report(void)  { }
 int  dav2_accel_check(void)   { return 0; }
 int  dav2_accel_lut_ok(void)  { return 0; }
+int  dav2_accel_w16_ok(void)  { return 0; }
+int  dav2_accel_gemm16_async(const int16_t *a, uint32_t a_stride, const int16_t *w,
+                             uint32_t w_stride, int32_t *acc, int N, int K, int M,
+                             int32_t *stats)
+{ (void)a;(void)a_stride;(void)w;(void)w_stride;(void)acc;(void)N;(void)K;(void)M;(void)stats; return 0; }
+int  dav2_accel_requant_stride(const int32_t *acc, int N, int M, const int32_t *params,
+                               int16_t *out, int out_stride, int32_t *amax)
+{ (void)acc;(void)N;(void)M;(void)params;(void)out;(void)out_stride;(void)amax; return 0; }
 int  dav2_accel_requant16(const int16_t *in, int N, int M, const int32_t *params,
                           int16_t *out, int32_t *amax)
 { (void)in; (void)N; (void)M; (void)params; (void)out; (void)amax; return 0; }

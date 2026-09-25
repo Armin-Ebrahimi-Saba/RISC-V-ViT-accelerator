@@ -131,6 +131,18 @@ int dav2_accel_lut_ok(void);
  * in[m][n] * mult_m / 2^shift_m) + bias_m), in rows of N int16 (N even),
  * out rows of M int16 (M even). Synchronous. Returns 0 when the block
  * lacks the mode (CAPS bit 25) or the shape; *amax gets the largest |out|. */
+/* GEMM with int16 weights (CTRL.w16): acc[m][n] = sum_k a[n][k] w[m][k],
+ * strides in bytes (0 = contiguous). stats, if given, receives each row's
+ * {max, min} (N <= CAPS.NROWS). Left running like the other _async calls;
+ * 0 when the block lacks the mode (CAPS bit 26) or the shape. */
+int dav2_accel_w16_ok(void);
+int dav2_accel_gemm16_async(const int16_t *a, uint32_t a_stride,
+                            const int16_t *w, uint32_t w_stride,
+                            int32_t *acc, int N, int K, int M, int32_t *stats);
+/* dav2_accel_requant with output rows out_stride int16 apart (instead of
+ * M): writes into a slice of a wider tensor. */
+int dav2_accel_requant_stride(const int32_t *acc, int N, int M, const int32_t *params,
+                              int16_t *out, int out_stride, int32_t *amax);
 int dav2_accel_requant16(const int16_t *in, int N, int M, const int32_t *params,
                          int16_t *out, int32_t *amax);
 

@@ -159,11 +159,11 @@ approximation.
 
 | Step | What happens |
 |---|---|
-| 9 | The CPU gathers this head's slice of the query and value vectors and splits them into high and low int8 halves. The key vectors are read by the accelerator in place, in the qkv tensor. |
-| 10a, 10b | Two GEMMs compute the attention scores, one from the high halves and one from the low halves. They do not depend on each other, but run one after another today. |
+| 9 | The CPU gathers this head's slice of the query vectors (shifted to 11 bits) and the value vectors (transposed), as int16. The key vectors are read by the accelerator in place, in the qkv tensor. |
+| 10 | One GEMM with int16 weights computes the attention scores. Its row statistics give each query's largest score. (An older bitstream without int16 weights uses two GEMMs over int8 halves.) |
 | 11 | Softmax. The CPU turns each row of scores into probabilities and divides them by the row sum, so that each row sums to 2^15. |
-| 12a, 12b | Two more GEMMs combine the probabilities with the value vector's high and low halves. |
-| 13 | The CPU rounds the result to the value scale (a shift by 15) and writes this head's result. No division is needed, because the probabilities are already divided by their sum. |
+| 12 | One more GEMM with int16 weights combines the probabilities with the value vectors. |
+| 13 | A requantisation job rounds the result to the value scale (a shift by 15) and writes it straight into this head's columns of the context tensor. No division is needed, because the probabilities are already divided by their sum. |
 
 **DPT decoder**
 

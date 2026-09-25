@@ -199,7 +199,13 @@ A second input format serves LayerNorm:
   tokens as rows, then z·γ + β with the channels as rows. The CPU keeps
   the row statistics and the channel ranges.
 
-`CAPS` bits 24 and 25 announce the lookup table and the int16 input. The
+A GEMM job can also take **int16 weights** (**`CTRL.w16`**), two per word:
+the DSP multipliers are 25 × 18 bits, so a 16 × 16 product costs nothing
+extra. Attention uses it for q (scores) and v (context), which are int16
+activations and were split into two int8 halves before.
+
+`CAPS` bits 24, 25 and 26 announce the lookup table, the int16 input and
+the int16 weights. The
 driver uses them only when the bit is set and its boot self-test passes;
 otherwise the same arithmetic runs on the CPU.
 
