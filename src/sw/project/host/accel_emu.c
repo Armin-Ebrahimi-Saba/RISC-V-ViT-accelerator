@@ -28,7 +28,7 @@ static uint32_t regs[NREGS];
 
 /* the latched job */
 static struct {
-    int      busy, requant, gather, add, relu, lut, lut_load, a16, w16, ostats, onchip;
+    int      busy, requant, gather, add, relu, lut, lut_load, a16, w16, ostats, onchip, osums;
     uint32_t lut_addr;
     uint32_t x_addr, add_mx, add_mh, add_shift;
     uint32_t a_addr, a_stride, w_addr, w_stride, c_addr, c_stride, s_addr, p_addr;
@@ -149,7 +149,21 @@ static void requant_all(void)
                 if (orow[m] > mx) mx = orow[m];
                 if (orow[m] < mn) mn = orow[m];
             }
-            ((uint32_t *)ptr(job.s_addr))[n] = ((uint32_t)(uint16_t)mx << 16) | (uint16_t)mn;
+            uint32_t *sv = (uint32_t *)ptr(job.s_addr) + (job.osums ? 4u * n : n);
+            sv[0] = ((uint32_t)(uint16_t)mx << 16) | (uint16_t)mn;
+            if (job.osums) {
+                /* CTRL.osums: the row's sum and sum of squares (40 bits) */
+                int32_t sm = 0;
+                uint64_t sq = 0;
+                for (uint32_t m = 0; m < job.m; m++) {
+                    sm += orow[m];
+                    sq += (uint64_t)((int64_t)orow[m] * orow[m]);
+                }
+                sq &= 0xffffffffffull;
+                sv[1] = (uint32_t)sm;
+                sv[2] = (uint32_t)sq;
+                sv[3] = (uint32_t)(sq >> 32);
+            }
         }
     }
     R(RQ_AMAX) = (uint32_t)amax;
@@ -176,6 +190,7 @@ static void latch(void)
     job.w16      = ((ctrl >> 8) & 1u) && !job.requant;
     job.ostats   = ((ctrl >> 9) & 1u) && job.requant;
     job.onchip   = (ctrl >> 10) & 1u;
+    job.osums    = ((ctrl >> 12) & 1u) && job.ostats;
     if (job.a16 && (job.n & 1u)) fail("requant A16: N_ROWS odd");
     if (job.lut_load && (job.lut_addr & 3u)) fail("LUT_ADDR unaligned");
     job.x_addr   = R(X_ADDR);   job.add_mx = R(ADD_MULT_X);
@@ -253,7 +268,7 @@ volatile uint32_t *dav2_emu_reg(uint32_t addr)
     static int init;
     if (!init) {
         init = 1;
-        R(CAPS) = (63u << 24) | ((uint32_t)KMAX << 8) | NROWS;   /* bits 24-29: table, int16 input and weights, row statistics, result RAM, tap reuse */
+        R(CAPS) = (127u << 24) | ((uint32_t)KMAX << 8) | NROWS;   /* bits 24-30: table, int16 input and weights, row statistics, result RAM, tap reuse, row sums */
     }
     if (addr < STUDENT_GEMM0_BASE_ADDR || addr >= STUDENT_GEMM0_BASE_ADDR + NREGS * 4u)
         fail("register access outside the block");

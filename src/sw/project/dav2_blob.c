@@ -42,10 +42,11 @@ int dav2_blob_check(void)
     return 0;
 }
 
-/* The index of a tensor, or -1. The search starts after the previous hit
+/* The index of a tensor, or -1. The search starts at the previous hit
  * and wraps around: the engine asks for the tensors almost in the order
- * the exporter wrote them, so most lookups compare one or two names
- * instead of scanning up to 300 (about 3 Mcycles per frame before). */
+ * the exporter wrote them, and dav2_qw asks for the same name twice (data,
+ * then dims), so most lookups compare one or two names instead of
+ * scanning up to 300. */
 static int find_index(const char *name)
 {
     static uint32_t last;
@@ -54,7 +55,7 @@ static int find_index(const char *name)
         last = 0;
     for (uint32_t k = 0, i = last; k < n; k++, i = (i + 1 == n) ? 0 : i + 1) {
         if (strcmp(blob_dir[i].name, name) == 0) {
-            last = i + 1;
+            last = i;
             return (int)i;
         }
     }

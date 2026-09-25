@@ -225,8 +225,12 @@ tile row, the writer copies these words from it inside the block, one per
 cycle, and only the new column is read from DDR3. A 128-word FIFO lets
 those reads continue while the writer copies.
 
-`CAPS` bits 24 to 29 announce the lookup table, the int16 input, the int16
-weights, the row statistics, the result RAM and tap reuse. The
+With **`CTRL.osums`** the statistics phase also writes each output row's
+sum and sum of squares. The residual updates ask for them, so LayerNorm
+gets its mean and variance without reading x.
+
+`CAPS` bits 24 to 30 announce the lookup table, the int16 input, the int16
+weights, the row statistics, the result RAM, tap reuse and the row sums. The
 driver uses them only when the bit is set and its boot self-test passes;
 otherwise the same arithmetic runs on the CPU.
 

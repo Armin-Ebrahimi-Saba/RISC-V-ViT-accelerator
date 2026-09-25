@@ -749,12 +749,15 @@ module student_gemm_tb;
   // Output row statistics (CTRL.ostats) on an int16-input job, optionally
   // with ReLU and the table: each output row n's {max, min} at S_BASE + n*4
   // for every n-tile (checked per tile, since each tile rewrites S_BASE).
-  task automatic run_requant_ostats(input int ndim, input int mdim, input int relu, input int lut);
+  task automatic run_requant_ostats(input int ndim, input int mdim, input int relu, input int lut,
+                                    input int osums = 0);
     int mismatches = 0;
     logic [31:0] st;
     int guard;
     localparam logic [31:0] H_BASE = 32'h8018_0000;
-    $display("--- REQUANT OSTATS%s%s N=%0d M=%0d", relu ? "+RELU" : "", lut ? "+LUT" : "", ndim, mdim);
+    int wpr = osums ? 4 : 1;               // statistics words per row
+    $display("--- REQUANT OSTATS%s%s%s N=%0d M=%0d", relu ? "+RELU" : "", lut ? "+LUT" : "",
+             osums ? "+SUMS" : "", ndim, mdim);
     for (int i = 0; i < ndim * mdim / 2; i++)
       memory.mem[mem_word(H_BASE) + i] = {16'($signed($urandom % 16383) - 8191),
                                           16'($signed($urandom % 16383) - 8191)};
@@ -768,7 +771,7 @@ module student_gemm_tb;
     end
     for (int n0 = 0; n0 < ndim; n0 += NROWS) begin
       int nc = (ndim - n0 > int'(NROWS)) ? NROWS : ndim - n0;
-      for (int i = 0; i < nc; i++) memory.mem[mem_word(S_BASE) + i] = 32'hdead_beef;
+      for (int i = 0; i < nc * wpr + 4; i++) memory.mem[mem_word(S_BASE) + i] = 32'hdead_beef;
       bus.put_word(R_A_ADDR,   H_BASE + 32'(n0 * 2));
       bus.put_word(R_A_STRIDE, ndim * 2);
       bus.put_word(R_P_ADDR,   P_BASE);
@@ -778,7 +781,8 @@ module student_gemm_tb;
       bus.put_word(R_LUT_ADDR, L_BASE);
       bus.put_word(R_M_LEN,    mdim);
       bus.put_word(R_N_ROWS,   nc);
-      bus.put_word(R_CTRL,     32'h283 | (relu ? 32'h10 : 0) | (lut ? 32'h60 : 0));
+      bus.put_word(R_CTRL,     32'h283 | (relu ? 32'h10 : 0) | (lut ? 32'h60 : 0)
+                               | (osums ? 32'h1000 : 0));
       guard = 0;
       forever begin
         bus.get_word(R_STATUS, st);
@@ -791,6 +795,8 @@ module student_gemm_tb;
       end
       for (int n = n0; n < n0 + nc; n++) begin
         int mx = -32768, mn = 32767;
+        int sum = 0;
+        longint sq = 0;
         logic [31:0] sw;
         for (int m = 0; m < mdim; m++) begin
           int idx = n * mdim + m;
@@ -798,8 +804,10 @@ module student_gemm_tb;
           int v = idx[0] ? int'($signed(w[31:16])) : int'($signed(w[15:0]));
           if (v > mx) mx = v;
           if (v < mn) mn = v;
+          sum += v;
+          sq  += longint'(v) * longint'(v);
         end
-        sw = memory.mem[mem_word(S_BASE) + (n - n0)];
+        sw = memory.mem[mem_word(S_BASE) + (n - n0) * wpr];
         checks++;
         if (int'($signed(sw[31:16])) !== mx || int'($signed(sw[15:0])) !== mn) begin
           if (mismatches < 5)
@@ -807,6 +815,23 @@ module student_gemm_tb;
                      int'($signed(sw[31:16])), int'($signed(sw[15:0])), mx, mn);
           mismatches++;
         end
+        if (osums) begin
+          logic [31:0] s1, s2, s3;
+          s1 = memory.mem[mem_word(S_BASE) + (n - n0) * 4 + 1];
+          s2 = memory.mem[mem_word(S_BASE) + (n - n0) * 4 + 2];
+          s3 = memory.mem[mem_word(S_BASE) + (n - n0) * 4 + 3];
+          checks += 3;
+          if (int'(s1) !== sum || {s3, s2} !== 64'(sq)) begin
+            if (mismatches < 5)
+              $display("  FAIL row %0d sums: got %0d, %0d expected %0d, %0d", n,
+                       int'(s1), {s3, s2}, sum, sq);
+            mismatches++;
+          end
+        end
+      end
+      if (memory.mem[mem_word(S_BASE) + nc * wpr] !== 32'hdead_beef) begin
+        $display("  FAIL: a statistics word past the end was written");
+        mismatches++;
       end
     end
     bus.put_word(R_S_ADDR, 0);
@@ -1078,6 +1103,14 @@ module student_gemm_tb;
     run_requant_ostats(384, 82, 0, 0);
     run_requant_ostats(82, 30, 1, 0);
     run_requant_ostats(20, 30, 0, 1);
+    // ... with the row sums (CTRL.osums): LayerNorm's input statistics
+    run_requant_ostats(82, 256, 0, 0, 1);
+    run_requant_ostats(82, 128, 1, 0, 1);
+    run_requant_ostats(384, 82, 0, 0, 1);      // three tiles
+    run_requant_ostats(20, 30, 0, 1, 1);
+    run_requant_ostats(2, 30, 0, 0, 1);        // two rows (A16 needs an even count)
+    run_requant_ostats(4, 2, 0, 0, 1);         // tiny rows: statistics right after the output
+    run_requant_ostats(20, 30, 0, 0, 0);       // and without again
     // results kept on chip: encoder shapes (82 rows), several chunks
     run_onchip(82, 64, 600);
     run_onchip(20, 128, 30);

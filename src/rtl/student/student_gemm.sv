@@ -154,7 +154,7 @@ module student_gemm #(
   logic [31:0] cycles_q;        // cycle counter, running while busy_q, for CYCLES
 
   assign hw2reg.status.d = {err_q, done_q, busy_q};        // STATUS register readback
-  assign hw2reg.caps.d   = {8'd63, 16'(KMAX), 8'(NROWS)};   // CAPS: what this instance supports
+  assign hw2reg.caps.d   = {8'd127, 16'(KMAX), 8'(NROWS)};   // CAPS: what this instance supports
   assign hw2reg.cycles.d = cycles_q;                       // CYCLES register readback
 
   logic start_strobe, start_requant, start_gather;
@@ -178,7 +178,9 @@ module student_gemm #(
   logic start_w16;
   assign start_w16      = reg2hw.ctrl.w16.q;      // GEMM job: int16 weights
   logic start_ostats;
-  assign start_ostats   = reg2hw.ctrl.ostats.q;   // requant job: output row statistics
+  assign start_ostats   = reg2hw.ctrl.ostats.q;
+  logic start_osums;
+  assign start_osums    = reg2hw.ctrl.osums.q;    // with ostats: row sums too   // requant job: output row statistics
   logic start_onchip;
   assign start_onchip   = reg2hw.ctrl.onchip.q;   // results in the on-chip RAM
 
@@ -206,6 +208,7 @@ module student_gemm #(
   logic           lut_ld_done;               // table load: the last word has arrived
   logic           a16_q;                     // requant input is int16, two per word
   logic           w16_q;                     // GEMM weights are int16, two per word
+  logic           osums_q;                   // requant: ... and its sum and sum of squares
   logic           ostats_q;                  // requant: write each output row's {max, min}
   logic           onchip_q;                  // GEMM: drain to / requant: load from the result RAM
   localparam int unsigned CRW = 131072;      // result RAM words (128 BRAM36)
@@ -304,6 +307,8 @@ module student_gemm #(
   logic [31:0]  drain_wr_addr, drain_wr_data, rq_wr_addr, rq_wr_data;
   logic         os_wr_req;
   logic [31:0]  os_wr_addr, os_wr_data;   // RQ_STATS: one word per output row
+  logic [NRW+1:0] os_t_q, os_nw;         // RQ_STATS: word written, words owed
+  logic           os_busy;               // row sums still in their pipeline
   assign wr_req  = (state_q == RQ_OUT) ? rq_wr_req : (state_q == RQ_STATS) ? os_wr_req : drain_wr_req;
   assign wr_addr = (state_q == RQ_OUT) ? rq_wr_addr : (state_q == RQ_STATS) ? os_wr_addr : drain_wr_addr;
   assign wr_data = (state_q == RQ_OUT) ? rq_wr_data : (state_q == RQ_STATS) ? os_wr_data : drain_wr_data;
@@ -751,8 +756,8 @@ module student_gemm #(
       RQ_LOAD_P:   if (rq_p_done)                state_d = RQ_LOAD_ACC; // param table loaded
       RQ_LOAD_ACC: if (rq_acc_done)              state_d = add_q ? RQ_LOAD_X : RQ_OUT;
       RQ_LOAD_X:   if (rq_x_done)                state_d = RQ_OUT;      // residual loaded
-      RQ_OUT:      if (rq_out_done)      state_d = ostats_q ? RQ_STATS : ST_FINISH;
-      RQ_STATS:    if (t_q == {1'b0, n_rows_q}) state_d = ST_FINISH;   // every output word written
+      RQ_OUT:      if (rq_out_done && !os_busy) state_d = ostats_q ? RQ_STATS : ST_FINISH;
+      RQ_STATS:    if (os_t_q == os_nw) state_d = ST_FINISH;   // every output word written
       default:                                   state_d = ST_IDLE;
     endcase
   end
@@ -788,6 +793,7 @@ module student_gemm #(
       a16_q <= 1'b0;
       w16_q <= 1'b0;
       ostats_q <= 1'b0;
+      osums_q  <= 1'b0;
       onchip_q <= 1'b0;
       greuse_q <= 1'b0;
       // rq_m_q, rq_p_cnt_q and lut_cnt_q have no reset: they address block
@@ -906,6 +912,7 @@ module student_gemm #(
             a16_q      <= start_a16 & start_requant;
             w16_q      <= start_w16 & ~start_requant;
             ostats_q   <= start_ostats & start_requant;
+            osums_q    <= start_osums & start_ostats & start_requant;
             onchip_q   <= start_onchip;
             greuse_q   <= start_greuse & start_gather & ~start_requant;
             p_addr_q   <= reg2hw.p_addr.q;
@@ -1050,8 +1057,7 @@ module student_gemm #(
 
         // ---- requantisation job -------------------------------------------
         RQ_STATS: begin
-          // one statistics word per output row, t_q = row
-          if (issue_wr) t_q <= t_q + 1'b1;
+          // the statistics words (os_t_q, below)
         end
         RQ_LOAD_L: begin
           // One table word per beat; then the parameter table, as a job
@@ -1587,9 +1593,83 @@ module student_gemm #(
       end
     end
   end
-  assign os_wr_req  = (state_q == RQ_STATS) & (t_q != {1'b0, n_rows_q});
-  assign os_wr_addr = s_ptr_q + 32'(t_q) * 32'd4;
-  assign os_wr_data = os_ram[t_q[RW-1:0]];
+  // Row sums (CTRL.osums): after q12 the value's square goes through one
+  // DSP48 with its input, multiplier and output registers (q13..q15);
+  // at q15 the square goes into a 40-bit sum (a row has at most KWORDS
+  // values below 2^26), the value into a 32-bit one, and at the row's end
+  // both into LUT RAMs. The row counter restarts in ST_IDLE, which every
+  // job passes: the last value reaches q15 after RQ_OUT may have ended.
+  logic [31:0]        os_sum_ram [NROWS];
+  logic [31:0]        os_sql_ram [NROWS];
+  logic [7:0]         os_sqh_ram [NROWS];
+  logic [NRW-1:0]     os_row15_q;
+  logic               os_v13_q, os_v14_q, os_v15_q, os_end13_q, os_end14_q, os_end15_q;
+  logic               os_first15_q;
+  (* use_dsp = "yes" *) logic signed [15:0] os_x13_q;
+  (* use_dsp = "yes" *) logic signed [31:0] os_sq14_q, os_sq15_q;
+  logic signed [15:0] os_x14_q, os_x15_q;
+  // the accumulators in logic: in a DSP48 they would be an adder with an
+  // unregistered feedback path
+  (* use_dsp = "no" *) logic signed [31:0] os_sum_q;
+  (* use_dsp = "no" *) logic [39:0]        os_sq_q;
+  assign os_busy = os_v13_q | os_v14_q | os_v15_q;
+  always_ff @(posedge clk_i) begin
+    os_v13_q   <= (state_q == RQ_OUT) & rq_v12;
+    os_x13_q   <= rq_val12[15:0];
+    os_end13_q <= rq_last12 | rq_row_end12;
+    os_sq14_q  <= os_x13_q * os_x13_q;
+    os_x14_q   <= os_x13_q;
+    os_v14_q   <= os_v13_q;
+    os_end14_q <= os_end13_q;
+    os_sq15_q  <= os_sq14_q;
+    os_x15_q   <= os_x14_q;
+    os_v15_q   <= os_v14_q;
+    os_end15_q <= os_end14_q;
+  end
+  always_ff @(posedge clk_i) begin
+    if (state_q == ST_IDLE) begin
+      os_row15_q   <= '0;
+      os_first15_q <= 1'b1;
+    end else if (os_v15_q) begin
+      logic signed [31:0] sm;
+      logic [39:0]        sq;
+      sm = (os_first15_q ? 32'sd0 : os_sum_q) + 32'(os_x15_q);
+      sq = (os_first15_q ? 40'd0 : os_sq_q) + 40'($unsigned(os_sq15_q));
+      os_sum_q <= sm;
+      os_sq_q  <= sq;
+      if (os_end15_q) begin
+        os_sum_ram[os_row15_q[RW-1:0]] <= sm;
+        os_sql_ram[os_row15_q[RW-1:0]] <= sq[31:0];
+        os_sqh_ram[os_row15_q[RW-1:0]] <= sq[39:32];
+        os_row15_q   <= os_row15_q + 1'b1;
+        os_first15_q <= 1'b1;
+      end else begin
+        os_first15_q <= 1'b0;
+      end
+    end
+  end
+
+  // RQ_STATS: word os_t_q; with CTRL.osums four per row (row = os_t_q / 4)
+  logic [RW-1:0]  os_row;
+  assign os_nw  = osums_q ? {n_rows_q, 2'b00} : (NRW+2)'(n_rows_q);
+  assign os_row = osums_q ? os_t_q[RW+1:2] : os_t_q[RW-1:0];
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni)                   os_t_q <= '0;
+    else if (state_q != RQ_STATS)  os_t_q <= '0;
+    else if (issue_wr)             os_t_q <= os_t_q + 1'b1;
+  end
+  assign os_wr_req  = (state_q == RQ_STATS) & (os_t_q != os_nw);
+  assign os_wr_addr = s_ptr_q + 32'(os_t_q) * 32'd4;
+  always_comb begin
+    os_wr_data = os_ram[os_row];
+    if (osums_q)
+      unique case (os_t_q[1:0])
+        2'd0:    os_wr_data = os_ram[os_row];
+        2'd1:    os_wr_data = os_sum_ram[os_row];
+        2'd2:    os_wr_data = os_sql_ram[os_row];
+        default: os_wr_data = {24'd0, os_sqh_ram[os_row]};
+      endcase
+  end
   // Result RAM (CTRL.onchip). The drain writes accumulator t of weight row
   // m at C_ADDR + m*C_STRIDE + t (words); a requantisation job reads its
   // chunk at A_ADDR + m*A_STRIDE + n, one word per cycle, into the tile

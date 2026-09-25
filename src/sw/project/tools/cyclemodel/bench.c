@@ -86,6 +86,7 @@ int dav2_accel_requant16(const int16_t *in, int N, int M, const int32_t *params,
   if (ostats) for (int n = 0; n < N; n++) ostats[n] = (8000u << 16) | (uint16_t)-8000;
   MMIO[6] = (uint32_t)(2 * N * M + N); *amax = 8000; return 1; }
 int dav2_accel_ostats_ok(void) { return 1; }
+int dav2_accel_osums_ok(void) { return 0; }
 int dav2_accel_onchip_ok(void) { return 0; }
 int dav2_accel_qgemm_onchip_async(const dav2_tensor_t *a, const dav2_qw_t *wt,
                                   dav2_accel_stats_t *st)

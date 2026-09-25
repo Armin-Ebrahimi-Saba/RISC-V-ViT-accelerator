@@ -201,6 +201,7 @@ dav2_tensor_t dav2_tensor_new(int n, int c)
     t.scale = XF_ONE;
     t.amax_q = -1;
     t.rst = 0;
+    t.rsum = 0;
     t.v = (int16_t *)dav2_arena_alloc((size_t)n * (size_t)c * sizeof(int16_t));
     return t;
 }
@@ -290,13 +291,40 @@ void dav2_embed_tokens(const dav2_tensor_t *patches, const int32_t *cls,
     int64_t *v = (int64_t *)dav2_arena_alloc((size_t)N * C * sizeof(int64_t));
     if (!v) { dav2_arena_release(mark); return; }
     int64_t amax = 0;
-    for (int i = 0; i < N * C; i++) {
-        int64_t x = (i < C) ? (int64_t)cls[i]
-                            : mul_xf_round(patches->v[i - C], patches->scale, DAV2_POS_Q);
-        x += pos[i];
-        v[i] = x;
-        int64_t a = x < 0 ? -x : x;
-        if (a > amax) amax = a;
+    const int psh = patches->scale.sh - DAV2_POS_Q;
+    if (psh >= 16 && psh <= 32) {
+        /* mul_xf_round in 32-bit pieces: |v| <= 2^15 and m < 2^31, so
+         * |v m| < 2^46 and the rounded magnitude is below 2^30 */
+        const uint32_t pm = (uint32_t)patches->scale.m;
+        const uint32_t rnd = 1u << (psh - 1);
+        for (int i = 0; i < C; i++) {
+            int64_t x = (int64_t)cls[i] + pos[i];
+            v[i] = x;
+            int64_t a = x < 0 ? -x : x;
+            if (a > amax) amax = a;
+        }
+        for (int i = C; i < N * C; i++) {
+            int32_t pv = patches->v[i - C];
+            uint32_t u = pv < 0 ? (uint32_t)-pv : (uint32_t)pv;
+            uint32_t lo = u * pm;
+            uint32_t hi = (uint32_t)(((uint64_t)u * pm) >> 32);     /* mulhu */
+            uint32_t lo2 = lo + rnd;
+            hi += lo2 < lo;
+            uint32_t mag = (hi << (32 - psh)) | ((lo2 >> (psh - 1)) >> 1);
+            int64_t x = (pv < 0 ? -(int64_t)mag : (int64_t)mag) + pos[i];
+            v[i] = x;
+            int64_t a = x < 0 ? -x : x;
+            if (a > amax) amax = a;
+        }
+    } else {
+        for (int i = 0; i < N * C; i++) {
+            int64_t x = (i < C) ? (int64_t)cls[i]
+                                : mul_xf_round(patches->v[i - C], patches->scale, DAV2_POS_Q);
+            x += pos[i];
+            v[i] = x;
+            int64_t a = x < 0 ? -x : x;
+            if (a > amax) amax = a;
+        }
     }
 
     /* Common output scale amax / 8191. The values are brought into int32
@@ -310,6 +338,15 @@ void dav2_embed_tokens(const dav2_tensor_t *patches, const int32_t *cls,
     int32_t om; int osh;
     xf_to_mult(xf_div(xf_norm(1, DAV2_POS_Q - r), out_scale), &om, &osh);
     int32_t omax = 0;
+    if (r == 0) {
+        /* |x| < 2^30: int32 */
+        for (int i = 0; i < N * C; i++) {
+            int32_t q = sat_act(apply_multiplier((int32_t)v[i], om, osh));
+            out->v[i] = (int16_t)q;
+            if (q < 0) q = -q;
+            if (q > omax) omax = q;
+        }
+    } else
     for (int i = 0; i < N * C; i++) {
         int64_t x = v[i];
         if (r) {
@@ -493,8 +530,9 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
 {
     /* out->rst on entry asks for the output's row ranges (filled only when
      * the requantisation job reports them); otherwise they are unknown */
-    uint32_t *rst_want = out->rst;
+    uint32_t *rst_want = out->rst, *rsum_want = out->rsum;
     out->rst = 0;
+    out->rsum = 0;
     const int M = wt->m;
     const int N = cv ? ((cv->h + 2 * cv->pad - cv->k) / cv->stride + 1)
                      * ((cv->w + 2 * cv->pad - cv->k) / cv->stride + 1)
@@ -743,8 +781,12 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
          * statistics word per row and chunk, combined below */
         uint32_t *rst_chunks = 0;
         const int n_chunks = (M + RQ_CHUNK - 1) / RQ_CHUNK;
+        /* with the row sums (rsum): four words per row and chunk */
+        const int sums = rst_want && rsum_want && dav2_accel_osums_ok();
+        const int wpr = sums ? 4 : 1;
+        epi.osums = sums;
         if (rst_want && dav2_accel_ostats_ok())
-            rst_chunks = (uint32_t *)dav2_arena_alloc((size_t)n_chunks * N * sizeof(uint32_t));
+            rst_chunks = (uint32_t *)dav2_arena_alloc((size_t)n_chunks * N * wpr * sizeof(uint32_t));
         if (gelu && dav2_accel_lut_ok()) {
             /* GELU inside the job: the table for this result's scale goes
              * into the block's lookup-table RAM with the first chunk */
@@ -797,7 +839,7 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
         for (int m0 = 0; m0 < M && ok; m0 += RQ_CHUNK) {
             int mc = M - m0 < RQ_CHUNK ? M - m0 : RQ_CHUNK;
             PAR_UPTO(m0 + mc);                    /* overlaps the previous chunk */
-            epi.ostats = rst_chunks ? rst_chunks + (size_t)(m0 / RQ_CHUNK) * N : 0;
+            epi.ostats = rst_chunks ? rst_chunks + (size_t)(m0 / RQ_CHUNK) * N * wpr : 0;
             uint64_t w0 = dav2_cycles();
             ok = dav2_accel_requant_rows_async(acc, N, M, m0, mc, par, dst, &rq_amax,
                                                (epi.add || epi.relu || epi.lut || epi.ostats
@@ -823,15 +865,27 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
             out->amax_q = epi.lut ? -1 : rq_amax;
             if (rst_chunks) {
                 for (int n = 0; n < N; n++) {
-                    int32_t mx = -32768, mn = 32767;
+                    int32_t mx = -32768, mn = 32767, sm = 0;
+                    uint64_t sq = 0;
                     for (int c = 0; c < n_chunks; c++) {
-                        uint32_t w = rst_chunks[(size_t)c * N + n];
+                        const uint32_t *r = rst_chunks + ((size_t)c * N + n) * wpr;
+                        uint32_t w = r[0];
                         if ((int16_t)(w >> 16) > mx) mx = (int16_t)(w >> 16);
                         if ((int16_t)(w & 0xffffu) < mn) mn = (int16_t)(w & 0xffffu);
+                        if (sums) {
+                            sm += (int32_t)r[1];
+                            sq += ((uint64_t)r[3] << 32) | r[2];
+                        }
                     }
                     rst_want[n] = ((uint32_t)(uint16_t)mx << 16) | (uint16_t)mn;
+                    if (sums) {
+                        rsum_want[3 * n]     = (uint32_t)sm;
+                        rsum_want[3 * n + 1] = (uint32_t)sq;
+                        rsum_want[3 * n + 2] = (uint32_t)(sq >> 32);
+                    }
                 }
                 out->rst = rst_want;
+                if (sums) out->rsum = rsum_want;
             }
             trace_tensor("qgemm", out);
             if (gelu && !epi.lut)
@@ -1187,12 +1241,18 @@ static int32_t requant16(const int16_t *in, int N, int M, const int32_t *par, in
  * has no compare per value; a compare costs a taken branch (3 cycles)
  * whenever the extreme does not change. */
 static inline void row_stats(const int16_t *row, int C, int wide, const uint32_t *rst,
-                             int32_t *sum_out, uint64_t *sq_out, int32_t *xmax_out,
-                             int32_t *xmin_out)
+                             const uint32_t *rsum, int32_t *sum_out, uint64_t *sq_out,
+                             int32_t *xmax_out, int32_t *xmin_out)
 {
     int32_t sum = 0, xmax = -32768, xmin = 32767;
     uint64_t sq = 0;
-    if (wide && rst) {
+    if (rst && rsum) {
+        /* all four from the requantisation job that wrote the row */
+        sum = (int32_t)rsum[0];
+        sq = ((uint64_t)rsum[2] << 32) | rsum[1];
+        xmax = (int16_t)(*rst >> 16);
+        xmin = (int16_t)(*rst & 0xffffu);
+    } else if (wide && rst) {
         const uint32_t *rw = (const uint32_t *)row;
         for (int c0 = 0; c0 < C / 2; c0 += 32) {
             const int c1 = c0 + 32 < C / 2 ? c0 + 32 : C / 2;
@@ -1281,7 +1341,8 @@ static void layernorm_affine(const dav2_tensor_t *in, const int32_t *gq,
         const int16_t *row = in->v + (size_t)n * C;
         int32_t sum, xmax, xmin;
         uint64_t sq;
-        row_stats(row, C, wide, in->rst ? in->rst + n : 0, &sum, &sq, &xmax, &xmin);
+        row_stats(row, C, wide, in->rst ? in->rst + n : 0,
+                  in->rsum ? in->rsum + 3 * n : 0, &sum, &sq, &xmax, &xmin);
         int64_t num = (int64_t)C * (int64_t)sq - (int64_t)sum * sum;  /* C^2 * var_q, exact */
         if (num < 0) num = 0;
         dav2_xf_t r = xf_rsqrt(xf_add(xf_mul(xf_from_int(num), inv_c2), eps_s2));
@@ -1416,7 +1477,8 @@ static void layernorm_plain(const dav2_tensor_t *in, dav2_tensor_t *out)
         const int16_t *row = in->v + (size_t)n * C;
         int32_t sum, xmax, xmin;
         uint64_t sq;
-        row_stats(row, C, wide, in->rst ? in->rst + n : 0, &sum, &sq, &xmax, &xmin);
+        row_stats(row, C, wide, in->rst ? in->rst + n : 0,
+                  in->rsum ? in->rsum + 3 * n : 0, &sum, &sq, &xmax, &xmin);
         int64_t num = (int64_t)C * (int64_t)sq - (int64_t)sum * sum;  /* C^2 * var_q, exact */
         if (num < 0) num = 0;
         dav2_xf_t r = xf_rsqrt(xf_add(xf_mul(xf_from_int(num), inv_c2), eps_s2));

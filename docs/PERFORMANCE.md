@@ -1,4 +1,4 @@
-# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 2.35 s (estimated)
+# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 2.22 s (estimated)
 
 This is the record of the speed-up work: what was measured, what each change
 did, and what is left. Every step kept the FPGA output **bit-exact with the
@@ -942,6 +942,39 @@ RAM before the driver did; without that, round sixteen is 128.7 Mcycles,
 not 128.4. Model: 128.7 → 122.2 Mcycles per frame, **about 2.35 s**
 (2.44 s, less the model's 4 %). `FRAME_FLAGS="-DREUSE_C=0
 -DONCHIP_CONV=0"` models round sixteen.
+
+### Round eighteen — LayerNorm's statistics from the block, and CPU fixes (hardware; estimated, not yet measured)
+
+`tools/cyclemodel/frame.c` now also reports the sub-profile counters
+(`DAV2_SUB_*`). They showed which CPU work runs while the accelerator is
+idle: the softmax (16.7 Mcycles, the block waits 0.7) and LayerNorm's
+statistics pass (7.5), but not the requantisation range pass (10.2),
+which overlaps the GEMM job it reads. A 32-bit version of that range
+pass made the CPU part faster and the frame no shorter, so it was not
+kept.
+
+| Change | Where | Model (Mcycles per frame) |
+|---|---|---|
+| `dav2_qw` asks for a tensor's data and then for its dims under the same name. `find_index` started after the previous hit, so the second lookup scanned the whole directory (about 298 string compares). It now starts at the previous hit. | `dav2_blob.c` | 122.2 → 120.8 |
+| Softmax: one test for the table index and the shift (u = t >> 6), two scores per step with one word store, and the normalisation two values per word (min(q, 32767) = q − (q >> 15), since q ≤ 32768). Same values. | `dav2_engine.c` | 120.8 → 120.3 |
+| **Output row sums** (`CTRL.osums`, CAPS bit 30). With `CTRL.ostats` the requantisation job also sums each output row's final values and their squares (a DSP48 with all its registers for the square, then 32-bit and 40-bit sums in logic) and writes four words per row: {max, min}, sum, and the sum of squares in two words. The residual updates ask for them (`dav2_tensor_t.rsum`), so LayerNorm has its mean and variance without a pass over x. They are exact integers, the same as `row_stats` computes. | `student_gemm.sv`, `dav2_ops.c`, `dav2_engine.c` | ln stats 7.8 → 4.0; 120.4 → 117.3 |
+| Token embedding: the rounding of patch × scale in 32-bit pieces (mul, mulhu and a carry) when the shift is 16 to 32, instead of a 64-bit shift by a variable; the second pass without the unused branch. Same values. | `dav2_ops.c` | 4.8 → 3.0; 117.3 → 115.5 |
+
+The statistics phase waits until the last row's sums have left their
+three pipeline stages. The first build put the 40-bit sum into a DSP48 as
+an adder with an unregistered feedback path (DPREG-4); `use_dsp = "no"`
+on both sums keeps them in logic.
+
+Checks: same output, bit for bit, on 11 images (host and emulator); bus
+errors injected into jobs 20 to 23, 40, 41, 300, 700, 1000 and 1250 all
+end with the correct output. The boot self-test gains "row-sums self-test
+ok" (an int32 requantisation with its four words per row against the
+CPU). `student_gemm_tb`: the sums with and without ReLU and the table,
+over three tiles, and with 2 and 4 rows, where the statistics follow the
+output at once. PASSED, 656,177 words. Bitstream: timing met, WNS +0.395 ns (DDR3 controller), worst `sys_clk` path +0.78 ns, WHS +0.029 ns; LUT 27.9 %, BRAM 91.6 %, DSP 37.8 % (one more, for the square).
+
+Model: 122.2 → 115.5 Mcycles per frame, **about 2.22 s** (2.31 s, less
+the model's 4 %).
 
 ## 7. What is left, in order of expected gain
 

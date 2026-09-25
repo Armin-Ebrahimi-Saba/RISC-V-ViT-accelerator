@@ -165,7 +165,22 @@ int dav2_accel_requant_rows_async(const int32_t *acc, int N, int M, int m0, int 
                                   const dav2_rq_epi_t *epi)
 { (void)acc;(void)M;(void)m0;(void)par;(void)dst;
   job_kind = (epi && epi->add) ? K_RQ_ADD : K_RQ;
-  start_job(requant_cycles(N, mc, 0, epi && epi->add)); *amax = 8000; return 2; }
+  const int wpr = (epi && epi->ostats) ? (epi->osums ? 4 : 1) : 0;
+  for (int n = 0; wpr && n < N; n++) {
+      /* plausible statistics: a range of +-8000, a spread of 3000 */
+      uint32_t *r = epi->ostats + (size_t)n * wpr;
+      r[0] = (8000u << 16) | (uint16_t)-8000;
+      if (wpr == 4) {
+          uint64_t sq = (uint64_t)mc * 3000u * 3000u;
+          r[1] = (uint32_t)(mc * 100); r[2] = (uint32_t)sq; r[3] = (uint32_t)(sq >> 32);
+      }
+  }
+  start_job(requant_cycles(N, mc, 0, epi && epi->add) + (uint64_t)N * wpr * BEAT / 10);
+  *amax = 8000; return 2; }
+#ifndef OSUMS_C
+#define OSUMS_C 1                       /* output row sums, CTRL.osums (round 18) */
+#endif
+int dav2_accel_osums_ok(void) { return OSUMS_C; }
 int dav2_accel_requant(const int32_t *acc, int N, int M, const int32_t *params,
                        int16_t *out, int32_t *amax_out)
 { (void)acc;(void)params;(void)out; job_kind = K_RQ; start_job(requant_cycles(N, M, 0, 0)); wait_done();
@@ -216,6 +231,7 @@ int main(void)
     wait_done();
     for (int b = 0; b < DAV2_PROF_N; b++) { MMIO[3] = (uint32_t)b; MMIO[4] = (uint32_t)dav2_prof_get(b); }
     for (int k = 0; k < K_N; k++) { MMIO[3] = (uint32_t)(100 + k); MMIO[4] = (uint32_t)acc_time[k]; }
+    for (int d = 0; d < DAV2_SUB_N; d++) { MMIO[3] = (uint32_t)(200 + d); MMIO[4] = (uint32_t)dav2_sub_get(d); }
     mark(0xdead);
     for (;;) ;
 }

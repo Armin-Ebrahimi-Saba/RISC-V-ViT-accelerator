@@ -97,6 +97,11 @@ typedef struct {
      * updates from the requantisation job's row statistics (CTRL.ostats);
      * LayerNorm uses them instead of finding the extremes itself. */
     uint32_t  *rst;
+    /* Each row's sum and sum of squares, three words per row (sum, then the
+     * sum of squares, bits 31:0 and 63:32), or NULL when unknown. Set with
+     * rst when the block reports them (CTRL.osums); LayerNorm then needs no
+     * pass over its input. */
+    uint32_t  *rsum;
 } dav2_tensor_t;
 
 /* ------------------------------------------------------------- blob access */

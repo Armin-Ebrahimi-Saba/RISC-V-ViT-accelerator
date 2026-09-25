@@ -126,6 +126,9 @@ typedef struct {
     /* CTRL.ostats: each output row n's {max, min} of this job's columns,
      * as one word (max in bits 31:16), at ostats[n]. */
     uint32_t      *ostats;
+    /* with ostats, CTRL.osums: four words per row at ostats[4n]: {max, min},
+     * the row's sum, its sum of squares (bits 31:0, then 63:32) */
+    int            osums;
     /* CTRL.onchip: the input is the result the last GEMM left in the
      * block's result RAM (dav2_accel_qgemm_onchip_async), not acc */
     int            onchip;
@@ -146,6 +149,7 @@ int dav2_accel_conv_onchip_async(const int16_t *img, int h, int w, int C, int k,
                                  int pad, const int8_t *wt, int M, dav2_accel_stats_t *st);
 /* Non-zero if the block writes output row statistics (CAPS bit 27). */
 int dav2_accel_ostats_ok(void);
+int dav2_accel_osums_ok(void);
 /* Non-zero if the block has the lookup table (CAPS bit 24) and its boot
  * self-test passed. */
 int dav2_accel_lut_ok(void);

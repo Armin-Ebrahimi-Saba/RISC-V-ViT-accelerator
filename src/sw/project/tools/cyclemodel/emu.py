@@ -184,10 +184,14 @@ if __name__ == "__main__":
               "add/relu", "im2col", "interpolate", "other"]
         tot = marks[-2][1] - marks[-3][1] if len(marks) >= 3 else 0
         print("frame: %.1f Mcycles, %.2f s at 50 MHz (CPU, and accelerator jobs from frame.c's model)" % (tot / 1e6, tot / 50e6))
+        subn = ["ln stats", "ln gamma/beta", "ln requant", "rq range", "rq params", "att prep q,k",
+                "att prep v", "att softmax", "att normalise", "att wait", "gelu table"]
         kn = ["GEMM (encoder)", "GEMM (convolutions)", "GEMM (attention)", "requant",
               "requant + add", "requant int16 in", "requant context"]
         for d, v in sub:
-            if d >= 100:
+            if d >= 200:
+                print("    %-18s %8.1f Mcycles" % (subn[d - 200], v / 1e6))
+            elif d >= 100:
                 print("  accelerator %-20s %8.1f Mcycles busy" % (kn[d - 100], v / 1e6))
             else:
                 print("  %-14s %8.1f Mcycles" % (pn[d], v / 1e6))

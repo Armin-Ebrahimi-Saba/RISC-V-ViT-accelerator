@@ -234,6 +234,21 @@ static void exp2_tab_init(void)
     }
 }
 
+/* 2^-t in Q15 for t = ((d >> j) * K) >> 11 in Q16, as below; u = t >> 6
+ * carries the table index (low 10 bits) and the shift (the rest). 0 from
+ * t >= 16 (u >= 16 << 10) and from d >= cutoff. At most 32767. */
+static inline uint32_t softmax_p(uint32_t d, uint32_t cutoff, int j, uint32_t K,
+                                 const uint16_t *e)
+{
+    if (d >= cutoff)
+        return 0;
+    uint32_t u = ((d >> j) * K) >> 17;
+    if (u >= (16u << 10))
+        return 0;
+    uint32_t p = (uint32_t)e[u & 1023u] >> (u >> 10);
+    return p > 32767u ? 32767u : p;
+}
+
 /* scores -> Q15 probabilities, each row divided by its sum */
 static void attn_softmax(const dav2_tensor_t *qkv, int n, attn_bufs_t *b)
 {
@@ -297,15 +312,20 @@ static void attn_softmax(const dav2_tensor_t *qkv, int n, attn_bufs_t *b)
                 for (int m = 0; m < n; m++)
                     if (sr[m] > smax) smax = sr[m];
             }
-            #pragma GCC unroll 2
-            for (int m = 0; m < n; m++) {
-                uint32_t d = (uint32_t)smax - (uint32_t)sr[m];
-                uint32_t t_q16 = d < cutoff ? ((d >> j) * K) >> 11 : over;
-                int32_t p = t_q16 >= over ? 0
-                          : (int32_t)exp2t[(t_q16 >> 6) & 1023u] >> (t_q16 >> 16);
-                if (p > 32767) p = 32767;
-                pr[m] = (int16_t)p;
-                sum += (uint32_t)p;
+            /* two scores per step, one word store (pr is word aligned:
+             * Kp is a multiple of 4) */
+            uint32_t *pw = (uint32_t *)pr;
+            int m = 0;
+            for (; m + 1 < n; m += 2) {
+                uint32_t p0 = softmax_p((uint32_t)smax - (uint32_t)sr[m], cutoff, j, K, exp2t);
+                uint32_t p1 = softmax_p((uint32_t)smax - (uint32_t)sr[m + 1], cutoff, j, K, exp2t);
+                pw[m >> 1] = p0 | (p1 << 16);
+                sum += p0 + p1;
+            }
+            if (m < n) {
+                uint32_t p0 = softmax_p((uint32_t)smax - (uint32_t)sr[m], cutoff, j, K, exp2t);
+                pr[m] = (int16_t)p0;
+                sum += p0;
             }
         } else {
         const int32_t *sh = s_hi + (size_t)t * n, *sl = s_lo + (size_t)t * n;
@@ -336,12 +356,19 @@ static void attn_softmax(const dav2_tensor_t *qkv, int n, attn_bufs_t *b)
          * sum >= 32767 and inv = round(2^31 / sum) <= 65538; p * inv < 2^32.
          * The p' of a row add up to 2^15 within rounding. */
         const uint32_t inv = (0x80000000u + sum / 2u) / sum;   /* 32-bit divu */
-        #pragma GCC unroll 4
-        for (int m = 0; m < n; m++) {
-            uint32_t q = ((uint32_t)pr[m] * inv + 32768u) >> 16;
-            pr[m] = (int16_t)(q > 32767u ? 32767u : q);
-        }
+        /* q <= 32768 (p <= 32767, inv <= 65538), so min(q, 32767) is
+         * q - (q >> 15). Two per word; the padding up to Kp stays zero. */
         for (int m = n; m < Kp; m++) pr[m] = 0;
+        uint32_t *pw = (uint32_t *)pr;
+        #pragma GCC unroll 2
+        for (int i = 0; i < Kp / 2; i++) {
+            uint32_t w = pw[i];
+            uint32_t q0 = ((w & 0xffffu) * inv + 32768u) >> 16;
+            uint32_t q1 = ((w >> 16) * inv + 32768u) >> 16;
+            q0 -= q0 >> 15;
+            q1 -= q1 >> 15;
+            pw[i] = q0 | (q1 << 16);
+        }
     }
 
 }
@@ -656,17 +683,20 @@ static void load_block(block_w_t *bw, int i)
  * temporary and no copy back are needed, and a failed job still leaves x
  * intact for the CPU redo. */
 static void residual_update(const dav2_tensor_t *a, const dav2_qw_t *w,
-                            dav2_tensor_t *x, int16_t **spare, uint32_t *rst)
+                            dav2_tensor_t *x, int16_t **spare, uint32_t *rst,
+                            uint32_t *rsum)
 {
     dav2_tensor_t y = *x;
     y.v = *spare;
     y.rst = rst;           /* ask for the new x's row ranges (for LayerNorm) */
+    y.rsum = rsum;         /* ... and its row sums */
     dav2_qgemm_ex(a, w, x, 0, &y);
     *spare = x->v;
     *x = y;
 }
 
-static void run_block(dav2_tensor_t *x, int16_t **spare, uint32_t *rst, int i, int n_tokens)
+static void run_block(dav2_tensor_t *x, int16_t **spare, uint32_t *rst, uint32_t *rsum,
+                      int i, int n_tokens)
 {
 #ifdef DAV2_TRACE
 #define BDUMP(nm, t) do { if (i == 0) dav2_dump("/tmp/dav2_b0_" nm ".bin", (t)); } while (0)
@@ -698,7 +728,7 @@ static void run_block(dav2_tensor_t *x, int16_t **spare, uint32_t *rst, int i, i
     BDUMP("ctx", &ctx);
     /* x = x + proj(ctx): the residual add is the requantisation job's
      * epilogue on the accelerator; the result goes to the spare buffer */
-    residual_update(&ctx, &bw.proj, x, spare, rst);
+    residual_update(&ctx, &bw.proj, x, spare, rst, rsum);
     BDUMP("res1", x);
     dav2_arena_release(mark);
 
@@ -712,7 +742,7 @@ static void run_block(dav2_tensor_t *x, int16_t **spare, uint32_t *rst, int i, i
     BDUMP("gelu", &h1);
 
     /* x = x + fc2(h1), likewise fused */
-    residual_update(&h1, &bw.fc2, x, spare, rst);
+    residual_update(&h1, &bw.fc2, x, spare, rst, rsum);
     BDUMP("res2", x);
     dav2_arena_release(mark);
 }
@@ -848,6 +878,7 @@ void dav2_infer(const dav2_cfg_t *cfg, int16_t *depth_q, dav2_xf_t *depth_scale)
     image.scale = g_image_scale;
     image.amax_q = -1;
     image.rst = 0;
+    image.rsum = 0;
 
     dav2_qw_t pe_w;
     dav2_qw(&pe_w, "patch_embed", DAV2_PATCH * DAV2_PATCH * 3);
@@ -855,6 +886,7 @@ void dav2_infer(const dav2_cfg_t *cfg, int16_t *depth_q, dav2_xf_t *depth_scale)
     dav2_tensor_t x = dav2_tensor_new(n_tokens, ED);
     int16_t *x_spare = dav2_tensor_new(n_tokens, ED).v;   /* see residual_update */
     uint32_t *x_rst = (uint32_t *)dav2_arena_alloc((size_t)n_tokens * sizeof(uint32_t));
+    uint32_t *x_rsum = (uint32_t *)dav2_arena_alloc((size_t)n_tokens * 3 * sizeof(uint32_t));
     {
         dav2_tensor_t patches = dav2_conv2d(&image, cfg->size, cfg->size,
                                             &pe_w, DAV2_PATCH, DAV2_PATCH, 0,
@@ -879,7 +911,7 @@ void dav2_infer(const dav2_cfg_t *cfg, int16_t *depth_q, dav2_xf_t *depth_scale)
         char msg[32];
         sprintf(msg, "block %d/12", i + 1);
         dav2_progress(msg);
-        run_block(&x, &x_spare, x_rst, i, n_tokens);
+        run_block(&x, &x_spare, x_rst, x_rsum, i, n_tokens);
 #ifdef DAV2_TRACE
         { char fn[64]; sprintf(fn, "/tmp/dav2_blk%d.bin", i); dav2_dump(fn, &x); }
 #endif
