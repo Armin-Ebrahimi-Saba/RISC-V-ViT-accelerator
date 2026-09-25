@@ -435,7 +435,7 @@ module student_gemm #(
   // NROWS independent single-port RAMs, one per activation row of the tile,
   // so all of them can be read together every cycle during the MAC phase.
   for (genvar r = 0; r < int'(NROWS); r++) begin : gen_arow
-    logic [31:0] mem [KWORDS];
+    (* ram_style = "block" *) logic [31:0] mem [KWORDS];
     always_ff @(posedge clk_i) begin
       if (a_we[r]) mem[a_wr_addr] <= a_wr_data;
       a_q[r] <= mem[a_rd_addr];
@@ -512,8 +512,8 @@ module student_gemm #(
   // klast: this is the last k of the current W row
 
   assign adv   = (state_q == ST_MAC) & wbuf_val_q;
-  assign wlast = (wsel_q == (w16_q ? 2'd1 : 2'd3));
-  assign klast = adv & (kcnt_q == (k_len_q - 1'b1));
+  assign wlast = (w16_q | (wsel_q == 2'd1));
+  assign klast = adv & (kcnt_q == (k_len_q - KCW'(2)));
 
   // A-tile read address: the requant output stage reads row rq_m_q (one
   // word = one output row m); the MAC phase reads word k/2 of every row.
@@ -542,25 +542,42 @@ module student_gemm #(
     end
   end
 
-  logic signed [15:0] wbyte;  // the one weight byte wsel_q currently selects out of wbuf_q
+  // The pair of weights wsel_q selects: int8 bytes 0,1 or 2,3 of wbuf_q, or
+  // with int16 weights (CTRL.w16) the word's two halves.
+  logic signed [15:0] wbyte, wbyte1;   // weights k and k+1
   always_comb begin
-    case (wsel_q)
-      2'd0:    wbyte = w16_q ? $signed(wbuf_q[15:0]) : 16'($signed(wbuf_q[7:0]));
-      2'd1:    wbyte = w16_q ? $signed(wbuf_q[31:16]) : 16'($signed(wbuf_q[15:8]));
-      2'd2:    wbyte = 16'($signed(wbuf_q[23:16]));
-      default: wbyte = 16'($signed(wbuf_q[31:24]));
-    endcase
+    if (w16_q) begin
+      wbyte  = $signed(wbuf_q[15:0]);
+      wbyte1 = $signed(wbuf_q[31:16]);
+    end else if (wsel_q == 2'd0) begin
+      wbyte  = 16'($signed(wbuf_q[7:0]));
+      wbyte1 = 16'($signed(wbuf_q[15:8]));
+    end else begin
+      wbyte  = 16'($signed(wbuf_q[23:16]));
+      wbyte1 = 16'($signed(wbuf_q[31:24]));
+    end
   end
-
-  // Three-stage MAC pipeline:
+  // MAC pipeline, two weights (k, k+1) per cycle:
   //   s0  present the A-tile read address (combinational from kcnt_q)
-  //   s1  A word arrives; select the half addressed by k[0]
-  //   s2  multiply-accumulate (maps onto a DSP48E1 with A/B/P registers)
-  logic              v_s1, v_s2;   // valid bit for pipeline stage s1 / s2 (adv delayed by 1 / 2 cycles)
-  logic              ksel_s1;      // s1: which 16-bit half of the A word this k selects (k[0])
-  logic signed [15:0] w_s1, w_s2;   // the weight byte, pipelined alongside to reach s1 / s2 together
-  logic signed [15:0] a_s2 [NROWS]; // s2: the A operand for each row, selected by ksel_s1
-  logic signed [31:0] acc_q [NROWS]; // the running sum for each of the NROWS rows (this is C, in progress)
+  //   s1  the A word a_q arrives: a[k] in bits 15:0, a[k+1] in bits 31:16
+  //   s2  a_s2 / a1_s2: the two halves, in fabric registers
+  //   s3  DSP input registers (AREG, BREG)
+  //   s4  DSP multiplier registers (MREG)
+  //   s5  DSP output registers (PREG): the two products
+  //   then the accumulator adds both products (in logic)
+  logic              v_s1, v_s2, v_s3, v_s4, v_s5;   // valid bit per stage (adv delayed by 1..5 cycles)
+  logic signed [15:0] w_s1, w_s2, w_s3, w1_s1, w1_s2, w1_s3;   // weights k and k+1, pipelined to s3
+  // keep: without it the DSP48 takes both a_s2 and the RAM read register
+  // a_q as its input registers, and the row RAMs become LUT RAM.
+  (* keep = "true" *) logic signed [15:0] a_s2 [NROWS], a1_s2 [NROWS];
+  // s3..s5 map onto one DSP48 per product with all its registers. The
+  // accumulator adds the two products in logic: left to itself, synthesis
+  // tried to fold the three-input add into the DSPs and did not finish in
+  // an hour.
+  (* use_dsp = "yes" *) logic signed [15:0] a_s3 [NROWS], a1_s3 [NROWS];
+  (* use_dsp = "yes" *) logic signed [31:0] m0_s4 [NROWS], m1_s4 [NROWS];
+  (* use_dsp = "yes" *) logic signed [31:0] p0_s5 [NROWS], p1_s5 [NROWS];
+  (* use_dsp = "no" *) logic signed [31:0] acc_q [NROWS]; // the running sum for each of the NROWS rows (this is C, in progress)
   logic              acc_clr;        // synchronously clear all NROWS accumulators this cycle
 
   // Only the valid bits are reset. The data registers (weight byte, A
@@ -570,30 +587,46 @@ module student_gemm #(
   // worth of methodology warnings (DPIR-1) and a longer path. The
   // accumulators are cleared synchronously at job start and after every
   // drain, so they never hold anything a result depends on before then.
-  // Shifts the "a MAC is happening" bit down the pipeline: adv (s0) -> v_s1 -> v_s2.
+  // Shifts the "a MAC is happening" bit down the pipeline: adv (s0) -> v_s1 -> ... -> v_s5.
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       v_s1 <= 1'b0;
       v_s2 <= 1'b0;
+      v_s3 <= 1'b0;
+      v_s4 <= 1'b0;
+      v_s5 <= 1'b0;
     end else begin
       v_s1 <= adv;
       v_s2 <= v_s1;
+      v_s3 <= v_s2;
+      v_s4 <= v_s3;
+      v_s5 <= v_s4;
     end
   end
-  // Carries which A-half to use, and the weight byte itself, alongside v_s1/v_s2.
+  // Carries the two weights alongside v_s1 .. v_s3.
   always_ff @(posedge clk_i) begin
-    ksel_s1 <= kcnt_q[0];
     w_s1    <= wbyte;
+    w1_s1   <= wbyte1;
     w_s2    <= w_s1;
+    w1_s2   <= w1_s1;
+    w_s3    <= w_s2;
+    w1_s3   <= w1_s2;
   end
 
   // One multiply-accumulate lane per tile row, replicated NROWS times; each
-  // maps onto one DSP48E1 slice (A/B/P registers = a_s2, w_s2, acc_q).
+  // uses two DSP48E1 slices, one per product (A/B/M/P registers).
   for (genvar r = 0; r < int'(NROWS); r++) begin : gen_pe
     always_ff @(posedge clk_i) begin
-      a_s2[r] <= ksel_s1 ? $signed(a_q[r][31:16]) : $signed(a_q[r][15:0]);
+      a_s2[r]  <= $signed(a_q[r][15:0]);     // a[k]
+      a1_s2[r] <= $signed(a_q[r][31:16]);    // a[k+1]
+      a_s3[r]  <= a_s2[r];
+      a1_s3[r] <= a1_s2[r];
+      m0_s4[r] <= a_s3[r] * w_s3;
+      m1_s4[r] <= a1_s3[r] * w1_s3;
+      p0_s5[r] <= m0_s4[r];
+      p1_s5[r] <= m1_s4[r];
       if (acc_clr)   acc_q[r] <= '0;
-      else if (v_s2) acc_q[r] <= acc_q[r] + (a_s2[r] * w_s2);
+      else if (v_s5) acc_q[r] <= acc_q[r] + p0_s5[r] + p1_s5[r];
     end
   end
 
@@ -621,8 +654,8 @@ module student_gemm #(
 
   // ------------------------------------------------------------ state machine
 
-  logic pipe_idle;  // the 2-stage MAC pipeline has fully drained (safe to start DRAIN)
-  assign pipe_idle = ~v_s1 & ~v_s2;
+  logic pipe_idle;  // the MAC pipeline has fully drained (safe to start DRAIN)
+  assign pipe_idle = ~v_s1 & ~v_s2 & ~v_s3 & ~v_s4 & ~v_s5;
 
   logic a_load_done;  // the A tile's last word (last row, last word) has just arrived
   assign a_load_done = ld_valid & (a_ld_row_q == (n_rows_q - 1'b1))
@@ -900,7 +933,7 @@ module student_gemm #(
           // read stream every 4th byte; reset k and the drain index when
           // the row's last k has been consumed.
           if (adv) begin
-            kcnt_q <= kcnt_q + 1'b1;
+            kcnt_q <= kcnt_q + KCW'(2);
             if (wlast) begin
               wsel_q <= '0;
               if (rd_valid) wbuf_q     <= rd_data;

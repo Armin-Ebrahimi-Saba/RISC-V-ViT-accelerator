@@ -52,7 +52,10 @@ int putchar(int c) { return c; }
  * Job times from the block's design, with 2.1 cycles per bus word as
  * measured on the board (boot report, "cycles/beat"):
  *   GEMM, per tile of nt <= 128 rows: A tile nt*K/2 words, then per weight
- *        row K MAC cycles (one weight per cycle) and nt + 2 drain writes.
+ *        row the MAC time, the pipeline tail and nt + 2 drain writes. MAC
+ *        time: K / MACW cycles (MACW weights per cycle), but not less than
+ *        the row's weight words (K/4, or K/2 for int16 weights) at the bus
+ *        rate. Pipeline tail: PIPE cycles from the last weight to the drain.
  *   requantisation: parameters 3*M words, input N*M words (int16: half),
  *        output one element per cycle, N*M/2 words written. */
 #define BEAT 21                         /* tenths of a cycle per bus word */
@@ -71,13 +74,22 @@ static void start_job(uint64_t cyc)
     wait_done();
     busy_until = dav2_cycles() + cyc;
 }
-static uint64_t gemm_cycles(int N, int K, int M)
+#ifndef MACW
+#define MACW 2                          /* weights per MAC cycle (1 before round 15) */
+#endif
+#ifndef PIPE
+#define PIPE 5                          /* MAC pipeline stages (2 before round 15) */
+#endif
+static uint64_t gemm_cycles(int N, int K, int M, int w16)
 {
     uint64_t c = 0;
+    uint64_t mac = (uint64_t)K / MACW;
+    uint64_t bus = (uint64_t)K / (w16 ? 2 : 4) * BEAT / 10;
+    uint64_t row = (mac > bus ? mac : bus) + PIPE;
     for (int n0 = 0; n0 < N; n0 += 128) {
         int nt = N - n0 < 128 ? N - n0 : 128;
         c += (uint64_t)nt * K / 2 * BEAT / 10;
-        c += (uint64_t)M * (K + (uint64_t)(nt + 2) * BEAT / 10);
+        c += (uint64_t)M * (row + (uint64_t)(nt + 2) * BEAT / 10);
     }
     return c;
 }
@@ -92,17 +104,17 @@ static uint64_t requant_cycles(int N, int M, int in16, int add)
 static int32_t stats_buf[2 * 4096];
 int dav2_accel_qgemm_async(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc,
                            dav2_accel_stats_t *st)
-{ (void)acc; job_kind = K_GEMM_ENC; start_job(gemm_cycles(a->n, a->c, wt->m));
+{ (void)acc; job_kind = K_GEMM_ENC; start_job(gemm_cycles(a->n, a->c, wt->m, 0));
   st->v = stats_buf; st->tiles = 1; return 2; }
 int dav2_accel_conv_async(const int16_t *img, int h, int w, int C, int k, int stride,
                           int pad, const int8_t *wt, int M, int32_t *acc, dav2_accel_stats_t *st)
 { (void)img;(void)wt;(void)acc;
   int oh = (h + 2 * pad - k) / stride + 1, ow = (w + 2 * pad - k) / stride + 1;
-  job_kind = K_GEMM_CONV; start_job(gemm_cycles(oh * ow, k * k * C, M));
+  job_kind = K_GEMM_CONV; start_job(gemm_cycles(oh * ow, k * k * C, M, 0));
   st->v = stats_buf; st->tiles = 1; return 2; }
 int dav2_accel_gemm_raw_async(const int16_t *a, uint32_t as, const int8_t *w, uint32_t ws,
                               int32_t *acc, int N, int K, int M)
-{ (void)a;(void)as;(void)w;(void)ws;(void)acc; job_kind = K_ATT; start_job(gemm_cycles(N, K, M)); return 2; }
+{ (void)a;(void)as;(void)w;(void)ws;(void)acc; job_kind = K_ATT; start_job(gemm_cycles(N, K, M, 0)); return 2; }
 int dav2_accel_requant_rows_async(const int32_t *acc, int N, int M, int m0, int mc,
                                   const int32_t *par, int16_t *dst, int32_t *amax,
                                   const dav2_rq_epi_t *epi)
@@ -120,7 +132,7 @@ int dav2_accel_w16_ok(void) { return 1; }
 int dav2_accel_present(void) { return 1; }
 int dav2_accel_gemm16_async(const int16_t *a, uint32_t as, const int16_t *w, uint32_t ws,
                             int32_t *acc, int N, int K, int M, int32_t *st)
-{ (void)a;(void)as;(void)w;(void)ws;(void)acc;(void)st; job_kind = K_ATT; start_job(gemm_cycles(N, K, M)); return 2; }
+{ (void)a;(void)as;(void)w;(void)ws;(void)acc;(void)st; job_kind = K_ATT; start_job(gemm_cycles(N, K, M, 1)); return 2; }
 int dav2_accel_requant_stride(const int32_t *acc, int N, int M, const int32_t *params,
                               int16_t *out, int out_stride, int32_t *amax)
 { (void)acc;(void)params;(void)out;(void)out_stride;

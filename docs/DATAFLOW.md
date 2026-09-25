@@ -228,7 +228,7 @@ means.
 |---|---|
 | A1 | The CPU programs the job's registers: the A, W and C addresses and strides, K, M, the row count, and S_ADDR for statistics. It then sets CTRL.start. For the last job of an operation it may carry on with independent work and collect the job later; otherwise it polls STATUS. |
 | A2 | The accelerator loads a 128-row tile of A into on-chip RAM. Up to 8 reads stay in flight, using a reorder buffer. If a response is lost, it is re-issued automatically. |
-| A3 | The accelerator streams W one word at a time. Each word carries 4 packed int8 weights. Each weight is broadcast to all 128 multiply-accumulate units. This gives 128 MACs per cycle, and K cycles per weight row. |
+| A3 | The accelerator streams W one word at a time. Each word carries 4 packed int8 weights. Each pair of weights is broadcast to all 128 lanes, and each lane has two multipliers. This gives 256 MACs per cycle, and K/2 cycles per weight row (at least the 2.1 cycles per weight word the bus needs). |
 | A4 | The accelerator writes that row's 128 int32 sums to column m of C. If statistics are enabled, it then writes that row's maximum and minimum. |
 | A5 | The accelerator moves to the next row. Once all M rows are done, it reports STATUS.done. The CPU then starts the next 128-row tile, back at step A2. |
 

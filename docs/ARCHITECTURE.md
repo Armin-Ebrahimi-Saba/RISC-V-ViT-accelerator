@@ -199,7 +199,10 @@ A second input format serves LayerNorm:
   tokens as rows, then z·γ + β with the channels as rows. The CPU keeps
   the row statistics and the channel ranges.
 
-A GEMM job can also take **int16 weights** (**`CTRL.w16`**), two per word:
+Each MAC lane takes **two weights per cycle** (two DSPs per lane): one
+A-tile word holds a[k] and a[k+1], so acc += a[k]·w[k] + a[k+1]·w[k+1].
+That matches what the bus can deliver (four int8 weights per word, about
+2.1 cycles per word). A GEMM job can also take **int16 weights** (**`CTRL.w16`**), two per word:
 the DSP multipliers are 25 × 18 bits, so a 16 × 16 product costs nothing
 extra. Attention uses it for q (scores) and v (context), which are int16
 activations and were split into two int8 halves before.
@@ -227,7 +230,7 @@ host build.
 The block has a register interface the CPU programs (addresses and strides
 of A, W and C; K, M and the tile row count; `S_ADDR`, `P_ADDR`; a control
 word with start and requant bits; status) and four debug registers that
-expose internal counters. Peak is 128 multiply-accumulates per cycle; the
+expose internal counters. Peak is 256 multiply-accumulates per cycle; the
 block is memory-bound, not compute-bound, so the tile width buys fewer
 passes over the weights rather than more arithmetic per pass.
 

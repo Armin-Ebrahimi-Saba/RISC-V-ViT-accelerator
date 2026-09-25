@@ -1,4 +1,4 @@
-# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 3.0 s (estimated)
+# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 2.75 s (estimated)
 
 This is the record of the speed-up work: what was measured, what each change
 did, and what is left. Every step kept the FPGA output **bit-exact with the
@@ -821,6 +821,62 @@ So the current estimate is **about 3.0 s per frame** (3.11 s, less the
 model's 4 %). The accelerator is now the limit. Its modelled busy time is
 83 Mcycles: encoder GEMMs 34, convolution GEMMs 23, attention GEMMs 3.5,
 requantisation 23.
+
+### Round fifteen — two weights per cycle in each MAC lane (hardware; estimated, not yet measured)
+
+A GEMM spent K MAC cycles per weight row, one weight per cycle, while the
+bus could bring about two: a word holds four int8 weights and takes 2.1
+cycles. One A-tile word already holds a[k] and a[k+1], so each lane now
+multiplies a[k]·w[k] and a[k+1]·w[k+1], each in its own DSP, and adds
+both products to its accumulator.
+int8 weights come in pairs (bytes 0,1 then 2,3 of a word), int16 weights
+as a word's two halves. No register or software change.
+
+The first version wrote acc + a·w + a1·w1 as one expression. Synthesis
+then stayed in "Cross Boundary and Area Optimization" for over an hour
+(the step normally takes a minute), most likely trying to fold the
+three-input add into the DSPs. With the products registered and the
+attributes `use_dsp = "yes"` on the products and `use_dsp = "no"` on the
+accumulators, the step takes 69 seconds.
+
+The next build failed in placement: 91,498 LUT RAM cells for 46,200
+sites. All 128 A-tile row RAMs had become LUT RAM. The DSP48 had taken
+both `a_s2` and the RAM read register `a_q` as its two input registers.
+A block RAM needs its read register, so synthesis fell back to LUT RAM,
+which can read without one. In round fourteen a multiplexer between
+`a_q` and `a_s2` prevented this. `(* keep = "true" *)` on `a_s2` and
+`a1_s2` now keeps them out of the DSP, and the row RAMs are block RAMs
+again.
+
+That build met timing, but each lane DSP then had no input register and
+no multiplier register (about 550 DPIP-1 and DPOP-2 warnings). The lane
+pipeline now has three more stages: `a_s3`/`w_s3` (the DSP's AREG and
+BREG), `m0_s4` (MREG) and `p0_s5` (PREG). The DSPs are fully pipelined,
+and the lane warnings are gone. The cost is 3 cycles per weight row
+(the pipeline tail before the drain), about 0.3 Mcycles per frame.
+
+`student_gemm_tb` PASSED (every GEMM, convolution and int16-weight test);
+593,163 words. The tile N = 20, K = 64, M = 30 takes 3175 cycles instead
+of 4059.
+Bitstream: timing met, WNS +0.287 ns, WHS +0.030 ns; LUT 22.4 %, BRAM 56.6 %, DSP 37.7 % (279, of which 256 in the MAC lanes).
+
+`tools/cyclemodel/frame.c` now has the weights per MAC cycle (`MACW`,
+at least the row's weight words at the bus rate) and the pipeline tail
+(`PIPE`). `FRAME_FLAGS="-DMACW=1 -DPIPE=2" ./build.sh` models round
+fourteen's block.
+
+Model: 155.9 → 142.6 Mcycles per frame, **about 2.75 s** (2.85 s, less
+the model's 4 %). The accelerator's GEMM time falls from 60.6 to 47.3
+Mcycles: encoder 34.4 → 24.2, convolutions 22.6 → 19.5, attention 3.6
+(int16 weights, limited by the bus before and after).
+
+**More weights per cycle would not help.** With two per cycle a weight
+row already needs 0.525 K cycles on the bus against 0.5 K MAC cycles; the
+model gives the same frame for four per cycle. What limits a GEMM now is
+bus traffic: for an encoder row (K = 384, 82 tokens) the 96 weight words
+and the 84 words of int32 results written by the drain, and then the
+requantisation job reads the results back. The next step is to keep the
+results on chip.
 
 ## 7. What is left, in order of expected gain
 
