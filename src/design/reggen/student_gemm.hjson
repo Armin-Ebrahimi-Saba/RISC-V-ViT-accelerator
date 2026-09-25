@@ -110,6 +110,11 @@
           desc: "GEMM job only: 1 - the weights W are int16, two per word (bits 15:0 first), instead of four int8. K_LEN must be even; W_STRIDE 0 then means K*2. Present when CAPS bit 26 is set."
         }
         {
+          bits: 9
+          name: "ostats"
+          desc: "Requantisation job only: 1 - after the output, write each output row n's largest and smallest final value to S_ADDR + n*4 as one word, max in bits 31:16 and min in bits 15:0 (int16). Present when CAPS bit 27 is set."
+        }
+        {
           bits: 2
           name: "gather"
           desc: "GEMM job only: 1 - the A tile is gathered from an NHWC int16 image as im2col would lay it out (G_ADDR, G_GEOM, G_CHAN, G_CONV, G_START), instead of read from A_ADDR. K_LEN must equal kpos_count * C. C must be even."
@@ -221,7 +226,7 @@
     }
     {
       name: caps
-      desc: "Hardware capabilities: bits [7:0] = NROWS, bits [23:8] = KMAX, bit 24 = the requantisation lookup table (CTRL.lut) exists, bit 25 = the int16 requantisation input (CTRL.a16) exists, bit 26 = int16 GEMM weights (CTRL.w16) exist. Reads 0 when no accelerator is present."
+      desc: "Hardware capabilities: bits [7:0] = NROWS, bits [23:8] = KMAX, bit 24 = the requantisation lookup table (CTRL.lut) exists, bit 25 = the int16 requantisation input (CTRL.a16) exists, bit 26 = int16 GEMM weights (CTRL.w16) exist, bit 27 = requantisation output row statistics (CTRL.ostats) exist. Reads 0 when no accelerator is present."
       swaccess: ro
       hwaccess: hwo
       hwext: "true"
@@ -339,7 +344,7 @@
     }
       {
       name: s_addr
-      desc: "GEMM job: byte address for per-row accumulator statistics, {max, min} int32 at S_ADDR + m*8 for every weight row m. 0 disables. 4-byte aligned."
+      desc: "GEMM job: byte address for per-row accumulator statistics, {max, min} int32 at S_ADDR + m*8 for every weight row m. 0 disables. Requantisation job with CTRL.ostats: the output row statistics, one word per output row n (see CTRL.ostats). 4-byte aligned."
       swaccess: rw
       hwaccess: hro
       fields:

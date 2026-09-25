@@ -656,16 +656,17 @@ static void load_block(block_w_t *bw, int i)
  * temporary and no copy back are needed, and a failed job still leaves x
  * intact for the CPU redo. */
 static void residual_update(const dav2_tensor_t *a, const dav2_qw_t *w,
-                            dav2_tensor_t *x, int16_t **spare)
+                            dav2_tensor_t *x, int16_t **spare, uint32_t *rst)
 {
     dav2_tensor_t y = *x;
     y.v = *spare;
+    y.rst = rst;           /* ask for the new x's row ranges (for LayerNorm) */
     dav2_qgemm_ex(a, w, x, 0, &y);
     *spare = x->v;
     *x = y;
 }
 
-static void run_block(dav2_tensor_t *x, int16_t **spare, int i, int n_tokens)
+static void run_block(dav2_tensor_t *x, int16_t **spare, uint32_t *rst, int i, int n_tokens)
 {
 #ifdef DAV2_TRACE
 #define BDUMP(nm, t) do { if (i == 0) dav2_dump("/tmp/dav2_b0_" nm ".bin", (t)); } while (0)
@@ -697,7 +698,7 @@ static void run_block(dav2_tensor_t *x, int16_t **spare, int i, int n_tokens)
     BDUMP("ctx", &ctx);
     /* x = x + proj(ctx): the residual add is the requantisation job's
      * epilogue on the accelerator; the result goes to the spare buffer */
-    residual_update(&ctx, &bw.proj, x, spare);
+    residual_update(&ctx, &bw.proj, x, spare, rst);
     BDUMP("res1", x);
     dav2_arena_release(mark);
 
@@ -711,7 +712,7 @@ static void run_block(dav2_tensor_t *x, int16_t **spare, int i, int n_tokens)
     BDUMP("gelu", &h1);
 
     /* x = x + fc2(h1), likewise fused */
-    residual_update(&h1, &bw.fc2, x, spare);
+    residual_update(&h1, &bw.fc2, x, spare, rst);
     BDUMP("res2", x);
     dav2_arena_release(mark);
 }
@@ -846,12 +847,14 @@ void dav2_infer(const dav2_cfg_t *cfg, int16_t *depth_q, dav2_xf_t *depth_scale)
     image.c = 3;
     image.scale = g_image_scale;
     image.amax_q = -1;
+    image.rst = 0;
 
     dav2_qw_t pe_w;
     dav2_qw(&pe_w, "patch_embed", DAV2_PATCH * DAV2_PATCH * 3);
 
     dav2_tensor_t x = dav2_tensor_new(n_tokens, ED);
     int16_t *x_spare = dav2_tensor_new(n_tokens, ED).v;   /* see residual_update */
+    uint32_t *x_rst = (uint32_t *)dav2_arena_alloc((size_t)n_tokens * sizeof(uint32_t));
     {
         dav2_tensor_t patches = dav2_conv2d(&image, cfg->size, cfg->size,
                                             &pe_w, DAV2_PATCH, DAV2_PATCH, 0,
@@ -876,7 +879,7 @@ void dav2_infer(const dav2_cfg_t *cfg, int16_t *depth_q, dav2_xf_t *depth_scale)
         char msg[32];
         sprintf(msg, "block %d/12", i + 1);
         dav2_progress(msg);
-        run_block(&x, &x_spare, i, n_tokens);
+        run_block(&x, &x_spare, x_rst, i, n_tokens);
 #ifdef DAV2_TRACE
         { char fn[64]; sprintf(fn, "/tmp/dav2_blk%d.bin", i); dav2_dump(fn, &x); }
 #endif

@@ -154,7 +154,7 @@ module student_gemm #(
   logic [31:0] cycles_q;        // cycle counter, running while busy_q, for CYCLES
 
   assign hw2reg.status.d = {err_q, done_q, busy_q};        // STATUS register readback
-  assign hw2reg.caps.d   = {8'd7, 16'(KMAX), 8'(NROWS)};   // CAPS: what this instance supports
+  assign hw2reg.caps.d   = {8'd15, 16'(KMAX), 8'(NROWS)};   // CAPS: what this instance supports
   assign hw2reg.cycles.d = cycles_q;                       // CYCLES register readback
 
   logic start_strobe, start_requant, start_gather;
@@ -175,6 +175,8 @@ module student_gemm #(
   assign start_a16      = reg2hw.ctrl.a16.q;      // requant job: int16 input
   logic start_w16;
   assign start_w16      = reg2hw.ctrl.w16.q;      // GEMM job: int16 weights
+  logic start_ostats;
+  assign start_ostats   = reg2hw.ctrl.ostats.q;   // requant job: output row statistics
 
   // Configuration snapshot, taken when a job starts so software may reprogram
   // the registers for the next tile while this one runs.
@@ -200,6 +202,7 @@ module student_gemm #(
   logic           lut_ld_done;               // table load: the last word has arrived
   logic           a16_q;                     // requant input is int16, two per word
   logic           w16_q;                     // GEMM weights are int16, two per word
+  logic           ostats_q;                  // requant: write each output row's {max, min}
   // Gather parameters (snapshot at start) and the walker signals the read
   // engine and the A-load writer use; the walkers themselves are further down.
   logic [31:0]    g_addr_q;
@@ -225,7 +228,8 @@ module student_gemm #(
     RQ_LOAD_ACC,   // acc chunk -> tile RAM, transposed
     RQ_LOAD_X,     // residual chunk -> upper half of tile RAM (CTRL.add)
     RQ_OUT,         // stream int16 pairs out
-    RQ_LOAD_L     // lookup table -> LUT RAM (CTRL.lut_load)
+    RQ_LOAD_L,     // lookup table -> LUT RAM (CTRL.lut_load)
+    RQ_STATS      // output row statistics -> S_ADDR (CTRL.ostats)
   } state_e;
 
   state_e state_q, state_d;  // state_q: current state (registered); state_d: next state
@@ -286,9 +290,11 @@ module student_gemm #(
   logic [31:0]  wr_addr, wr_data;       // that word's address and data
   logic         drain_wr_req, rq_wr_req;
   logic [31:0]  drain_wr_addr, drain_wr_data, rq_wr_addr, rq_wr_data;
-  assign wr_req  = (state_q == RQ_OUT) ? rq_wr_req  : drain_wr_req;
-  assign wr_addr = (state_q == RQ_OUT) ? rq_wr_addr : drain_wr_addr;
-  assign wr_data = (state_q == RQ_OUT) ? rq_wr_data : drain_wr_data;
+  logic         os_wr_req;
+  logic [31:0]  os_wr_addr, os_wr_data;   // RQ_STATS: one word per output row
+  assign wr_req  = (state_q == RQ_OUT) ? rq_wr_req : (state_q == RQ_STATS) ? os_wr_req : drain_wr_req;
+  assign wr_addr = (state_q == RQ_OUT) ? rq_wr_addr : (state_q == RQ_STATS) ? os_wr_addr : drain_wr_addr;
+  assign wr_data = (state_q == RQ_OUT) ? rq_wr_data : (state_q == RQ_STATS) ? os_wr_data : drain_wr_data;
   logic [CW-1:0] wr_out_q;      // writes issued without an ack yet
   logic [SW-1:0] wr_src_q;      // a_source to tag the next write with (cycles through OUTSTANDING slots)
 
@@ -640,7 +646,8 @@ module student_gemm #(
       RQ_LOAD_P:   if (rq_p_done)                state_d = RQ_LOAD_ACC; // param table loaded
       RQ_LOAD_ACC: if (rq_acc_done)              state_d = add_q ? RQ_LOAD_X : RQ_OUT;
       RQ_LOAD_X:   if (rq_x_done)                state_d = RQ_OUT;      // residual loaded
-      RQ_OUT:      if (rq_out_done)              state_d = ST_FINISH;   // every output word written
+      RQ_OUT:      if (rq_out_done)      state_d = ostats_q ? RQ_STATS : ST_FINISH;
+      RQ_STATS:    if (t_q == {1'b0, n_rows_q}) state_d = ST_FINISH;   // every output word written
       default:                                   state_d = ST_IDLE;
     endcase
   end
@@ -675,6 +682,7 @@ module student_gemm #(
       lut_q <= 1'b0; p_addr_q <= '0;
       a16_q <= 1'b0;
       w16_q <= 1'b0;
+      ostats_q <= 1'b0;
       // rq_m_q, rq_p_cnt_q and lut_cnt_q have no reset: they address block
       // RAMs (an asynchronous reset there is DRC REQP-1840), and every job
       // sets them before use.
@@ -790,6 +798,7 @@ module student_gemm #(
             lut_q      <= start_lut & start_requant;
             a16_q      <= start_a16 & start_requant;
             w16_q      <= start_w16 & ~start_requant;
+            ostats_q   <= start_ostats & start_requant;
             p_addr_q   <= reg2hw.p_addr.q;
             lut_cnt_q  <= '0;
             x_addr_q   <= reg2hw.x_addr.q;
@@ -931,6 +940,10 @@ module student_gemm #(
         end
 
         // ---- requantisation job -------------------------------------------
+        RQ_STATS: begin
+          // one statistics word per output row, t_q = row
+          if (issue_wr) t_q <= t_q + 1'b1;
+        end
         RQ_LOAD_L: begin
           // One table word per beat; then the parameter table, as a job
           // without a table load starts with.
@@ -1427,6 +1440,36 @@ module student_gemm #(
 
   // Largest |out| of the job, for the consumer of the result (the residual
   // add needs the range of its operands and would otherwise scan them).
+  // Output row statistics (CTRL.ostats): the rows reach q12 in order, so a
+  // row counter and a running {max, min} suffice; at each row's end the
+  // pair goes into a small LUT RAM, which RQ_STATS writes out.
+  logic [31:0]        os_ram [NROWS];
+  logic [NRW-1:0]     os_row_q;
+  logic               os_first_q;
+  logic signed [15:0] os_max_q, os_min_q;
+  always_ff @(posedge clk_i) begin
+    if (state_q != RQ_OUT) begin
+      os_row_q   <= '0;
+      os_first_q <= 1'b1;
+    end else if (rq_v12) begin
+      logic signed [15:0] v, mx, mn;
+      v  = rq_val12[15:0];
+      mx = (os_first_q || v > os_max_q) ? v : os_max_q;
+      mn = (os_first_q || v < os_min_q) ? v : os_min_q;
+      os_max_q <= mx;
+      os_min_q <= mn;
+      if (rq_last12 || rq_row_end12) begin
+        os_ram[os_row_q[RW-1:0]] <= {mx, mn};
+        os_row_q   <= os_row_q + 1'b1;
+        os_first_q <= 1'b1;
+      end else begin
+        os_first_q <= 1'b0;
+      end
+    end
+  end
+  assign os_wr_req  = (state_q == RQ_STATS) & (t_q != {1'b0, n_rows_q});
+  assign os_wr_addr = s_ptr_q + 32'(t_q) * 32'd4;
+  assign os_wr_data = os_ram[t_q[RW-1:0]];
   logic [31:0] rq_amax_q;
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin

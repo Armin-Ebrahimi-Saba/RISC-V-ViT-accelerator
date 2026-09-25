@@ -139,7 +139,7 @@ accelerator applies those parameters to produce int16 output.*
 
 | Step | What happens |
 |---|---|
-| 7 | LayerNorm 1. The CPU computes each token's mean, 1/√variance and range in fixed point. A first requantisation job (int16 input, tokens as rows) computes z = (x − mean)/std at a common 14-bit scale and writes it channel by channel. The CPU finds each channel's range; a second job applies γ and β per channel, scales, saturates and writes the result token by token. |
+| 7 | LayerNorm 1. The CPU computes each token's mean, 1/√variance and range in fixed point. The tokens' ranges come with x from the previous residual update. A first requantisation job (int16 input, tokens as rows) computes z = (x − mean)/std at a common 14-bit scale, writes it channel by channel and reports each channel's range; a second job applies γ and β per channel, scales, saturates and writes the result token by token. |
 | 8 | GEMM + requant. The block's qkv weights produce query, key and value vectors for all 6 attention heads at once. |
 | 9 to 13 | Attention, repeated for each of the 6 heads. See the table below. Heads do not depend on each other, but run one after another today. |
 | 14 | GEMM + requant. The combined attention output is projected back to 384 dimensions. |

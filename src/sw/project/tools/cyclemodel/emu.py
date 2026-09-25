@@ -9,10 +9,11 @@ emulator and counts cycles with a simple timing model:
 
 The constants reproduce the board's boot-time microbenchmark (main.c,
 dav2_bench) within 0.3 cycles per iteration: run calib.elf. The
-accelerator is replaced by stubs whose jobs finish at once, so only CPU
-time is counted. For the committed engine of round seven the per-operator
-totals were within 10 % of the board's profile, except "requantise",
-which on the board also contains time spent waiting for the drain.
+accelerator is replaced by stubs. In bench.elf its jobs finish at once. In
+frame.elf each job runs for a time from the block's design (see frame.c)
+while the CPU goes on, and the CPU waits for it where the driver would.
+For the round-seven engine the whole frame comes out at 373 Mcycles
+against 360 measured on the board (4 % high).
 
 Usage (Unicorn and pyelftools: pip install unicorn pyelftools):
   python3 emu.py calib.elf                  microbenchmark, per phase
@@ -182,9 +183,14 @@ if __name__ == "__main__":
         pn = ["gemm (accel)", "gemm (cpu)", "requantise", "attention", "layernorm", "gelu",
               "add/relu", "im2col", "interpolate", "other"]
         tot = marks[-2][1] - marks[-3][1] if len(marks) >= 3 else 0
-        print("frame: %.1f Mcycles (CPU only, accelerator jobs take no time)" % (tot / 1e6))
+        print("frame: %.1f Mcycles, %.2f s at 50 MHz (CPU, and accelerator jobs from frame.c's model)" % (tot / 1e6, tot / 50e6))
+        kn = ["GEMM (encoder)", "GEMM (convolutions)", "GEMM (attention)", "requant",
+              "requant + add", "requant int16 in", "requant context"]
         for d, v in sub:
-            print("  %-14s %8.1f Mcycles" % (pn[d], v / 1e6))
+            if d >= 100:
+                print("  accelerator %-20s %8.1f Mcycles busy" % (kn[d - 100], v / 1e6))
+            else:
+                print("  %-14s %8.1f Mcycles" % (pn[d], v / 1e6))
         if ph >= 0:
             line_profile(sys.argv[1], run.prof, 30)
         sys.exit(0)

@@ -742,6 +742,77 @@ module student_gemm_tb;
       $display("  ok, %0d outputs", ndim * mdim);
   endtask
 
+  // Output row statistics (CTRL.ostats) on an int16-input job, optionally
+  // with ReLU and the table: each output row n's {max, min} at S_BASE + n*4
+  // for every n-tile (checked per tile, since each tile rewrites S_BASE).
+  task automatic run_requant_ostats(input int ndim, input int mdim, input int relu, input int lut);
+    int mismatches = 0;
+    logic [31:0] st;
+    int guard;
+    localparam logic [31:0] H_BASE = 32'h8018_0000;
+    $display("--- REQUANT OSTATS%s%s N=%0d M=%0d", relu ? "+RELU" : "", lut ? "+LUT" : "", ndim, mdim);
+    for (int i = 0; i < ndim * mdim / 2; i++)
+      memory.mem[mem_word(H_BASE) + i] = {16'($signed($urandom % 16383) - 8191),
+                                          16'($signed($urandom % 16383) - 8191)};
+    if (lut)
+      for (int i = 0; i < 8192; i++)
+        memory.mem[mem_word(L_BASE) + i] = $urandom;
+    for (int m = 0; m < mdim; m++) begin
+      memory.mem[mem_word(P_BASE) + 3*m]     = 32'h4000_0000 + ($urandom % 32'h3fff_ffff);
+      memory.mem[mem_word(P_BASE) + 3*m + 1] = 30 + ($urandom % 4);
+      memory.mem[mem_word(P_BASE) + 3*m + 2] = 32'($signed($urandom % 2001) - 1000);
+    end
+    for (int n0 = 0; n0 < ndim; n0 += NROWS) begin
+      int nc = (ndim - n0 > int'(NROWS)) ? NROWS : ndim - n0;
+      for (int i = 0; i < nc; i++) memory.mem[mem_word(S_BASE) + i] = 32'hdead_beef;
+      bus.put_word(R_A_ADDR,   H_BASE + 32'(n0 * 2));
+      bus.put_word(R_A_STRIDE, ndim * 2);
+      bus.put_word(R_P_ADDR,   P_BASE);
+      bus.put_word(R_C_ADDR,   O_BASE + 32'(n0 * mdim * 2));
+      bus.put_word(R_C_STRIDE, mdim * 2);
+      bus.put_word(R_S_ADDR,   S_BASE);
+      bus.put_word(R_LUT_ADDR, L_BASE);
+      bus.put_word(R_M_LEN,    mdim);
+      bus.put_word(R_N_ROWS,   nc);
+      bus.put_word(R_CTRL,     32'h283 | (relu ? 32'h10 : 0) | (lut ? 32'h60 : 0));
+      guard = 0;
+      forever begin
+        bus.get_word(R_STATUS, st);
+        if (!(st & 32'h1)) break;
+        if (++guard > 400000) begin
+          $display("FAIL: statistics job did not finish (status=0x%08x)", st);
+          errors++;
+          return;
+        end
+      end
+      for (int n = n0; n < n0 + nc; n++) begin
+        int mx = -32768, mn = 32767;
+        logic [31:0] sw;
+        for (int m = 0; m < mdim; m++) begin
+          int idx = n * mdim + m;
+          logic [31:0] w = memory.mem[mem_word(O_BASE) + (idx >> 1)];
+          int v = idx[0] ? int'($signed(w[31:16])) : int'($signed(w[15:0]));
+          if (v > mx) mx = v;
+          if (v < mn) mn = v;
+        end
+        sw = memory.mem[mem_word(S_BASE) + (n - n0)];
+        checks++;
+        if (int'($signed(sw[31:16])) !== mx || int'($signed(sw[15:0])) !== mn) begin
+          if (mismatches < 5)
+            $display("  FAIL row %0d: got {%0d,%0d} expected {%0d,%0d}", n,
+                     int'($signed(sw[31:16])), int'($signed(sw[15:0])), mx, mn);
+          mismatches++;
+        end
+      end
+    end
+    bus.put_word(R_S_ADDR, 0);
+    if (mismatches) begin
+      $display("  %0d rows wrong", mismatches);
+      errors += mismatches;
+    end else
+      $display("  ok, %0d rows", ndim);
+  endtask
+
   task automatic run_requant(input int ndim, input int mdim, input int sh_min = 33);
     int mismatches = 0;
     logic [31:0] st;
@@ -908,6 +979,11 @@ module student_gemm_tb;
     run_requant_a16(384, 82, 0);                     // 3 n-tiles of 128
     run_requant_a16(82, 384, 0);                     // 2 m-chunks
     run_requant_a16(20, 30, 1);
+    // output row statistics: LayerNorm's first job (3 tiles of 128 rows),
+    // with ReLU, with the table; then a plain job
+    run_requant_ostats(384, 82, 0, 0);
+    run_requant_ostats(82, 30, 1, 0);
+    run_requant_ostats(20, 30, 0, 1);
     // and a plain job afterwards must not use the table
     run_gemm(20, 64, 30);    run_requant_epi(20, 30, 1);
     stats_addr = 0;

@@ -200,6 +200,7 @@ dav2_tensor_t dav2_tensor_new(int n, int c)
     t.c = c;
     t.scale = XF_ONE;
     t.amax_q = -1;
+    t.rst = 0;
     t.v = (int16_t *)dav2_arena_alloc((size_t)n * (size_t)c * sizeof(int16_t));
     return t;
 }
@@ -489,6 +490,10 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
                        const dav2_qw_t *wt, const dav2_tensor_t *res, int relu,
                        int gelu, dav2_tensor_t *out)
 {
+    /* out->rst on entry asks for the output's row ranges (filled only when
+     * the requantisation job reports them); otherwise they are unknown */
+    uint32_t *rst_want = out->rst;
+    out->rst = 0;
     const int M = wt->m;
     const int N = cv ? ((cv->h + 2 * cv->pad - cv->k) / cv->stride + 1)
                      * ((cv->w + 2 * cv->pad - cv->k) / cv->stride + 1)
@@ -713,6 +718,12 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
         memset(&epi, 0, sizeof epi);
         epi.relu = relu;
         uint64_t gelu_cycles = 0;
+        /* the output's row ranges, when the caller asks (out->rst): one
+         * statistics word per row and chunk, combined below */
+        uint32_t *rst_chunks = 0;
+        const int n_chunks = (M + RQ_CHUNK - 1) / RQ_CHUNK;
+        if (rst_want && dav2_accel_ostats_ok())
+            rst_chunks = (uint32_t *)dav2_arena_alloc((size_t)n_chunks * N * sizeof(uint32_t));
         if (gelu && dav2_accel_lut_ok()) {
             /* GELU inside the job: the table for this result's scale goes
              * into the block's lookup-table RAM with the first chunk */
@@ -765,9 +776,11 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
         for (int m0 = 0; m0 < M && ok; m0 += RQ_CHUNK) {
             int mc = M - m0 < RQ_CHUNK ? M - m0 : RQ_CHUNK;
             PAR_UPTO(m0 + mc);                    /* overlaps the previous chunk */
+            epi.ostats = rst_chunks ? rst_chunks + (size_t)(m0 / RQ_CHUNK) * N : 0;
             uint64_t w0 = dav2_cycles();
             ok = dav2_accel_requant_rows_async(acc, N, M, m0, mc, par, dst, &rq_amax,
-                                               (epi.add || epi.relu || epi.lut) ? &epi : 0) != 0;
+                                               (epi.add || epi.relu || epi.lut || epi.ostats)
+                                               ? &epi : 0) != 0;
             epi.lut_load = 0;                     /* the block keeps the table */
             waited += dav2_cycles() - w0;         /* includes settling the previous */
         }
@@ -787,6 +800,18 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
             out->c = M;
             out->scale = fin_scale;
             out->amax_q = epi.lut ? -1 : rq_amax;
+            if (rst_chunks) {
+                for (int n = 0; n < N; n++) {
+                    int32_t mx = -32768, mn = 32767;
+                    for (int c = 0; c < n_chunks; c++) {
+                        uint32_t w = rst_chunks[(size_t)c * N + n];
+                        if ((int16_t)(w >> 16) > mx) mx = (int16_t)(w >> 16);
+                        if ((int16_t)(w & 0xffffu) < mn) mn = (int16_t)(w & 0xffffu);
+                    }
+                    rst_want[n] = ((uint32_t)(uint16_t)mx << 16) | (uint16_t)mn;
+                }
+                out->rst = rst_want;
+            }
             trace_tensor("qgemm", out);
             if (gelu && !epi.lut)
                 dav2_gelu(out);                   /* no lookup table: on the CPU */
@@ -1089,23 +1114,100 @@ static void layernorm_affine_cpu(const dav2_tensor_t *in, const int32_t *gq,
  * rows of N int16, out rows of M int16. On the accelerator when it has the
  * mode, otherwise the same arithmetic on the CPU. Returns the largest
  * |out|. */
-static int32_t requant16(const int16_t *in, int N, int M, const int32_t *par, int16_t *out)
+static int32_t requant16(const int16_t *in, int N, int M, const int32_t *par, int16_t *out,
+                         uint32_t *ostats)
 {
+    /* ostats, if given, receives each output row's {max, min}: from the
+     * block (CTRL.ostats), or found here */
     int32_t amax = -1;
-    if (dav2_accel_requant16(in, N, M, par, out, &amax))
+    if (dav2_accel_requant16(in, N, M, par, out, &amax, ostats))
         return amax;
+    if (ostats && dav2_accel_requant16(in, N, M, par, out, &amax, 0)) {
+        for (int n = 0; n < N; n++) {
+            const int16_t *orow = out + (size_t)n * M;
+            int32_t mx = orow[0], mn = orow[0];
+            for (int m = 1; m < M; m++) {
+                if (orow[m] > mx) mx = orow[m];
+                if (orow[m] < mn) mn = orow[m];
+            }
+            ostats[n] = ((uint32_t)(uint16_t)mx << 16) | (uint16_t)mn;
+        }
+        return amax;
+    }
     amax = 0;
     for (int n = 0; n < N; n++) {
         int16_t *orow = out + (size_t)n * M;
+        int32_t mx = -32768, mn = 32767;
         for (int m = 0; m < M; m++) {
             int32_t o = sat_act(apply_multiplier(in[(size_t)m * N + n], par[3 * m],
                                                  par[3 * m + 1]) + par[3 * m + 2]);
             orow[m] = (int16_t)o;
+            if (o > mx) mx = o;
+            if (o < mn) mn = o;
             if (o < 0) o = -o;
             if (o > amax) amax = o;
         }
+        if (ostats)
+            ostats[n] = ((uint32_t)(uint16_t)mx << 16) | (uint16_t)mn;
     }
     return amax;
+}
+
+/* A row's sum and sum of squares, and its extremes unless they are known
+ * (rst): x^2 in 32 bits, 64 at a time (activations are within
+ * +-DAV2_ACT_QMAX, and 64 * 8191^2 < 2^32). The loop without the extremes
+ * has no compare per value; a compare costs a taken branch (3 cycles)
+ * whenever the extreme does not change. */
+static inline void row_stats(const int16_t *row, int C, int wide, const uint32_t *rst,
+                             int32_t *sum_out, uint64_t *sq_out, int32_t *xmax_out,
+                             int32_t *xmin_out)
+{
+    int32_t sum = 0, xmax = -32768, xmin = 32767;
+    uint64_t sq = 0;
+    if (wide && rst) {
+        const uint32_t *rw = (const uint32_t *)row;
+        for (int c0 = 0; c0 < C / 2; c0 += 32) {
+            const int c1 = c0 + 32 < C / 2 ? c0 + 32 : C / 2;
+            uint32_t sq32 = 0;
+            #pragma GCC unroll 8
+            for (int c = c0; c < c1; c++) {
+                uint32_t x = rw[c];
+                int32_t d0 = lo16(x), d1 = hi16(x);
+                sum += d0 + d1;
+                sq32 += (uint32_t)(d0 * d0) + (uint32_t)(d1 * d1);
+            }
+            sq += sq32;
+        }
+        xmax = (int16_t)(*rst >> 16);
+        xmin = (int16_t)(*rst & 0xffffu);
+    } else if (wide) {
+        const uint32_t *rw = (const uint32_t *)row;
+        for (int c0 = 0; c0 < C / 2; c0 += 32) {
+            const int c1 = c0 + 32 < C / 2 ? c0 + 32 : C / 2;
+            uint32_t sq32 = 0;
+            #pragma GCC unroll 4
+            for (int c = c0; c < c1; c++) {
+                uint32_t x = rw[c];
+                int32_t d0 = lo16(x), d1 = hi16(x);
+                sum += d0 + d1;
+                sq32 += (uint32_t)(d0 * d0) + (uint32_t)(d1 * d1);
+                if (d0 > xmax) xmax = d0;
+                if (d0 < xmin) xmin = d0;
+                if (d1 > xmax) xmax = d1;
+                if (d1 < xmin) xmin = d1;
+            }
+            sq += sq32;
+        }
+    } else {
+        for (int c = 0; c < C; c++) {
+            int32_t d = (int32_t)row[c];
+            sum += d;
+            sq += (uint64_t)((int64_t)d * (int64_t)d);
+            if (d > xmax) xmax = d;
+            if (d < xmin) xmin = d;
+        }
+    }
+    *sum_out = sum; *sq_out = sq; *xmax_out = xmax; *xmin_out = xmin;
 }
 
 static void layernorm_affine(const dav2_tensor_t *in, const int32_t *gq,
@@ -1149,37 +1251,9 @@ static void layernorm_affine(const dav2_tensor_t *in, const int32_t *gq,
     dav2_xf_t zmax_all = XF_ZERO;
     for (int n = 0; n < N; n++) {
         const int16_t *row = in->v + (size_t)n * C;
-        int32_t sum = 0, xmax = -32768, xmin = 32767;
-        uint64_t sq = 0;
-        if (wide) {
-            /* x^2 in 32 bits, 64 at a time: activations are within
-             * +-DAV2_ACT_QMAX, and 64 * 8191^2 < 2^32 */
-            const uint32_t *rw = (const uint32_t *)row;
-            for (int c0 = 0; c0 < C / 2; c0 += 32) {
-                const int c1 = c0 + 32 < C / 2 ? c0 + 32 : C / 2;
-                uint32_t sq32 = 0;
-                #pragma GCC unroll 4
-                for (int c = c0; c < c1; c++) {
-                    uint32_t x = rw[c];
-                    int32_t d0 = lo16(x), d1 = hi16(x);
-                    sum += d0 + d1;
-                    sq32 += (uint32_t)(d0 * d0) + (uint32_t)(d1 * d1);
-                    if (d0 > xmax) xmax = d0;
-                    if (d0 < xmin) xmin = d0;
-                    if (d1 > xmax) xmax = d1;
-                    if (d1 < xmin) xmin = d1;
-                }
-                sq += sq32;
-            }
-        } else {
-            for (int c = 0; c < C; c++) {
-                int32_t d = (int32_t)row[c];
-                sum += d;
-                sq += (uint64_t)((int64_t)d * (int64_t)d);
-                if (d > xmax) xmax = d;
-                if (d < xmin) xmin = d;
-            }
-        }
+        int32_t sum, xmax, xmin;
+        uint64_t sq;
+        row_stats(row, C, wide, in->rst ? in->rst + n : 0, &sum, &sq, &xmax, &xmin);
         int64_t num = (int64_t)C * (int64_t)sq - (int64_t)sum * sum;  /* C^2 * var_q, exact */
         if (num < 0) num = 0;
         dav2_xf_t r = xf_rsqrt(xf_add(xf_mul(xf_from_int(num), inv_c2), eps_s2));
@@ -1205,7 +1279,9 @@ static void layernorm_affine(const dav2_tensor_t *in, const int32_t *gq,
         parn[3 * n + 2] = (int32_t)-xf_round(xf_mul(xf_norm(p[0], 16), k), 0);
     }
     SUB_LAP(DAV2_SUB_LN_STATS);
-    requant16(in->v, C, N, parn, zq);            /* rows n, C columns -> zq[c][n] */
+    /* rows n, C columns -> zq[c][n], and each channel's {max, min} */
+    uint32_t *zst = (uint32_t *)dav2_arena_alloc((size_t)C * sizeof(uint32_t));
+    requant16(in->v, C, N, parn, zq, zst);
 
     /* step 3: channel extremes of zq, the exact range of y in Q16, with
      * ZS = zs 2^32 (|zq g| < 2^33, ZS < 2^24: the product fits int64) */
@@ -1214,7 +1290,10 @@ static void layernorm_affine(const dav2_tensor_t *in, const int32_t *gq,
     for (int c = 0; c < C; c++) {
         const int16_t *zr = zq + (size_t)c * N;
         int32_t lo = 32767, hi = -32768;
-        if ((N & 1) == 0 && (((uintptr_t)zr) & 3u) == 0) {
+        if (zst) {
+            hi = (int16_t)(zst[c] >> 16);
+            lo = (int16_t)(zst[c] & 0xffffu);
+        } else if ((N & 1) == 0 && (((uintptr_t)zr) & 3u) == 0) {
             const uint32_t *zw = (const uint32_t *)zr;
             #pragma GCC unroll 4
             for (int n = 0; n < N / 2; n++) {
@@ -1262,7 +1341,7 @@ static void layernorm_affine(const dav2_tensor_t *in, const int32_t *gq,
         }
         parn[3 * c + 2] = sat_i32(shr_round64((int64_t)bq[c] * inv.m, inv.sh + 16));
     }
-    int32_t omax = requant16(zq, N, C, parn, out->v);   /* rows c, N columns -> out[n][c] */
+    int32_t omax = requant16(zq, N, C, parn, out->v, 0);   /* rows c, N columns -> out[n][c] */
     SUB_LAP(DAV2_SUB_LN_OUT);
     out->scale = out_scale;
     out->n = N;
@@ -1307,37 +1386,9 @@ static void layernorm_plain(const dav2_tensor_t *in, dav2_tensor_t *out)
     dav2_xf_t zmax_all = XF_ZERO;
     for (int n = 0; n < N; n++) {
         const int16_t *row = in->v + (size_t)n * C;
-        int32_t sum = 0, xmax = -32768, xmin = 32767;
-        uint64_t sq = 0;
-        if (wide) {
-            /* x^2 in 32 bits, 64 at a time: activations are within
-             * +-DAV2_ACT_QMAX, and 64 * 8191^2 < 2^32. No 64-bit multiply. */
-            const uint32_t *rw = (const uint32_t *)row;
-            for (int c0 = 0; c0 < C / 2; c0 += 32) {
-                const int c1 = c0 + 32 < C / 2 ? c0 + 32 : C / 2;
-                uint32_t sq32 = 0;
-                #pragma GCC unroll 4
-                for (int c = c0; c < c1; c++) {
-                    uint32_t x = rw[c];
-                    int32_t d0 = lo16(x), d1 = hi16(x);
-                    sum += d0 + d1;
-                    sq32 += (uint32_t)(d0 * d0) + (uint32_t)(d1 * d1);
-                    if (d0 > xmax) xmax = d0;
-                    if (d0 < xmin) xmin = d0;
-                    if (d1 > xmax) xmax = d1;
-                    if (d1 < xmin) xmin = d1;
-                }
-                sq += sq32;
-            }
-        } else {
-            for (int c = 0; c < C; c++) {
-                int32_t d = (int32_t)row[c];
-                sum += d;
-                sq += (uint64_t)((int64_t)d * (int64_t)d);
-                if (d > xmax) xmax = d;
-                if (d < xmin) xmin = d;
-            }
-        }
+        int32_t sum, xmax, xmin;
+        uint64_t sq;
+        row_stats(row, C, wide, in->rst ? in->rst + n : 0, &sum, &sq, &xmax, &xmin);
         int64_t num = (int64_t)C * (int64_t)sq - (int64_t)sum * sum;  /* C^2 * var_q, exact */
         if (num < 0) num = 0;
         dav2_xf_t r = xf_rsqrt(xf_add(xf_mul(xf_from_int(num), inv_c2), eps_s2));

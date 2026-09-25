@@ -204,8 +204,13 @@ the DSP multipliers are 25 × 18 bits, so a 16 × 16 product costs nothing
 extra. Attention uses it for q (scores) and v (context), which are int16
 activations and were split into two int8 halves before.
 
-`CAPS` bits 24, 25 and 26 announce the lookup table, the int16 input and
-the int16 weights. The
+With **`CTRL.ostats`** a requantisation job also writes each output row's
+largest and smallest value to `S_ADDR` after the output. The residual
+updates use it for the tokens' ranges and LayerNorm's first job for the
+channels' ranges, so LayerNorm needs no compare per value.
+
+`CAPS` bits 24 to 27 announce the lookup table, the int16 input, the int16
+weights and the row statistics. The
 driver uses them only when the bit is set and its boot self-test passes;
 otherwise the same arithmetic runs on the CPU.
 

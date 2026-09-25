@@ -1,4 +1,4 @@
-# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 2.4 s (estimated)
+# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 3.0 s (estimated)
 
 This is the record of the speed-up work: what was measured, what each change
 did, and what is left. Every step kept the FPGA output **bit-exact with the
@@ -786,6 +786,41 @@ Checks: `student_gemm_tb` has int16-weight GEMMs in attention's two shapes
 (K = 64 scores, K = 84 context with strided rows) and over two tiles:
 PASSED, 592,677 words checked. Bitstream: timing met, WNS +0.395 ns,
 WHS +0.041 ns; LUT 19.5 %, BRAM 56.6 %, DSP 20.4 %.
+
+### Round fourteen — row statistics from the requantisation job (hardware; estimated, not yet measured)
+
+| Change | Where | Tool (Mcycles per frame, CPU) |
+|---|---|---|
+| **Output row statistics** (`CTRL.ostats`): the job keeps each output row's largest and smallest final value in a 128-word LUT RAM and, after the output, writes one word per row to `S_ADDR` (max in bits 31:16). A new state `RQ_STATS`; CAPS bit 27, boot self-test. | `student_gemm.sv`, `dav2_accel.c` | — |
+| The residual updates (proj, fc2) ask for them, so x arrives at LayerNorm with each token's range (`dav2_tensor_t.rst`); LayerNorm's first job gives each channel's range the same way. LayerNorm's token pass then has no compare per value, and its channel pass is gone. The ranges are exact, so the output is the same as round thirteen's, bit for bit. | `dav2_ops.c`, `dav2_engine.c` | layernorm 31.6 → 16.6 |
+
+`student_gemm_tb`: statistics on LayerNorm's first-job shape (three
+tiles), with ReLU and with the table. PASSED, 593,163 words. Bitstream:
+timing met, WNS +0.264 ns (the critical path is in the DDR3 controller,
+not in `student_gemm`); LUT 19.5 %, BRAM 56.6 %, DSP 20.4 %.
+
+**The frame-time estimates of rounds ten to thirteen were too low.** They
+added about 15 Mcycles of accelerator waits to the CPU time, the value
+measured in round seven. But in round seven most of the accelerator's 68
+Mcycles ran while the CPU worked on the requantisation parameters (74
+Mcycles then); that CPU work is now 15 Mcycles, so the CPU waits more.
+`tools/cyclemodel/` now models the accelerator too: each stubbed job runs
+for a time from the block's design (per weight row K MAC cycles and the
+drain writes; requantisation one element per cycle or its bus words; 2.1
+cycles per bus word as measured), and the CPU waits for it where the
+driver would. Checked against the board: for the round-seven engine it
+gives 373 Mcycles (7.46 s) against 360 Mcycles (7.20 s) measured, 4 %
+high.
+
+| Engine | Model (Mcycles) | Model (s) | CPU waiting (Mcycles) |
+|---|---|---|---|
+| round seven | 373.2 | 7.46 | 38.8 |
+| round fourteen | 155.7 | 3.11 | 62.7 |
+
+So the current estimate is **about 3.0 s per frame** (3.11 s, less the
+model's 4 %). The accelerator is now the limit. Its modelled busy time is
+83 Mcycles: encoder GEMMs 34, convolution GEMMs 23, attention GEMMs 3.5,
+requantisation 23.
 
 ## 7. What is left, in order of expected gain
 

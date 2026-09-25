@@ -123,7 +123,12 @@ typedef struct {
      * kept for later jobs. */
     const int16_t *lut;
     int            lut_load;
+    /* CTRL.ostats: each output row n's {max, min} of this job's columns,
+     * as one word (max in bits 31:16), at ostats[n]. */
+    uint32_t      *ostats;
 } dav2_rq_epi_t;
+/* Non-zero if the block writes output row statistics (CAPS bit 27). */
+int dav2_accel_ostats_ok(void);
 /* Non-zero if the block has the lookup table (CAPS bit 24) and its boot
  * self-test passed. */
 int dav2_accel_lut_ok(void);
@@ -144,7 +149,7 @@ int dav2_accel_gemm16_async(const int16_t *a, uint32_t a_stride,
 int dav2_accel_requant_stride(const int32_t *acc, int N, int M, const int32_t *params,
                               int16_t *out, int out_stride, int32_t *amax);
 int dav2_accel_requant16(const int16_t *in, int N, int M, const int32_t *params,
-                         int16_t *out, int32_t *amax);
+                         int16_t *out, int32_t *amax, uint32_t *ostats);
 
 int dav2_accel_requant_rows_async(const int32_t *acc, int N, int M, int m0, int mc,
                                   const int32_t *params, int16_t *out, int32_t *amax,

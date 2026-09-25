@@ -92,6 +92,11 @@ typedef struct {
     dav2_xf_t  scale;
     int        n, c;
     int32_t    amax_q;
+    /* Each row's largest and smallest value, one word per row (max in bits
+     * 31:16, min in bits 15:0), or NULL when unknown. Set by the residual
+     * updates from the requantisation job's row statistics (CTRL.ostats);
+     * LayerNorm uses them instead of finding the extremes itself. */
+    uint32_t  *rst;
 } dav2_tensor_t;
 
 /* ------------------------------------------------------------- blob access */

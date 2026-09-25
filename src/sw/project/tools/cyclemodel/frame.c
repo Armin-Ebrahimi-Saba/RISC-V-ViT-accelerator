@@ -45,45 +45,93 @@ char *strcat(char *d, const char *s) { strcpy(d + strlen(d), s); return d; }
 int puts(const char *s) { (void)s; return 0; }
 int putchar(int c) { return c; }
 
-/* accelerator stubs: every job "completes" at once without computing */
+/* Accelerator model. A job starts when the previous one has finished (the
+ * driver settles a pending job before it starts the next, so the CPU waits
+ * for it) and then runs for an estimated time while the CPU continues; a
+ * finish call waits until that time. MMIO[6] adds cycles to the CPU clock.
+ * Job times from the block's design, with 2.1 cycles per bus word as
+ * measured on the board (boot report, "cycles/beat"):
+ *   GEMM, per tile of nt <= 128 rows: A tile nt*K/2 words, then per weight
+ *        row K MAC cycles (one weight per cycle) and nt + 2 drain writes.
+ *   requantisation: parameters 3*M words, input N*M words (int16: half),
+ *        output one element per cycle, N*M/2 words written. */
+#define BEAT 21                         /* tenths of a cycle per bus word */
+static uint64_t busy_until;
+static uint64_t acc_time[8];            /* modelled job time by kind, reported at the end */
+enum { K_GEMM_ENC, K_GEMM_CONV, K_ATT, K_RQ, K_RQ_ADD, K_RQ16, K_RQ_CTX, K_N };
+static void wait_done(void)
+{
+    uint64_t now = dav2_cycles();
+    if (busy_until > now) MMIO[6] = (uint32_t)(busy_until - now);
+}
+static int job_kind;
+static void start_job(uint64_t cyc)
+{
+    acc_time[job_kind] += cyc;
+    wait_done();
+    busy_until = dav2_cycles() + cyc;
+}
+static uint64_t gemm_cycles(int N, int K, int M)
+{
+    uint64_t c = 0;
+    for (int n0 = 0; n0 < N; n0 += 128) {
+        int nt = N - n0 < 128 ? N - n0 : 128;
+        c += (uint64_t)nt * K / 2 * BEAT / 10;
+        c += (uint64_t)M * (K + (uint64_t)(nt + 2) * BEAT / 10);
+    }
+    return c;
+}
+static uint64_t requant_cycles(int N, int M, int in16, int add)
+{
+    uint64_t e = (uint64_t)N * M;
+    uint64_t tiles = (uint64_t)(N + 127) / 128;
+    uint64_t words = 3u * M * tiles + (in16 ? e / 2 : e) + (add ? e / 2 : 0);
+    uint64_t out = e > e / 2 * BEAT / 10 ? e : e / 2 * BEAT / 10;
+    return words * BEAT / 10 + out;
+}
 static int32_t stats_buf[2 * 4096];
 int dav2_accel_qgemm_async(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc,
                            dav2_accel_stats_t *st)
-{ (void)a; (void)acc; st->v = stats_buf; st->tiles = 1; (void)wt; return 1; }
+{ (void)acc; job_kind = K_GEMM_ENC; start_job(gemm_cycles(a->n, a->c, wt->m));
+  st->v = stats_buf; st->tiles = 1; return 2; }
 int dav2_accel_conv_async(const int16_t *img, int h, int w, int C, int k, int stride,
                           int pad, const int8_t *wt, int M, int32_t *acc, dav2_accel_stats_t *st)
-{ (void)img;(void)h;(void)w;(void)C;(void)k;(void)stride;(void)pad;(void)wt;(void)M;(void)acc;
-  st->v = stats_buf; st->tiles = 1; return 1; }
+{ (void)img;(void)wt;(void)acc;
+  int oh = (h + 2 * pad - k) / stride + 1, ow = (w + 2 * pad - k) / stride + 1;
+  job_kind = K_GEMM_CONV; start_job(gemm_cycles(oh * ow, k * k * C, M));
+  st->v = stats_buf; st->tiles = 1; return 2; }
 int dav2_accel_gemm_raw_async(const int16_t *a, uint32_t as, const int8_t *w, uint32_t ws,
                               int32_t *acc, int N, int K, int M)
-{ (void)a;(void)as;(void)w;(void)ws;(void)acc;(void)N;(void)K;(void)M; return 1; }
+{ (void)a;(void)as;(void)w;(void)ws;(void)acc; job_kind = K_ATT; start_job(gemm_cycles(N, K, M)); return 2; }
 int dav2_accel_requant_rows_async(const int32_t *acc, int N, int M, int m0, int mc,
                                   const int32_t *par, int16_t *dst, int32_t *amax,
                                   const dav2_rq_epi_t *epi)
-{ (void)acc;(void)N;(void)M;(void)m0;(void)mc;(void)par;(void)dst;(void)epi; *amax = 8000; return 1; }
-/* synchronous requantisation: the CPU waits for the job. Charged as
- * 1.5 bus beats per element at 2 cycles per beat (MMIO[6] adds cycles). */
+{ (void)acc;(void)M;(void)m0;(void)par;(void)dst;
+  job_kind = (epi && epi->add) ? K_RQ_ADD : K_RQ;
+  start_job(requant_cycles(N, mc, 0, epi && epi->add)); *amax = 8000; return 2; }
 int dav2_accel_requant(const int32_t *acc, int N, int M, const int32_t *params,
                        int16_t *out, int32_t *amax_out)
-{ (void)acc;(void)params;(void)out; MMIO[6] = (uint32_t)(3 * N * M); *amax_out = 8000; return 1; }
-int dav2_accel_finish(void) { return 1; }
-int dav2_accel_lut_ok(void) { return 1; }   /* GELU in the requantisation job */
-/* int16-weight GEMM (attention): instant, rows' statistics left as they are;
- * strided requantisation (the context): 1.5 beats per element, 2 cycles each */
+{ (void)acc;(void)params;(void)out; job_kind = K_RQ; start_job(requant_cycles(N, M, 0, 0)); wait_done();
+  *amax_out = 8000; return 1; }
+int dav2_accel_finish(void) { wait_done(); return 1; }
+int dav2_accel_busy(void) { return dav2_cycles() < busy_until; }
+int dav2_accel_lut_ok(void) { return 1; }
 int dav2_accel_w16_ok(void) { return 1; }
 int dav2_accel_present(void) { return 1; }
 int dav2_accel_gemm16_async(const int16_t *a, uint32_t as, const int16_t *w, uint32_t ws,
                             int32_t *acc, int N, int K, int M, int32_t *st)
-{ (void)a;(void)as;(void)w;(void)ws;(void)acc;(void)N;(void)K;(void)M;(void)st; return 1; }
+{ (void)a;(void)as;(void)w;(void)ws;(void)acc;(void)st; job_kind = K_ATT; start_job(gemm_cycles(N, K, M)); return 2; }
 int dav2_accel_requant_stride(const int32_t *acc, int N, int M, const int32_t *params,
                               int16_t *out, int out_stride, int32_t *amax)
-{ (void)acc;(void)params;(void)out;(void)out_stride; MMIO[6] = (uint32_t)(3 * N * M); *amax = 8000; return 1; }
-/* int16-input requantisation (LayerNorm): N*M/2 words in and out, charged
- * at 2 cycles per beat */
+{ (void)acc;(void)params;(void)out;(void)out_stride;
+  job_kind = K_RQ_CTX; start_job(requant_cycles(N, M, 0, 0)); wait_done(); *amax = 8000; return 1; }
 int dav2_accel_requant16(const int16_t *in, int N, int M, const int32_t *params,
-                         int16_t *out, int32_t *amax)
-{ (void)in;(void)params;(void)out; MMIO[6] = (uint32_t)(2 * N * M); *amax = 8000; return 1; }
-int dav2_accel_busy(void) { return 0; }
+                         int16_t *out, int32_t *amax, uint32_t *ostats)
+{ (void)in;(void)params;(void)out;
+  if (ostats) for (int n = 0; n < N; n++) ostats[n] = (8000u << 16) | (uint16_t)-8000;
+  job_kind = K_RQ16; start_job(requant_cycles(N, M, 1, 0) + (ostats ? (uint64_t)N * BEAT / 10 : 0)); wait_done();
+  *amax = 8000; return 1; }
+int dav2_accel_ostats_ok(void) { return 1; }
 
 
 #define DDR ((uint8_t *)0x80000000u)
@@ -102,7 +150,9 @@ int main(void)
     mark(1);
     dav2_infer(&cfg, depth, &sc);
     mark(0);
+    wait_done();
     for (int b = 0; b < DAV2_PROF_N; b++) { MMIO[3] = (uint32_t)b; MMIO[4] = (uint32_t)dav2_prof_get(b); }
+    for (int k = 0; k < K_N; k++) { MMIO[3] = (uint32_t)(100 + k); MMIO[4] = (uint32_t)acc_time[k]; }
     mark(0xdead);
     for (;;) ;
 }
