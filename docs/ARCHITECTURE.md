@@ -216,9 +216,17 @@ A **result RAM** of 131,072 words (**`CTRL.onchip`**) keeps a GEMM's int32
 result on chip: the drain writes it there instead of to DDR3, and the next
 requantisation job reads it from there. The encoder's results fit (82
 tokens); this removes two of the two and a half bus words per output.
+Single-chunk convolutions with N·M ≤ 131,072 use it as well.
 
-`CAPS` bits 24 to 28 announce the lookup table, the int16 input, the int16
-weights, the row statistics and the result RAM. The
+**Tap reuse** (**`CTRL.greuse`**) shortens a gather's A load. With stride 1
+and all k·k kernel positions in one job, a pixel's taps kx = 0..k−2 are
+the taps kx+1 of the pixel to its left. When that pixel is the previous
+tile row, the writer copies these words from it inside the block, one per
+cycle, and only the new column is read from DDR3. A 128-word FIFO lets
+those reads continue while the writer copies.
+
+`CAPS` bits 24 to 29 announce the lookup table, the int16 input, the int16
+weights, the row statistics, the result RAM and tap reuse. The
 driver uses them only when the bit is set and its boot self-test passes;
 otherwise the same arithmetic runs on the CPU.
 

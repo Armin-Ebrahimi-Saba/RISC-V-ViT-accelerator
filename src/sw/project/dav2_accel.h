@@ -138,6 +138,12 @@ typedef struct {
 int dav2_accel_onchip_ok(void);
 int dav2_accel_qgemm_onchip_async(const dav2_tensor_t *a, const dav2_qw_t *wt,
                                   dav2_accel_stats_t *st);
+/* A convolution (as dav2_accel_conv_async) whose result stays in the
+ * result RAM: acc[m][n] at word m*N + n. Only when all k*k positions fit one
+ * job and N*M <= DAV2_ACCEL_CR_WORDS; the statistics come back in st.
+ * 0 when not possible. */
+int dav2_accel_conv_onchip_async(const int16_t *img, int h, int w, int C, int k, int stride,
+                                 int pad, const int8_t *wt, int M, dav2_accel_stats_t *st);
 /* Non-zero if the block writes output row statistics (CAPS bit 27). */
 int dav2_accel_ostats_ok(void);
 /* Non-zero if the block has the lookup table (CAPS bit 24) and its boot

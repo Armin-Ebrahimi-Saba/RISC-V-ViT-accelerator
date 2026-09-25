@@ -385,10 +385,12 @@ module student_gemm_tb;
     int ndim = oh * ow;
     int kfull = k * k * C;
     int mismatches = 0;
-    logic [31:0] st;
+    logic [31:0] st, cyc;
+    longint total_cyc = 0;
     int guard;
-    $display("--- CONV %0dx%0dx%0d k=%0d s=%0d p=%0d -> %0dx%0d, M=%0d, K=%0d in chunks of %0d positions",
-             h, w, C, k, stride, pad, oh, ow, mdim, kfull, kchunk);
+    $display("--- CONV %0dx%0dx%0d k=%0d s=%0d p=%0d -> %0dx%0d, M=%0d, K=%0d in chunks of %0d positions%s",
+             h, w, C, k, stride, pad, oh, ow, mdim, kfull, kchunk,
+             (ctrl_extra & 32'h800) ? ", tap reuse" : "");
 
     // image and weights
     for (int i = 0; i < h*w*C/2; i++)
@@ -421,7 +423,7 @@ module student_gemm_tb;
         bus.put_word(R_K_LEN,    pc * C);
         bus.put_word(R_M_LEN,    mdim);
         bus.put_word(R_N_ROWS,   nt);
-        bus.put_word(R_CTRL,     32'h5);      // start | gather
+        bus.put_word(R_CTRL,     32'h5 | ctrl_extra);      // start | gather
         guard = 0;
         forever begin
           bus.get_word(R_STATUS, st);
@@ -432,6 +434,8 @@ module student_gemm_tb;
             return;
           end
         end
+        bus.get_word(R_CYCLES, cyc);
+        total_cyc += cyc;
       end
       if (p0 != 0)
         for (int i = 0; i < mdim * ndim; i++)
@@ -468,7 +472,7 @@ module student_gemm_tb;
       $display("  %0d/%0d words wrong", mismatches, mdim * ndim);
       errors += mismatches;
     end else
-      $display("  ok, %0d words", mdim * ndim);
+      $display("  ok, %0d words, %0d cycles", mdim * ndim, total_cyc);
   endtask
 
   // apply_multiplier as the C code does it: (v*mult + 2^(sh-1)) >> sh
@@ -1087,6 +1091,20 @@ module student_gemm_tb;
     run_conv(9, 9, 384, 3, 2, 1, 6, 5);        // K=3456 split 5+4 positions
     run_conv(10, 7, 16, 3, 1, 1, 4, 9);        // non-square, N=70
     run_conv(12, 12, 16, 3, 1, 1, 4, 9);       // N=144: a full 128-row tile + 16
+    // The same with tap reuse (CTRL.greuse): the block must ignore it for
+    // stride 2 and for split kernels, and give the same result otherwise.
+    ctrl_extra = 32'h800;
+    run_conv(9, 9, 64, 3, 1, 1, 12, 9);
+    run_conv(9, 9, 32, 3, 2, 1, 8, 9);         // stride 2: no reuse
+    run_conv(9, 9, 384, 3, 2, 1, 6, 5);        // split: no reuse
+    run_conv(10, 7, 16, 3, 1, 1, 4, 9);
+    run_conv(12, 12, 16, 3, 1, 1, 4, 9);       // tiles start inside a row
+    run_conv(20, 20, 32, 3, 1, 1, 8, 9);       // N=400, four tiles
+    run_conv(11, 13, 8, 5, 1, 2, 4, 25);       // k=5, pad 2
+    run_conv(8, 9, 12, 2, 1, 0, 4, 4);         // k=2, no padding
+    run_conv(9, 9, 16, 1, 1, 0, 4, 1);         // k=1: nothing to reuse
+    ctrl_extra = 32'h0;
+    run_conv(20, 20, 32, 3, 1, 1, 8, 9);       // the same shape without reuse, for the cycles
 
     if (x_errors) begin
       $display("X on the host A channel in %0d cycles", x_errors);

@@ -532,17 +532,26 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
      * m+1.. are still being computed. Profile: "gemm (accelerator)" counts
      * only the time the CPU actually waits for the block. */
     uint64_t t_start = dav2_cycles(), waited = 0;
-    int use_onchip = !cv && !qgemm_no_onchip && dav2_accel_onchip_ok()
-                  && (M & 1) == 0 && N <= 128 && (long)N * M <= DAV2_ACCEL_CR_WORDS
+    /* a convolution's tiles all drain into the result RAM (C_ADDR = n0) */
+    int use_onchip = !qgemm_no_onchip && dav2_accel_onchip_ok()
+                  && (M & 1) == 0 && (cv || N <= 128) && (long)N * M <= DAV2_ACCEL_CR_WORDS
                   && (!res || (res->n == N && res->c == M && (((uintptr_t)res->v) & 3u) == 0));
     dav2_accel_stats_t st;
-    int run;
-    if (cv && (run = dav2_accel_conv_async(a->v, cv->h, cv->w, a->c, cv->k, cv->stride,
-                                           cv->pad, wt->w, M, acc, &st)) != 0) {
+    int run = 0;
+    if (cv && use_onchip)
+        run = dav2_accel_conv_onchip_async(a->v, cv->h, cv->w, a->c, cv->k, cv->stride,
+                                           cv->pad, wt->w, M, &st);
+    if (cv && !run) {
+        use_onchip = 0;
+        run = dav2_accel_conv_async(a->v, cv->h, cv->w, a->c, cv->k, cv->stride,
+                                    cv->pad, wt->w, M, acc, &st);
+    }
+    if (cv && run) {
         /* the block gathers the patches itself: no im2col matrix */
     } else {
         dav2_tensor_t cols = *a;
         if (cv) {
+            use_onchip = 0;                   /* the im2col GEMM keeps acc in DDR3 */
             cols = dav2_tensor_new(N, K);
             if (!cols.v) { dav2_arena_release(mark); return; }
             dav2_im2col(a, cv->h, cv->w, cv->k, cv->k, cv->stride, cv->pad, &cols);

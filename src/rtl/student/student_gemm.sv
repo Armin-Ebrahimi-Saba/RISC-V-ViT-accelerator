@@ -154,7 +154,7 @@ module student_gemm #(
   logic [31:0] cycles_q;        // cycle counter, running while busy_q, for CYCLES
 
   assign hw2reg.status.d = {err_q, done_q, busy_q};        // STATUS register readback
-  assign hw2reg.caps.d   = {8'd31, 16'(KMAX), 8'(NROWS)};   // CAPS: what this instance supports
+  assign hw2reg.caps.d   = {8'd63, 16'(KMAX), 8'(NROWS)};   // CAPS: what this instance supports
   assign hw2reg.cycles.d = cycles_q;                       // CYCLES register readback
 
   logic start_strobe, start_requant, start_gather;
@@ -164,7 +164,9 @@ module student_gemm #(
   // Which job to run: 1 = requantisation, 0 = a plain GEMM tile. Only
   // meaningful the same cycle as start_strobe, so it is latched below.
   assign start_requant = reg2hw.ctrl.requant.q;   // sampled with start
-  assign start_gather  = reg2hw.ctrl.gather.q;    // GEMM job: A tile via the gather walkers
+  assign start_gather  = reg2hw.ctrl.gather.q;
+  logic start_greuse;
+  assign start_greuse  = reg2hw.ctrl.greuse.q;    // gather: reuse the left taps    // GEMM job: A tile via the gather walkers
   logic start_add, start_relu;
   assign start_add     = reg2hw.ctrl.add.q;       // requant job: add a residual
   assign start_relu    = reg2hw.ctrl.relu.q;      // requant job: clamp the output at 0
@@ -218,6 +220,8 @@ module student_gemm #(
   logic [3:0]     g_k_q, g_stride_q, g_pad_q, g_ky0_q, g_kx0_q;
   logic [7:0]     g_kpos_q;
   logic [15:0]    g_cwords;                  // beats per kernel position
+  logic           greuse_q;                  // CTRL.greuse, sampled at start
+  logic           g_reuse_ok;                // tap reuse applies to this job
   logic           gw_inb;                    // writer: current position in bounds
   logic           gi_handover;               // issuer: a run is ready for the read engine
   logic [31:0]    gi_addr_q;                 // its address
@@ -485,14 +489,70 @@ module student_gemm #(
   // zero when the gather walker is over an out-of-bounds kernel position.
   logic        ld_valid;
   logic [31:0] ld_data;
-  assign ld_valid = gather_q ? (gw_inb ? rd_valid : 1'b1) : rd_valid;
-  assign ld_data  = (gather_q & ~gw_inb) ? 32'd0 : rd_data;
+  // Gather: a word comes from the bus (through the FIFO gf_*) for an
+  // in-bounds position the issuer read, is a zero for an out-of-bounds one,
+  // and is a copy from the previous tile row for a reused one (gw_reuse).
+  logic        gw_reuse, gw_bus;
+  logic        gf_valid, gf_full, gf_push, gf_pop;
+  logic [31:0] gf_data;
+  assign gw_bus   = gw_inb & ~gw_reuse;
+  assign ld_valid = gather_q ? (gw_bus ? gf_valid : 1'b1) : rd_valid;
+  assign ld_data  = gather_q ? (gw_bus ? gf_data : 32'd0) : rd_data;
 
-  assign a_wr_data = (onchip_q && state_q == RQ_LOAD_ACC) ? cr_rdata_q : ld_data;
+  // Gather read FIFO: the reorder buffer drains into it whenever it has
+  // room, so reads for new taps continue while the writer copies.
+  localparam int unsigned GFD = 128;
+  localparam int unsigned GFA = $clog2(GFD);
+  (* ram_style = "distributed" *) logic [31:0] gf_mem [GFD];
+  logic [GFA-1:0] gf_wp_q, gf_rp_q;
+  logic [GFA:0]   gf_cnt_q;
+  assign gf_valid = gf_cnt_q != '0;
+  assign gf_full  = gf_cnt_q == (GFA+1)'(GFD);
+  assign gf_data  = gf_mem[gf_rp_q];
+  assign gf_push  = (state_q == ST_LOAD_A) & gather_q & rd_valid & ~gf_full;
+  assign gf_pop   = (state_q == ST_LOAD_A) & gather_q & gw_bus & gf_valid;
+  always_ff @(posedge clk_i) begin
+    if (gf_push) gf_mem[gf_wp_q] <= rd_data;
+  end
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      gf_wp_q <= '0; gf_rp_q <= '0; gf_cnt_q <= '0;
+    end else if (state_q == ST_IDLE) begin
+      gf_wp_q <= '0; gf_rp_q <= '0; gf_cnt_q <= '0;
+    end else begin
+      if (gf_push) gf_wp_q <= gf_wp_q + 1'b1;
+      if (gf_pop)  gf_rp_q <= gf_rp_q + 1'b1;
+      gf_cnt_q <= gf_cnt_q + (gf_push ? 1'b1 : 1'b0) - (gf_pop ? 1'b1 : 1'b0);
+    end
+  end
+
+  // Gather writes one cycle late (stage g1): a copy reads word
+  // a_ld_word_q + C/2 of every row this cycle (a_rd_addr), and row t-1's
+  // word is in a_q the next.
+  logic           g1_we_q, g1_copy_q;
+  logic [RW-1:0]  g1_row_q;
+  logic [AW-1:0]  g1_addr_q;
+  logic [31:0]    g1_data_q;
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) g1_we_q <= 1'b0;
+    else         g1_we_q <= (state_q == ST_LOAD_A) & gather_q & ld_valid;
+  end
+  always_ff @(posedge clk_i) begin
+    g1_copy_q <= gw_reuse;
+    g1_row_q  <= a_ld_row_q[RW-1:0];
+    g1_addr_q <= a_ld_word_q;
+    g1_data_q <= ld_data;
+  end
+  logic [31:0] g1_prev;                  // row t-1's word, for a copy
+  assign g1_prev = a_q[RW'(g1_row_q - 1'b1)];
+
+  assign a_wr_data = (onchip_q && state_q == RQ_LOAD_ACC) ? cr_rdata_q
+                   : g1_we_q ? (g1_copy_q ? g1_prev : g1_data_q) : ld_data;
   always_comb begin
     a_we      = '0;
-    a_wr_addr = a_ld_word_q;
-    if ((state_q == ST_LOAD_A) && ld_valid) a_we[a_ld_row_q[RW-1:0]] = 1'b1;
+    a_wr_addr = g1_we_q ? g1_addr_q : a_ld_word_q;
+    if ((state_q == ST_LOAD_A) && ld_valid && !gather_q) a_we[a_ld_row_q[RW-1:0]] = 1'b1;
+    if (g1_we_q) a_we[g1_row_q] = 1'b1;
     if (state_q == RQ_LOAD_ACC) begin
       a_wr_addr = rq_m_q;
       if (acc_valid) begin
@@ -530,8 +590,9 @@ module student_gemm #(
   // cycle after (rq_xcyc_q); no element enters on that second cycle.
   logic          rq_xcyc_q;
   logic [AW-1:0] rq_xaddr_q;
-  assign a_rd_addr = (state_q == RQ_OUT) ? (rq_xcyc_q ? rq_xaddr_q : rq_m_q)
-                                         : AW'(kcnt_q >> 1);
+  assign a_rd_addr = (state_q == RQ_OUT)    ? (rq_xcyc_q ? rq_xaddr_q : rq_m_q)
+                   : (state_q == ST_LOAD_A) ? a_ld_word_q + AW'(g_cwords)   // gather copy source
+                                            : AW'(kcnt_q >> 1);
 
   // When to consume the next word from the read stream (rd_pop -> rb_rd_q
   // advances): every load phase takes one word at a time as it arrives;
@@ -539,7 +600,7 @@ module student_gemm #(
   always_comb begin
     rd_pop = 1'b0;
     if (state_q == ST_LOAD_A) begin
-      rd_pop = rd_valid & (gather_q ? gw_inb : 1'b1);
+      rd_pop = gather_q ? gf_push : rd_valid;
     end else if (state_q == RQ_LOAD_P || state_q == RQ_LOAD_ACC || state_q == RQ_LOAD_X
                  || state_q == RQ_LOAD_L) begin
       rd_pop = rd_valid;
@@ -728,6 +789,7 @@ module student_gemm #(
       w16_q <= 1'b0;
       ostats_q <= 1'b0;
       onchip_q <= 1'b0;
+      greuse_q <= 1'b0;
       // rq_m_q, rq_p_cnt_q and lut_cnt_q have no reset: they address block
       // RAMs (an asynchronous reset there is DRC REQP-1840), and every job
       // sets them before use.
@@ -845,6 +907,7 @@ module student_gemm #(
             w16_q      <= start_w16 & ~start_requant;
             ostats_q   <= start_ostats & start_requant;
             onchip_q   <= start_onchip;
+            greuse_q   <= start_greuse & start_gather & ~start_requant;
             p_addr_q   <= reg2hw.p_addr.q;
             lut_cnt_q  <= '0;
             x_addr_q   <= reg2hw.x_addr.q;
@@ -1115,6 +1178,12 @@ module student_gemm #(
   // Products oy*stride and ox*stride are kept incrementally.
 
   assign g_cwords = g_c_q >> 1;
+  // Reuse needs stride 1 and one chunk holding all k*k positions from
+  // (0, 0); then tile row t's tap (ky, kx) is row t-1's (ky, kx+1),
+  // zeros included, whenever both pixels are on one output row.
+  assign g_reuse_ok = greuse_q & (g_stride_q == 4'd1) & (g_k_q >= 4'd2)
+                    & (g_ky0_q == '0) & (g_kx0_q == '0)
+                    & (g_kpos_q == 8'(g_k_q) * 8'(g_k_q));
 
   // ---- issuer
   typedef enum logic [1:0] { GI_IDLE, GI_SCAN, GI_CALC, GI_LOAD } gi_e;
@@ -1140,7 +1209,10 @@ module student_gemm #(
   assign gi_handover = (gi_q == GI_LOAD) & (rd_left_q == 32'd0) & (state_q == ST_LOAD_A);
   // Advance one kernel position: after skipping an out-of-bounds one, or
   // after handing an in-bounds one over.
-  assign gi_step = ((gi_q == GI_SCAN) & ~gi_inb) | gi_handover;
+  logic gi_reuse;   // this position is copied by the writer, not read
+  assign gi_reuse = g_reuse_ok & (gi_t_q != '0) & (gi_ox_q != '0)
+                  & (gi_kx_q != g_k_q - 1'b1);
+  assign gi_step = ((gi_q == GI_SCAN) & (~gi_inb | gi_reuse)) | gi_handover;
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
@@ -1158,7 +1230,7 @@ module student_gemm #(
       gi_kx_q  <= reg2hw.g_conv.q[19:16];
       gi_pos_q <= '0;
     end else begin
-      if (gi_q == GI_SCAN && gi_inb) gi_q <= GI_CALC;
+      if (gi_q == GI_SCAN && gi_inb && !gi_reuse) gi_q <= GI_CALC;
       if (gi_q == GI_CALC)           gi_q <= GI_LOAD;
       if (gi_step) begin
         gi_q <= GI_SCAN;
@@ -1213,6 +1285,8 @@ module student_gemm #(
   assign gw_ix  = $signed({2'b0, gw_oxs_q}) + $signed({14'b0, gw_kx_q}) - $signed({14'b0, g_pad_q});
   assign gw_inb = (gw_iy >= 0) & (gw_iy < $signed({2'b0, g_h_q}))
                 & (gw_ix >= 0) & (gw_ix < $signed({2'b0, g_w_q}));
+  assign gw_reuse = g_reuse_ok & (gw_t_q != '0) & (gw_ox_q != '0)
+                  & (gw_kx_q != g_k_q - 1'b1);
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin

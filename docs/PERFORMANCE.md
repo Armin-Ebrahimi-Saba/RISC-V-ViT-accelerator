@@ -1,4 +1,4 @@
-# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 2.47 s (estimated)
+# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 2.35 s (estimated)
 
 This is the record of the speed-up work: what was measured, what each change
 did, and what is left. Every step kept the FPGA output **bit-exact with the
@@ -906,6 +906,42 @@ synthesis copy the register; the worst `sys_clk` path then has +1.67 ns.
 
 Model: 142.6 → 128.4 Mcycles per frame, **about 2.47 s** (2.57 s, less
 the model's 4 %).
+
+### Round seventeen — convolutions: tap reuse and the result RAM (hardware; estimated, not yet measured)
+
+The convolution GEMMs were the largest accelerator item (19.5 Mcycles in
+the model), and 13.4 Mcycles of that was loading the gathered A tile: each
+output pixel reads its k·k·C/2 patch words over the bus at 2.1 cycles per
+word. The largest ones are the head's 3 × 3 convolutions with few output
+channels (126 × 126 × 32 → 32: 4.8 of 6.5 Mcycles in the A load).
+
+| Change | Where | Model (Mcycles per frame) |
+|---|---|---|
+| **Tap reuse** (`CTRL.greuse`, CAPS bit 29). With stride 1 and all k·k positions in one job, a pixel's taps kx = 0..k−2 are its left neighbour's taps kx+1, zeros included. When the neighbour is the previous tile row, the gather writer copies these words from that row through the tile RAM's read port (source word = destination word + C/2), one per cycle, and the issuer does not read them. The gather writes pass one register stage (the copy's read takes a cycle); a 128-word FIFO between the reorder buffer and the writer lets the reads of the new column run ahead while the writer copies. For k = 3 a pixel costs K/2 cycles instead of 1.05 K. | `student_gemm.sv` | accelerator GEMM (convolutions) 18.4 → 11.8 |
+| **Convolutions into the result RAM**: a single-chunk convolution with N·M ≤ 131,072 drains every tile into the RAM (C_ADDR = n0, C_STRIDE = N, in words); the requantisation job already read chunks of N > 128 from it. Most of the DPT head's convolutions fit; the two largest (72 × 72 and 126 × 126) do not. | `dav2_accel.c`, `dav2_ops.c` | convolutions 19.5 → 18.4, requantisation 7.9 → 7.1 |
+
+`int run;` in `qgemm_impl` (round sixteen) was read uninitialised for a
+plain GEMM that does not use the result RAM. It is now 0.
+
+The boot self-test runs the gather test twice: without tap reuse, then
+with it ("tap-reuse self-test ok"); a mismatch turns reuse off. The
+emulator accepts `CTRL.greuse` and checks that no job reaches past the
+result RAM. Same output as before, bit for bit (11 images); bus errors
+injected into jobs 20 to 23, 40, 41, 300, 700, 1000 and 1250 all end with
+the correct output. `student_gemm_tb`: every convolution again with reuse,
+plus k = 5, k = 2, k = 1, four tiles of a 20 × 20 image and tiles that
+start inside an output row; with stride 2 or a split kernel the block
+ignores the bit. PASSED, 653,861 words. The 20 × 20 × 32 → 8 convolution
+takes 67,181 cycles instead of 106,455 in the testbench, whose memory is
+faster than DDR3. Bitstream: timing met, WNS +0.303 ns (DDR3 controller),
+worst `sys_clk` path +1.49 ns, WHS +0.024 ns; LUT 25.9 % (+3,000 for the
+copy multiplexer and the FIFO), BRAM 91.6 %, DSP 37.7 %.
+
+The model's stub for convolutions had let the small ones use the result
+RAM before the driver did; without that, round sixteen is 128.7 Mcycles,
+not 128.4. Model: 128.7 → 122.2 Mcycles per frame, **about 2.35 s**
+(2.44 s, less the model's 4 %). `FRAME_FLAGS="-DREUSE_C=0
+-DONCHIP_CONV=0"` models round sixteen.
 
 ## 7. What is left, in order of expected gain
 

@@ -87,6 +87,7 @@
 #define CTRL_W16      0x100u
 #define CTRL_OSTATS   0x200u
 #define CTRL_ONCHIP   0x400u
+#define CTRL_GREUSE   0x800u
 
 #define STATUS_BUSY 0x1u
 #define STATUS_DONE 0x2u
@@ -118,6 +119,8 @@ static int      accel_a16_ok;          /* CAPS bit 25, cleared if its self-test 
 static int      accel_w16_ok;          /* CAPS bit 26, cleared if its self-test fails */
 static int      accel_ostats_ok;       /* CAPS bit 27, cleared if its self-test fails */
 static int      accel_onchip_ok;       /* CAPS bit 28, cleared if its self-test fails */
+static int      accel_greuse_ok;       /* CAPS bit 29, cleared if its self-test fails */
+static int      accel_conv_onchip;     /* dav2_accel_conv: result into the result RAM */
 static uint32_t accel_gemm_ctrl;       /* extra CTRL bits for accel_run (CTRL.w16) */
 static int      accel_out_stride;      /* requant output row length in int16, 0 = M */
 static int      accel_ok;
@@ -145,6 +148,7 @@ int dav2_accel_init(void)
     accel_w16_ok = (int)((caps >> 26) & 1u);
     accel_ostats_ok = (int)((caps >> 27) & 1u);
     accel_onchip_ok = (int)((caps >> 28) & 1u);
+    accel_greuse_ok = (int)((caps >> 29) & 1u);
 
     /* A missing block reads back as zero (or the bus errors out, which the
      * core reports separately); either way we simply stay on the CPU path. */
@@ -584,11 +588,19 @@ int dav2_accel_conv(const int16_t *img, int h, int w, int C, int k, int stride,
     const int nrows = (int)accel_nrows;
     const int tiles = (N + nrows - 1) / nrows;
     const int single = (pc_max == k * k);
+    /* the result RAM: one chunk, the statistics as the only way back */
+    const int onchip = accel_conv_onchip;
+    if (onchip && (!single || !st || !accel_onchip_ok || (long)N * M > DAV2_ACCEL_CR_WORDS))
+        return 0;
+    /* tap reuse (CTRL.greuse): stride 1, all k*k positions in one job */
+    const uint32_t ctrl = CTRL_START | CTRL_GATHER | (onchip ? CTRL_ONCHIP : 0u)
+                        | ((accel_greuse_ok && stride == 1 && single) ? CTRL_GREUSE : 0u);
     int32_t *stats = 0, *part = 0;
     const size_t mark = dav2_arena_mark();
     if (single && st) {
         stats = (int32_t *)dav2_arena_alloc((size_t)tiles * M * 2 * sizeof(int32_t));
         if (stats) { st->v = stats; st->tiles = tiles; }
+        else if (onchip) return 0;
     }
     if (!single) {
         part = (int32_t *)dav2_arena_alloc((size_t)N * M * sizeof(int32_t));
@@ -600,7 +612,7 @@ int dav2_accel_conv(const int16_t *img, int h, int w, int C, int k, int stride,
     REG32(GEMM_G_CHAN)   = ((uint32_t)ow << 16) | (uint32_t)C;
     REG32(GEMM_W_STRIDE) = (uint32_t)K;
     REG32(GEMM_A_STRIDE) = 0u;
-    REG32(GEMM_C_STRIDE) = (uint32_t)N * 4u;
+    REG32(GEMM_C_STRIDE) = onchip ? (uint32_t)N : (uint32_t)N * 4u;
     REG32(GEMM_M_LEN)    = (uint32_t)M;
 
     for (int p0 = 0; p0 < k * k; p0 += pc_max) {
@@ -616,15 +628,16 @@ int dav2_accel_conv(const int16_t *img, int h, int w, int C, int k, int stride,
             int nt = N - n0;
             if (nt > nrows) nt = nrows;
             REG32(GEMM_G_START) = ((uint32_t)(n0 / ow) << 16) | (uint32_t)(n0 % ow);
-            REG32(GEMM_C_ADDR)  = (uint32_t)(uintptr_t)(dst + n0);
+            REG32(GEMM_C_ADDR)  = onchip ? (uint32_t)n0 : (uint32_t)(uintptr_t)(dst + n0);
             REG32(GEMM_N_ROWS)  = (uint32_t)nt;
             REG32(GEMM_S_ADDR)  = stats ? (uint32_t)(uintptr_t)(stats + (size_t)t * M * 2) : 0u;
             if (stats && accel_defer && single && n0 + nt >= N)
                 accel_prefill_stats(stats + (size_t)t * M * 2, M);
-            REG32(GEMM_CTRL)    = CTRL_START | CTRL_GATHER;
+            REG32(GEMM_CTRL)    = ctrl;
             {
                 unsigned long beats = (unsigned long)M * (pc * C / 4)
-                                    + (unsigned long)nt * (pc * C / 2) + (unsigned long)nt * M;
+                                    + (unsigned long)nt * (pc * C / 2)
+                                    + (onchip ? 0ul : (unsigned long)nt * M);
                 /* only a single-chunk conv may leave its last job running:
                  * a split one adds partial sums right after each chunk */
                 if (accel_maybe_defer(single && n0 + nt >= N, beats, 0))
@@ -638,7 +651,7 @@ int dav2_accel_conv(const int16_t *img, int h, int w, int C, int k, int stride,
             accel_cycles += REG32(GEMM_CYCLES);
             accel_jobs++;
             accel_beats += (unsigned long)M * (pc * C / 4) + (unsigned long)nt * (pc * C / 2)
-                         + (unsigned long)nt * M;
+                         + (onchip ? 0ul : (unsigned long)nt * M);
             accel_retries += REG32(GEMM_DBG4) >> 16;
         }
         if (p0) {
@@ -711,6 +724,21 @@ int dav2_accel_conv_async(const int16_t *img, int h, int w, int C, int k, int st
     accel_defer = 1;
     int r = dav2_accel_conv(img, h, w, C, k, stride, pad, wt, M, acc, st);
     accel_defer = 0;
+    return r;
+}
+
+int dav2_accel_conv_onchip_async(const int16_t *img, int h, int w, int C, int k, int stride,
+                                 int pad, const int8_t *wt, int M, dav2_accel_stats_t *st)
+{
+    st->v = 0; st->tiles = 0;
+    if (!dav2_accel_init() || !accel_onchip_ok)
+        return 0;
+    accel_defer = 1;
+    accel_conv_onchip = 1;
+    int r = dav2_accel_conv(img, h, w, C, k, stride, pad, wt, M, 0, st);
+    accel_conv_onchip = 0;
+    accel_defer = 0;
+    if (!r) { st->v = 0; st->tiles = 0; }
     return r;
 }
 
@@ -930,6 +958,9 @@ static int accel_check_gather(void)
                 }
     dav2_qgemm_cpu(cols, chk_w, chk_sw, N, K, M);
 
+    /* plain gather first, then with tap reuse (CTRL.greuse) */
+    const int greuse = accel_greuse_ok;
+    accel_greuse_ok = 0;
     if (!dav2_accel_conv(img, H, W, C, KS, 1, 1, chk_w, M, chk_hw, 0)) {
         printf("GEMM accelerator: gather self-test could not run\n");
         accel_gather_ok = 0;
@@ -949,6 +980,19 @@ static int accel_check_gather(void)
         accel_gather_ok = 0;
     } else {
         printf("GEMM accelerator: gather self-test ok (%dx%dx%d, 3x3 pad 1)\n", H, W, C);
+        if (greuse) {
+            accel_greuse_ok = 1;
+            for (int i = 0; i < M * N; i++) chk_hw[i] = 0x55555555;
+            int rbad = dav2_accel_conv(img, H, W, C, KS, 1, 1, chk_w, M, chk_hw, 0) ? 0 : -1;
+            for (int i = 0; rbad >= 0 && i < M * N; i++)
+                if (chk_hw[i] != chk_sw[i]) rbad++;
+            if (rbad) {
+                printf("GEMM accelerator: TAP-REUSE SELF-TEST FAILED (%d), reuse disabled\n", rbad);
+                accel_greuse_ok = 0;
+            } else {
+                printf("GEMM accelerator: tap-reuse self-test ok\n");
+            }
+        }
     }
     return 0;      /* the plain GEMM path is still good */
 }
@@ -1405,6 +1449,10 @@ int  dav2_accel_onchip_ok(void) { return 0; }
 int  dav2_accel_qgemm_onchip_async(const dav2_tensor_t *a, const dav2_qw_t *wt,
                                    dav2_accel_stats_t *st)
 { (void)a; (void)wt; st->v = 0; st->tiles = 0; return 0; }
+int  dav2_accel_conv_onchip_async(const int16_t *img, int h, int w, int C, int k, int stride,
+                                  int pad, const int8_t *wt, int M, dav2_accel_stats_t *st)
+{ (void)img;(void)h;(void)w;(void)C;(void)k;(void)stride;(void)pad;(void)wt;(void)M;
+  st->v = 0; st->tiles = 0; return 0; }
 
 int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc,
                      dav2_accel_stats_t *st)

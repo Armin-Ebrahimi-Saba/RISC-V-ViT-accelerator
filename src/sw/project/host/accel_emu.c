@@ -207,6 +207,15 @@ static void latch(void)
          | job.s_addr | job.p_addr | job.g_addr) & 3u)
         fail("unaligned address");
     if (job.onchip && job.requant && job.a16) fail("requant: CTRL.onchip with CTRL.a16");
+    /* the result RAM's words used by the job must exist */
+    if (job.onchip && !job.requant
+        && (uint64_t)job.c_addr + (uint64_t)(job.m - 1) * job.c_stride + job.n > 131072u)
+        fail("GEMM: result RAM overrun");
+    if (job.onchip && job.requant
+        && (uint64_t)job.a_addr + (uint64_t)(job.m - 1) * job.a_stride + job.n > 131072u)
+        fail("requant: result RAM overrun");
+    /* CTRL.greuse (bit 11) changes the block's timing only, never the result */
+    if (((ctrl >> 11) & 1u) && !job.gather) fail("CTRL.greuse without CTRL.gather");
 }
 
 /* Advance the running job; called on every STATUS read. */
@@ -244,7 +253,7 @@ volatile uint32_t *dav2_emu_reg(uint32_t addr)
     static int init;
     if (!init) {
         init = 1;
-        R(CAPS) = (31u << 24) | ((uint32_t)KMAX << 8) | NROWS;   /* bits 24-28: table, int16 input and weights, row statistics, result RAM */
+        R(CAPS) = (63u << 24) | ((uint32_t)KMAX << 8) | NROWS;   /* bits 24-29: table, int16 input and weights, row statistics, result RAM, tap reuse */
     }
     if (addr < STUDENT_GEMM0_BASE_ADDR || addr >= STUDENT_GEMM0_BASE_ADDR + NREGS * 4u)
         fail("register access outside the block");

@@ -90,6 +90,10 @@ int dav2_accel_onchip_ok(void) { return 0; }
 int dav2_accel_qgemm_onchip_async(const dav2_tensor_t *a, const dav2_qw_t *wt,
                                   dav2_accel_stats_t *st)
 { (void)a; (void)wt; st->v = 0; st->tiles = 0; return 0; }
+int dav2_accel_conv_onchip_async(const int16_t *img, int h, int w, int C, int k, int stride,
+                                 int pad, const int8_t *wt, int M, dav2_accel_stats_t *st)
+{ (void)img;(void)h;(void)w;(void)C;(void)k;(void)stride;(void)pad;(void)wt;(void)M;
+  st->v = 0; st->tiles = 0; return 0; }
 int dav2_accel_busy(void) { return 0; }
 
 static uint32_t rs = 12345;

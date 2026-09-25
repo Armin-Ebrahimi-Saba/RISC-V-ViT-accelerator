@@ -89,20 +89,41 @@ static void start_job(uint64_t cyc)
 #define ONCHIP_C 1                      /* results kept on chip (round 16; 0 before) */
 #endif
 static int onchip_last;                 /* the last GEMM kept its result on chip */
-static uint64_t gemm_cycles(int N, int K, int M, int w16)
+#ifndef ONCHIP_CONV
+#define ONCHIP_CONV 1                   /* convolutions use the result RAM too (round 17) */
+#endif
+#ifndef REUSE_C
+#define REUSE_C 1                       /* gather tap reuse, CTRL.greuse (round 17) */
+#endif
+/* A GEMM job's time. rk > 1: a gather with tap reuse over an output row of
+ * ow pixels: a tile row whose left neighbour is the previous tile row
+ * copies (rk-1)/rk of its K/2 words at one per cycle and reads the rest,
+ * the reads running ahead through the FIFO. */
+static uint64_t gemm_core(int N, int K, int M, int w16, int onchip, int rk, int ow)
 {
-    const int onchip = ONCHIP_C && N <= 128 && (long)N * M <= CR_WORDS && !w16;
-    onchip_last = onchip;
     uint64_t c = 0;
     uint64_t mac = (uint64_t)K / MACW;
     uint64_t bus = (uint64_t)K / (w16 ? 2 : 4) * BEAT / 10;
     uint64_t row = (mac > bus ? mac : bus) + PIPE;
+    const uint64_t full = (uint64_t)K / 2 * BEAT / 10;
+    uint64_t reused = full;
+    if (rk > 1) {
+        uint64_t rd = (uint64_t)K / 2 / rk * BEAT / 10;
+        reused = (uint64_t)K / 2 > rd ? (uint64_t)K / 2 : rd;
+    }
     for (int n0 = 0; n0 < N; n0 += 128) {
         int nt = N - n0 < 128 ? N - n0 : 128;
-        c += (uint64_t)nt * K / 2 * BEAT / 10;
+        for (int t = 0; t < nt; t++)
+            c += (rk > 1 && t > 0 && (n0 + t) % ow != 0) ? reused : full;
         c += (uint64_t)M * (row + (onchip ? (uint64_t)nt / 4 + 2 : (uint64_t)(nt + 2) * BEAT / 10));
     }
     return c;
+}
+static uint64_t gemm_cycles(int N, int K, int M, int w16)
+{
+    const int onchip = ONCHIP_C && N <= 128 && (long)N * M <= CR_WORDS && !w16;
+    onchip_last = onchip;
+    return gemm_core(N, K, M, w16, onchip, 0, 1);
 }
 static uint64_t requant_cycles(int N, int M, int in16, int add)
 {
@@ -121,7 +142,20 @@ int dav2_accel_conv_async(const int16_t *img, int h, int w, int C, int k, int st
                           int pad, const int8_t *wt, int M, int32_t *acc, dav2_accel_stats_t *st)
 { (void)img;(void)wt;(void)acc;
   int oh = (h + 2 * pad - k) / stride + 1, ow = (w + 2 * pad - k) / stride + 1;
-  job_kind = K_GEMM_CONV; start_job(gemm_cycles(oh * ow, k * k * C, M, 0));
+  int single = k * k * C <= 2048;
+  onchip_last = 0;
+  job_kind = K_GEMM_CONV;
+  start_job(gemm_core(oh * ow, k * k * C, M, 0, 0, (REUSE_C && stride == 1 && single) ? k : 0, ow));
+  st->v = stats_buf; st->tiles = 1; return 2; }
+int dav2_accel_conv_onchip_async(const int16_t *img, int h, int w, int C, int k, int stride,
+                                 int pad, const int8_t *wt, int M, dav2_accel_stats_t *st)
+{ (void)img;(void)wt;
+  int oh = (h + 2 * pad - k) / stride + 1, ow = (w + 2 * pad - k) / stride + 1;
+  int single = k * k * C <= 2048;
+  if (!ONCHIP_C || !ONCHIP_CONV || !single || (long)oh * ow * M > CR_WORDS) return 0;
+  onchip_last = 1;
+  job_kind = K_GEMM_CONV;
+  start_job(gemm_core(oh * ow, k * k * C, M, 0, 1, (REUSE_C && stride == 1) ? k : 0, ow));
   st->v = stats_buf; st->tiles = 1; return 2; }
 int dav2_accel_gemm_raw_async(const int16_t *a, uint32_t as, const int8_t *w, uint32_t ws,
                               int32_t *acc, int N, int K, int M)
