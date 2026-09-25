@@ -876,35 +876,31 @@ static void layernorm_affine(const dav2_tensor_t *in, const int32_t *gq,
 
     /* All integer. Per element (N*C = 31k):
      *
-     *   y = (x - mean) * (s * inv_std) * g[c] + b[c]
+     *   out = (z * g[c] + b[c]) / scale,   z = (x - mean) * r,
      *
-     * with x - mean in Q16, s*inv_std as a (mult, shift) pair per row, g in
-     * Q15 and b in Q16, both converted offline (dav2_blob_int.py). Per row
-     * (N = 82), the statistics are exact integers:
+     * with r = s * inv_std per row, g in Q15 and b in Q16 (converted
+     * offline, dav2_blob_int.py). Per row (N = 82), the statistics are
+     * exact integers:
      *
      *   var_q = (C * sum(x^2) - sum(x)^2) / C^2        (in units of s^2)
-     *   s * inv_std = s / sqrt(var_q * s^2 + eps) = 1 / sqrt(var_q + eps/s^2)
+     *   r = s / sqrt(var_q * s^2 + eps) = 1 / sqrt(var_q + eps/s^2)
      *
-     * and the reciprocal square root is a Newton iteration (xf_rsqrt). y
-     * comes out in Q16 -- resolution 1.5e-5 against an output step of ~1e-3
-     * after quantisation to 14 bits -- and is then requantised to the
-     * tensor's common scale.
+     * and the reciprocal square root is a Newton iteration (xf_rsqrt).
      *
-     * One pass computes y and stores it (int32, arena) while tracking the
-     * range; a second requantises. A version that recomputed y instead of
-     * storing it was slower: on this core a load and a store cost less
-     * than the arithmetic they replace.
-     *
-     * Every product is one mulh (the high word of a 32 x 32 product):
-     *   z16 = (x - mean) * r      mulh with the row's shift hoisted
-     *   z16 * g                   = mulh(z16 << 10, g << 7): z16 * g / 2^15,
-     *                             floored. |z| <= sqrt(C - 1) < 2^5 for any
-     *                             row, so |z16 << 10| < 2^31; g < 2^9.
-     *   y -> output               mulh with the tensor's shift hoisted
-     * A row whose shift is below 33 (never in this model: it would need
-     * r >= 2^-2 with x - mean in Q16) takes apply_multiplier. */
-    int32_t *y16 = (int32_t *)dav2_arena_alloc((size_t)N * C * sizeof(int32_t));
-    if (!y16) { dav2_arena_release(mark); return; }
+     * The second half, out = z * G[c] + B[c], is a per-channel multiply,
+     * add and saturation: exactly the accelerator's requantisation job
+     * with the channels as its rows. So the CPU computes only z (Q16, one
+     * mulh per element), channel by channel into zc[c][n], and keeps each
+     * channel's smallest and largest z. Those give the exact range of
+     * z * g[c] + b[c] per channel, hence the output scale, before any
+     * output exists. The job then applies g and b and the scale, saturates,
+     * writes out[n][c] and reports the largest |out|. Without an
+     * accelerator the CPU runs the same arithmetic (apply_multiplier), so
+     * both give the same result. */
+    int32_t *zc = (int32_t *)dav2_arena_alloc((size_t)N * C * sizeof(int32_t));
+    int32_t *rowp = (int32_t *)dav2_arena_alloc((size_t)N * 4 * sizeof(int32_t));
+    int32_t *par = (int32_t *)dav2_arena_alloc((size_t)C * 3 * sizeof(int32_t));
+    if (!zc || !rowp || !par) { dav2_arena_release(mark); return; }
 
     /* per call: 1/C^2 and eps/s^2, eps = 1e-6 as in PyTorch (the exact
      * float32 value 1e-6f, 0x358637bd) */
@@ -912,7 +908,7 @@ static void layernorm_affine(const dav2_tensor_t *in, const int32_t *gq,
     const dav2_xf_t inv_s  = xf_recip(in->scale);
     const dav2_xf_t eps_s2 = xf_mul(xf_from_f32_bits(0x358637bdu), xf_mul(inv_s, inv_s));
     const int wide = (((uintptr_t)in->v | (uintptr_t)out->v) & 3u) == 0 && (C & 3) == 0;
-    int32_t ymax = 0, ymin = 0;
+    int fast = wide;                  /* every row's shift >= 33 (always, in this model) */
     SUB_START();
     for (int n = 0; n < N; n++) {
         const int16_t *row = in->v + (size_t)n * C;
@@ -945,72 +941,111 @@ static void layernorm_affine(const dav2_tensor_t *in, const int32_t *gq,
         if (num < 0) num = 0;
         dav2_xf_t v = xf_add(xf_mul(xf_from_int(num), inv_c2), eps_s2);
         int32_t am; int ash;
-        xf_to_mult(xf_rsqrt(v), &am, &ash);                   /* s * inv_std */
-
+        xf_to_mult(xf_rsqrt(v), &am, &ash);                   /* r */
         /* mean in Q16, rounded half away from zero */
         int64_t s16 = (int64_t)sum * 65536;
-        int32_t mean16 = (int32_t)(s16 >= 0 ? (s16 + C / 2) / C : -((-s16 + C / 2) / C));
+        int32_t *p = rowp + (size_t)n * 4;
+        p[0] = (int32_t)(s16 >= 0 ? (s16 + C / 2) / C : -((-s16 + C / 2) / C));
+        p[1] = am;
+        p[2] = ash;
+        p[3] = ash >= 33 ? 1 << (ash - 33) : 0;
+        if (ash < 33) fast = 0;
+    }
+    SUB_LAP(DAV2_SUB_LN_STATS);
 
-        SUB_LAP(DAV2_SUB_LN_STATS);
-        int32_t *orow = y16 + (size_t)n * C;
-        if (wide && ash >= 33) {
-            const int32_t rnd = 1 << (ash - 33);
-            const int sh = ash - 32;
-            const uint32_t *rw = (const uint32_t *)row;
+    /* z = (x - mean) * r in Q16, two channels at a time, into zc[c][n],
+     * with each channel's extremes. |z| <= sqrt(C - 1) < 2^5, so z16 fits. */
+    int64_t ymax_all = 0;                          /* largest |y| in Q16 */
+    for (int c = 0; c < C; c += (fast ? 2 : 1)) {
+        int32_t lo0 = 0x7fffffff, hi0 = -0x7fffffff - 1, lo1 = lo0, hi1 = hi0;
+        int32_t *z0 = zc + (size_t)c * N;
+        if (fast) {
+            int32_t *z1 = z0 + N;
+            const int16_t *col = in->v + c;
             #pragma GCC unroll 2
-            for (int c = 0; c < C / 2; c++) {
-                uint32_t x = rw[c];
-                int32_t z0 = mul_hi_round((lo16(x) << 16) - mean16, am, rnd, sh);
-                int32_t z1 = mul_hi_round((hi16(x) << 16) - mean16, am, rnd, sh);
-                int32_t y0 = mulh32(z0 << 10, gq[2 * c] << 7) + bq[2 * c];
-                int32_t y1 = mulh32(z1 << 10, gq[2 * c + 1] << 7) + bq[2 * c + 1];
-                orow[2 * c] = y0;
-                orow[2 * c + 1] = y1;
-                if (y0 > ymax) ymax = y0;
-                if (y0 < ymin) ymin = y0;
-                if (y1 > ymax) ymax = y1;
-                if (y1 < ymin) ymin = y1;
+            for (int n = 0; n < N; n++) {
+                const int32_t *p = rowp + (size_t)n * 4;
+                uint32_t x = *(const uint32_t *)(col + (size_t)n * C);
+                const int sh = p[2] - 32;
+                int32_t a = (mulh32((lo16(x) << 16) - p[0], p[1]) + p[3]) >> sh;
+                int32_t b = (mulh32((hi16(x) << 16) - p[0], p[1]) + p[3]) >> sh;
+                z0[n] = a;
+                z1[n] = b;
+                if (a < lo0) lo0 = a;
+                if (a > hi0) hi0 = a;
+                if (b < lo1) lo1 = b;
+                if (b > hi1) hi1 = b;
             }
         } else {
-            for (int c = 0; c < C; c++) {
-                int32_t z = apply_multiplier(((int32_t)row[c] << 16) - mean16, am, ash);
-                int32_t y = mulh32(z << 10, gq[c] << 7) + bq[c];
-                orow[c] = y;
-                if (y > ymax) ymax = y;
-                if (y < ymin) ymin = y;
+            for (int n = 0; n < N; n++) {
+                const int32_t *p = rowp + (size_t)n * 4;
+                int32_t a = apply_multiplier(((int32_t)in->v[(size_t)n * C + c] << 16) - p[0],
+                                             p[1], p[2]);
+                z0[n] = a;
+                if (a < lo0) lo0 = a;
+                if (a > hi0) hi0 = a;
             }
         }
-        SUB_LAP(DAV2_SUB_LN_Y);
+        /* y = z g / 2^15 + b, Q16, at the channel's extremes */
+        for (int k = 0; k < (fast ? 2 : 1); k++) {
+            const int64_t g = gq[c + k], b = bq[c + k];
+            const int64_t zl = k ? lo1 : lo0, zh = k ? hi1 : hi0;
+            int64_t y0 = ((zl * g) >> 15) + b, y1 = ((zh * g) >> 15) + b;
+            if (y0 < 0) y0 = -y0;
+            if (y1 < 0) y1 = -y1;
+            if (y0 > ymax_all) ymax_all = y0;
+            if (y1 > ymax_all) ymax_all = y1;
+        }
+    }
+    SUB_LAP(DAV2_SUB_LN_Y);
+
+    /* the scale, then per channel: mult = g / 2^31 / scale, bias = b / 2^16
+     * / scale. mult = mulh(g << 12, F.m) with F = 2^-31 / scale: the same
+     * shift F.sh - 20 for every channel; |g| < 2^19, so g << 12 fits. */
+    dav2_xf_t out_scale = ymax_all ? xf_div(xf_norm(ymax_all, 16), xf_from_int(DAV2_ACT_QMAX))
+                                   : XF_ONE;
+    dav2_xf_t inv = xf_recip(out_scale);
+    dav2_xf_t F = inv;
+    F.sh += 31;
+    int shift = F.sh - 20, r = 0;
+    if (shift > 62) { r = shift - 62; shift = 62; }
+    if (r > 31) r = 31;
+    const int shift_ok = shift >= 1;
+    for (int c = 0; c < C; c++) {
+        if (shift_ok) {
+            par[3 * c] = mulh32(gq[c] << 12, F.m) >> r;
+            par[3 * c + 1] = shift;
+        } else {                           /* factor >= 1: never in this model */
+            int sh;
+            xf_to_mult(xf_mul(xf_norm(gq[c], 31), inv), &par[3 * c], &sh);
+            par[3 * c + 1] = sh;
+        }
+        par[3 * c + 2] = sat_i32(shr_round64((int64_t)bq[c] * inv.m, inv.sh + 16));
     }
 
-    /* common output scale, then the second pass writes the result */
-    int32_t amax = ymax > -ymin ? ymax : -ymin;
-    dav2_xf_t out_scale = amax > 0 ? xf_div(xf_norm(amax, 16), xf_from_int(DAV2_ACT_QMAX))
-                                   : XF_ONE;
-    int32_t om; int osh;                         /* Q16 -> output units */
-    xf_to_mult(xf_div(xf_norm(1, 16), out_scale), &om, &osh);
-    /* the output's largest |value|, from y's extremes: the map is
-     * non-decreasing */
-    int32_t e0 = sat_act(apply_multiplier(ymax, om, osh));
-    int32_t e1 = sat_act(apply_multiplier(ymin, om, osh));
-    const int total = N * C;
-    if (wide && osh >= 33) {
-        const int32_t rnd = 1 << (osh - 33);
-        const int sh = osh - 32;
-        uint32_t *ow = (uint32_t *)out->v;
-        #pragma GCC unroll 4
-        for (int i = 0; i < total / 2; i++)
-            ow[i] = pack16(sat_act(mul_hi_round(y16[2 * i], om, rnd, sh)),
-                           sat_act(mul_hi_round(y16[2 * i + 1], om, rnd, sh)));
-    } else {
-        for (int i = 0; i < total; i++)
-            out->v[i] = sat_act(apply_multiplier(y16[i], om, osh));
+    int32_t omax = -1;
+    if (!(C & 1) && !dav2_accel_requant(zc, N, C, par, out->v, &omax)) {
+        omax = -1;
+    }
+    if (omax < 0) {
+        /* no accelerator: the same arithmetic on the CPU */
+        omax = 0;
+        for (int n = 0; n < N; n++) {
+            int16_t *orow = out->v + (size_t)n * C;
+            for (int c = 0; c < C; c++) {
+                int32_t o = sat_act(apply_multiplier(zc[(size_t)c * N + n], par[3 * c],
+                                                     par[3 * c + 1]) + par[3 * c + 2]);
+                orow[c] = (int16_t)o;
+                if (o < 0) o = -o;
+                if (o > omax) omax = o;
+            }
+        }
     }
     SUB_LAP(DAV2_SUB_LN_OUT);
     out->scale = out_scale;
     out->n = N;
     out->c = C;
-    out->amax_q = e0 > -e1 ? e0 : -e1;
+    out->amax_q = omax;
     dav2_arena_release(mark);
 }
 

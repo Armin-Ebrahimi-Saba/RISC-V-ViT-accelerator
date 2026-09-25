@@ -40,9 +40,9 @@ static const int INTERMEDIATE[4] = {2, 5, 8, 11};
 
 /* ------------------------------------------------------------- attention */
 
-/* Scores for one head, then softmax, then the context vector. Q/K are
- * requantised to 11 bits so that the K=64 dot product cannot overflow int32:
- * 64 * 2047^2 = 2.7e8. */
+/* Scores for one head, then softmax, then the context vector. q is shifted
+ * to 11 bits and k keeps its 14 bits, so that the K=64 dot product cannot
+ * overflow int32: 64 * 2047 * 8191 = 1.07e9 < 2^31. */
 
 /* One attention head, on the GEMM accelerator.
  *
@@ -53,7 +53,7 @@ static const int INTERMEDIATE[4] = {2, 5, 8, 11};
  *
  *     x = hi * 2^s + lo,  a.x = 2^s * (a.hi) + (a.lo)         exactly.
  *
- * Scores:  S[t][m] = q_t . k_m      A = k (int16, shifted to 11 bits),
+ * Scores:  S[t][m] = q_t . k_m      A = k (int16, read in place from qkv),
  *                                   W = q_hi (q >> 4), q_lo (q & 15)
  * Context: C[t][d] = sum_m P[t][m] v[m][d]
  *                                   A = P (int16 probabilities, Q15),
@@ -68,11 +68,12 @@ static const int INTERMEDIATE[4] = {2, 5, 8, 11};
  * Operands are built in the DDR3 arena, packed four int8 per word, since a
  * byte store costs the CPU the same bus transaction as a word store. */
 typedef struct {
-    int16_t *k16;  int8_t *q_hi, *q_lo;
+    int8_t *q_hi, *q_lo;
     int32_t *s_hi, *s_lo;
     int16_t *p16;  int8_t *vt_hi, *vt_lo;
     int32_t *c_hi, *c_lo;
-    int      q_sh, k_sh;
+    int      q_sh;
+    uint16_t *exp2;             /* exp2_tab, copied into the DDR3 arena */
 } attn_bufs_t;
 
 /* A GEMM that may be left running on the accelerator (see dav2_accel.h):
@@ -129,69 +130,49 @@ static void gemm_i32_start(const int16_t *a, int a_stride, const int8_t *w, int 
 
 /* ---- the phases of one head (the code of the former attention_head) */
 
-/* q and k of a head, shifted to 11 bits: k as the int16 operand, q split
- * into two int8 halves. */
+/* q of a head, shifted to 11 bits and split into two int8 halves. k needs
+ * no preparation: the score GEMMs read it straight from qkv as their int16
+ * operand, with qkv's row stride, at its full 14 bits. */
 static void attn_prep_qk(const dav2_tensor_t *qkv, int head, int n, attn_bufs_t *b)
 {
     const int HD = DAV2_HEAD_DIM;
-    const int ED = DAV2_EMBED_DIM;
-    const int Kp = (n + 3) & ~3;
-    int16_t *k16 = b->k16; int8_t *q_hi = b->q_hi, *q_lo = b->q_lo;
-    int32_t *s_hi = b->s_hi, *s_lo = b->s_lo; int16_t *p16 = b->p16;
-    int8_t *vt_hi = b->vt_hi, *vt_lo = b->vt_lo;
-    int32_t *c_hi = b->c_hi, *c_lo = b->c_lo;
-    (void)HD; (void)ED; (void)Kp; (void)k16; (void)q_hi; (void)q_lo; (void)s_hi; (void)s_lo;
-    (void)p16; (void)vt_hi; (void)vt_lo; (void)c_hi; (void)c_lo;
-    /* The ranges of q and k of this head, read straight from qkv in DDR3,
-     * two values per load. (Staging them in on-chip scratch cost more: on
-     * this SoC a load from the on-chip RAM takes about 4 cycles longer
-     * than a DDR3 cache hit.) */
-    /* The shift below depends only on the highest set bit of the largest
-     * |value|, and the OR of all |values| has the same highest bit: no
-     * compare and no branch per element. */
-    uint32_t qmax = 0, kmax = 0;
+    int8_t *q_hi = b->q_hi, *q_lo = b->q_lo;
+    /* The range of q of this head, read straight from qkv in DDR3, two
+     * values per load. The shift below depends only on the highest set bit
+     * of the largest |value|, and the OR of all |values| has the same
+     * highest bit: no compare and no branch per element. */
+    uint32_t qmax = 0;
 #define ABS16(x) ({ int32_t v_ = (x), s_ = v_ >> 31; (uint32_t)((v_ ^ s_) - s_); })
     for (int t = 0; t < n; t++) {
         const uint32_t *qr = (const uint32_t *)(qkv->v + (size_t)t * qkv->c + head * HD);
-        const uint32_t *kr = (const uint32_t *)(qkv->v + (size_t)t * qkv->c + ED + head * HD);
         #pragma GCC unroll 4
         for (int d = 0; d < HD / 2; d++) {
-            uint32_t wq = qr[d], wk = kr[d];
+            uint32_t wq = qr[d];
             qmax |= ABS16((int16_t)(wq & 0xffffu)) | ABS16((int16_t)(wq >> 16));
-            kmax |= ABS16((int16_t)(wk & 0xffffu)) | ABS16((int16_t)(wk >> 16));
         }
     }
 #undef ABS16
-    int q_sh = 0, k_sh = 0;
+    int q_sh = 0;
     while ((qmax >> q_sh) > (uint32_t)DAV2_QK_QMAX) q_sh++;
-    while ((kmax >> k_sh) > (uint32_t)DAV2_QK_QMAX) k_sh++;
 
-    /* Shifted k as the int16 operand; shifted q split into two int8 halves.
-     * |q| <= 2047 after the shift, so q >> 4 is within int8. */
+    /* shifted q split into two int8 halves; |q| <= 2047 after the shift,
+     * so q >> 4 is within int8 */
     for (int t = 0; t < n; t++) {
         const uint32_t *qr = (const uint32_t *)(qkv->v + (size_t)t * qkv->c + head * HD);
-        const uint32_t *kr = (const uint32_t *)(qkv->v + (size_t)t * qkv->c + ED + head * HD);
-        uint32_t *kd = (uint32_t *)(k16 + (size_t)t * HD);
         uint32_t *qh = (uint32_t *)(q_hi + (size_t)t * HD);
         uint32_t *ql = (uint32_t *)(q_lo + (size_t)t * HD);
         #pragma GCC unroll 2
         for (int d = 0; d < HD / 4; d++) {
             uint32_t wq0 = qr[2 * d], wq1 = qr[2 * d + 1];
-            uint32_t wk0 = kr[2 * d], wk1 = kr[2 * d + 1];
             int32_t v0 = (int16_t)(wq0 & 0xffffu) >> q_sh, v1 = (int16_t)(wq0 >> 16) >> q_sh;
             int32_t v2 = (int16_t)(wq1 & 0xffffu) >> q_sh, v3 = (int16_t)(wq1 >> 16) >> q_sh;
             qh[d] = ((uint32_t)(v0 >> 4) & 0xffu) | (((uint32_t)(v1 >> 4) & 0xffu) << 8)
                   | (((uint32_t)(v2 >> 4) & 0xffu) << 16) | ((uint32_t)(v3 >> 4) << 24);
             ql[d] = ((uint32_t)v0 & 0xfu) | (((uint32_t)v1 & 0xfu) << 8)
                   | (((uint32_t)v2 & 0xfu) << 16) | (((uint32_t)v3 & 0xfu) << 24);
-            kd[2 * d]     = ((uint32_t)((int16_t)(wk0 & 0xffffu) >> k_sh) & 0xffffu)
-                          | ((uint32_t)((int16_t)(wk0 >> 16) >> k_sh) << 16);
-            kd[2 * d + 1] = ((uint32_t)((int16_t)(wk1 & 0xffffu) >> k_sh) & 0xffffu)
-                          | ((uint32_t)((int16_t)(wk1 >> 16) >> k_sh) << 16);
         }
     }
     b->q_sh = q_sh;
-    b->k_sh = k_sh;
 }
 
 /* v^T of a head, split into int8 halves */
@@ -200,11 +181,11 @@ static void attn_prep_v(const dav2_tensor_t *qkv, int head, int n, attn_bufs_t *
     const int HD = DAV2_HEAD_DIM;
     const int ED = DAV2_EMBED_DIM;
     const int Kp = (n + 3) & ~3;
-    int16_t *k16 = b->k16; int8_t *q_hi = b->q_hi, *q_lo = b->q_lo;
+    int8_t *q_hi = b->q_hi, *q_lo = b->q_lo;
     int32_t *s_hi = b->s_hi, *s_lo = b->s_lo; int16_t *p16 = b->p16;
     int8_t *vt_hi = b->vt_hi, *vt_lo = b->vt_lo;
     int32_t *c_hi = b->c_hi, *c_lo = b->c_lo;
-    (void)HD; (void)ED; (void)Kp; (void)k16; (void)q_hi; (void)q_lo; (void)s_hi; (void)s_lo;
+    (void)HD; (void)ED; (void)Kp; (void)q_hi; (void)q_lo; (void)s_hi; (void)s_lo;
     (void)p16; (void)vt_hi; (void)vt_lo; (void)c_hi; (void)c_lo;
     /* v^T, split, padded with zero columns up to Kp. Four tokens at a time so
      * that each store is a whole word. */
@@ -229,17 +210,34 @@ static void attn_prep_v(const dav2_tensor_t *qkv, int head, int n, attn_bufs_t *
 
 }
 
+/* 2^(-k/1024) in Q15 for k = 0..1023 (k = 0 gives 32768, clamped below).
+ * Built once with an integer recurrence in Q30: T[k] = T[k-1] * r with
+ * r = 2^(-1/1024) in Q31 = 2146030505; the error after 1023 steps is below
+ * 3e-8, far below a Q15 unit. */
+static uint16_t exp2_tab[1024];
+
+static void exp2_tab_init(void)
+{
+    if (exp2_tab[0])
+        return;
+    uint32_t t = 1u << 30;
+    for (int k = 0; k < 1024; k++) {
+        exp2_tab[k] = (uint16_t)((t + (1u << 14)) >> 15);
+        t = (uint32_t)(((uint64_t)t * 2146030505u + (1u << 30)) >> 31);
+    }
+}
+
 /* scores -> Q15 probabilities, each row divided by its sum */
 static void attn_softmax(const dav2_tensor_t *qkv, int n, attn_bufs_t *b)
 {
     const int HD = DAV2_HEAD_DIM;
     const int ED = DAV2_EMBED_DIM;
     const int Kp = (n + 3) & ~3;
-    int16_t *k16 = b->k16; int8_t *q_hi = b->q_hi, *q_lo = b->q_lo;
+    int8_t *q_hi = b->q_hi, *q_lo = b->q_lo;
     int32_t *s_hi = b->s_hi, *s_lo = b->s_lo; int16_t *p16 = b->p16;
     int8_t *vt_hi = b->vt_hi, *vt_lo = b->vt_lo;
     int32_t *c_hi = b->c_hi, *c_lo = b->c_lo;
-    (void)HD; (void)ED; (void)Kp; (void)k16; (void)q_hi; (void)q_lo; (void)s_hi; (void)s_lo;
+    (void)HD; (void)ED; (void)Kp; (void)q_hi; (void)q_lo; (void)s_hi; (void)s_lo;
     (void)p16; (void)vt_hi; (void)vt_lo; (void)c_hi; (void)c_lo;
     /* Softmax per query token, in fixed point: p = 2^(-(smax - s) * scale *
      * log2e) in Q15. kf is typically far below 1 (score_scale is ~1e-5), so
@@ -247,7 +245,7 @@ static void attn_softmax(const dav2_tensor_t *qkv, int n, attn_bufs_t *b)
      * integer -- rounding it into a Q16 constant collapses it to 0 or 1 and
      * flattens the whole distribution. */
     dav2_xf_t score_scale = xf_mul(qkv->scale, qkv->scale);
-    score_scale.sh -= b->q_sh + b->k_sh;                /* * 2^q_sh * 2^k_sh */
+    score_scale.sh -= b->q_sh;                          /* * 2^q_sh */
     /* -> exponent base 2: * log2(e), the float32 1.4426950f (0x3fb8aa3b) */
     dav2_xf_t kf = xf_mul(score_scale, xf_from_f32_bits(0x3fb8aa3bu));
     int32_t kmult; int kshift;
@@ -270,6 +268,7 @@ static void attn_softmax(const dav2_tensor_t *qkv, int n, attn_bufs_t *b)
         ks = 1;
     }
     const uint32_t over = 16u << 16;               /* underflows Q15 */
+    const uint16_t *exp2t = b->exp2;
     for (int t = 0; t < n; t++) {
         const int32_t *sh = s_hi + (size_t)t * n, *sl = s_lo + (size_t)t * n;
         int32_t smax = -2147483647 - 1;
@@ -284,26 +283,15 @@ static void attn_softmax(const dav2_tensor_t *qkv, int n, attn_bufs_t *b)
         for (int m = 0; m < n; m++) {
             /* the score again from its two halves: two DDR3 cache hits cost
              * less than a store and a load of on-chip RAM */
-            uint32_t d = (uint32_t)(smax - (sh[m] * 16 + sl[m]));      /* >= 0 */
+            /* >= 0 and < 2^32: unsigned, since |s| < 1.07e9 each */
+            uint32_t d = (uint32_t)smax - (uint32_t)(sh[m] * 16 + sl[m]);
             uint32_t hi = (uint32_t)(((uint64_t)d * (uint32_t)kmult) >> 32);
             uint32_t lo = d * (uint32_t)kmult;
             uint32_t t_q16 = (hi >> ks) ? over : (hi << (32 - ks)) | (lo >> ks);
-            int32_t p;
-            if (t_q16 >= over) {
-                p = 0;
-            } else {
-                int32_t ip = (int32_t)(t_q16 >> 16);
-                int32_t fp = (int32_t)(t_q16 & 0xffff);
-                /* 2^-frac in Q15. Linear interpolation between 1.0 and 0.5
-                 * overestimates because 2^-x is convex, so subtract a
-                 * parabolic correction: the gap peaks at x=0.5, where
-                 * 0.75 - 2^-0.5 = 0.0429 -> 1406 in Q15, and 4*1406 = 5623
-                 * is the coefficient of the x(1-x) term. */
-                int32_t lin = 32768 - ((fp * 16384) >> 16);
-                int32_t u = (fp * (65536 - fp)) >> 16;   /* x(1-x) in Q16 */
-                int32_t corr = (u * 5623) >> 16;
-                p = (lin - corr) >> ip;
-            }
+            /* 2^-t = 2^-frac >> int: the fraction's 10 high bits index the
+             * table (Q15, error below 11 units), the integer part shifts */
+            int32_t p = t_q16 >= over ? 0
+                      : (int32_t)exp2t[(t_q16 >> 6) & 1023u] >> (t_q16 >> 16);
             if (p > 32767) p = 32767;        /* the argmax: 2^15 -> int16 */
             pr[m] = (int16_t)p;
             sum += (uint32_t)p;
@@ -329,11 +317,11 @@ static void attn_normalise(int head, int n, attn_bufs_t *b, dav2_tensor_t *ctx)
     const int HD = DAV2_HEAD_DIM;
     const int ED = DAV2_EMBED_DIM;
     const int Kp = (n + 3) & ~3;
-    int16_t *k16 = b->k16; int8_t *q_hi = b->q_hi, *q_lo = b->q_lo;
+    int8_t *q_hi = b->q_hi, *q_lo = b->q_lo;
     int32_t *s_hi = b->s_hi, *s_lo = b->s_lo; int16_t *p16 = b->p16;
     int8_t *vt_hi = b->vt_hi, *vt_lo = b->vt_lo;
     int32_t *c_hi = b->c_hi, *c_lo = b->c_lo;
-    (void)HD; (void)ED; (void)Kp; (void)k16; (void)q_hi; (void)q_lo; (void)s_hi; (void)s_lo;
+    (void)HD; (void)ED; (void)Kp; (void)q_hi; (void)q_lo; (void)s_hi; (void)s_lo;
     (void)p16; (void)vt_hi; (void)vt_lo; (void)c_hi; (void)c_lo;
     /* ctx[t][d] = (64 c_hi + c_lo) / 2^15, rounded: the probabilities are
      * already divided by their sum (attn_softmax), so this is 32-bit. The
@@ -368,8 +356,8 @@ static void attn_normalise(int head, int n, attn_bufs_t *b, dav2_tensor_t *ctx)
  *   C_hi(h), C_lo(h) q, k of head h+1 prepared (during C_lo)
  *   --               head h normalised
  *
- * The buffers are allocated once for all heads: head h+1's q/k go into the
- * same k16/q_hi/q_lo as head h's, which is safe because both S jobs of head
+ * The buffers are allocated once for all heads: head h+1's q goes into the
+ * same q_hi/q_lo as head h's, which is safe because both S jobs of head
  * h have completed by then (one job at a time, and C_hi has run since).
  * Without an accelerator every GEMM is computed at its start, in the same
  * order, so the result is bit-identical. */
@@ -381,7 +369,6 @@ static void attention_all(const dav2_tensor_t *qkv, int n_tokens, dav2_tensor_t 
     const size_t mark = dav2_arena_mark();
     attn_bufs_t b;
 
-    b.k16   = (int16_t *)dav2_arena_alloc((size_t)n * HD * sizeof(int16_t));
     b.q_hi  = (int8_t  *)dav2_arena_alloc((size_t)n * HD);
     b.q_lo  = (int8_t  *)dav2_arena_alloc((size_t)n * HD);
     b.s_hi  = (int32_t *)dav2_arena_alloc((size_t)n * n * sizeof(int32_t));
@@ -391,7 +378,12 @@ static void attention_all(const dav2_tensor_t *qkv, int n_tokens, dav2_tensor_t 
     b.vt_lo = (int8_t  *)dav2_arena_alloc((size_t)HD * Kp);
     b.c_hi  = (int32_t *)dav2_arena_alloc((size_t)HD * n * sizeof(int32_t));
     b.c_lo  = (int32_t *)dav2_arena_alloc((size_t)HD * n * sizeof(int32_t));
+    b.exp2  = (uint16_t *)dav2_arena_alloc(1024 * sizeof(uint16_t));
     if (dav2_arena_failed) { dav2_arena_release(mark); return; }
+    /* the table from the on-chip RAM into the DDR3 arena, where the
+     * softmax's loads are about 4 cycles cheaper */
+    exp2_tab_init();
+    dav2_copy16((int16_t *)b.exp2, (const int16_t *)exp2_tab, 1024);
 
     uint64_t t0 = dav2_cycles(), t1;
 #define LAP(d) do { t1 = dav2_cycles(); dav2_sub_add((d), t1 - t0); t0 = t1; } while (0)
@@ -399,11 +391,12 @@ static void attention_all(const dav2_tensor_t *qkv, int n_tokens, dav2_tensor_t 
     LAP(DAV2_SUB_ATT_PREP_QK);
     for (int h = 0; h < DAV2_N_HEADS; h++) {
         /* S = k . q_hi, k . q_lo  ->  s[t][m] (W rows are t, A rows are m) */
-        gemm_i32_start(b.k16, HD, b.q_hi, HD, b.s_hi, n, HD, n);
+        const int16_t *k = qkv->v + DAV2_EMBED_DIM + h * HD;   /* in place */
+        gemm_i32_start(k, qkv->c, b.q_hi, HD, b.s_hi, n, HD, n);
         LAP(DAV2_SUB_ATT_WAIT);
         attn_prep_v(qkv, h, n, &b);
         LAP(DAV2_SUB_ATT_PREP_V);
-        gemm_i32_start(b.k16, HD, b.q_lo, HD, b.s_lo, n, HD, n);
+        gemm_i32_start(k, qkv->c, b.q_lo, HD, b.s_lo, n, HD, n);
         gemm_i32_finish();
         LAP(DAV2_SUB_ATT_WAIT);
         attn_softmax(qkv, n, &b);

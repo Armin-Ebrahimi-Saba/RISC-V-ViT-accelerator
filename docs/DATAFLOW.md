@@ -139,7 +139,7 @@ accelerator applies those parameters to produce int16 output.*
 
 | Step | What happens |
 |---|---|
-| 7 | LayerNorm 1. The CPU rescales each token's row to zero mean and unit variance. The row statistics and 1/√variance are computed in fixed point, like the per-element work. |
+| 7 | LayerNorm 1. The CPU computes each token's mean and 1/√variance in fixed point, then z = (x − mean)/std channel by channel. The accelerator's requantisation job applies γ and β per channel, scales, saturates and writes the result token by token. |
 | 8 | GEMM + requant. The block's qkv weights produce query, key and value vectors for all 6 attention heads at once. |
 | 9 to 13 | Attention, repeated for each of the 6 heads. See the table below. Heads do not depend on each other, but run one after another today. |
 | 14 | GEMM + requant. The combined attention output is projected back to 384 dimensions. |
@@ -159,7 +159,7 @@ approximation.
 
 | Step | What happens |
 |---|---|
-| 9 | The CPU gathers this head's slice of the query, key and value vectors. It splits the query and value vectors into high and low int8 halves. |
+| 9 | The CPU gathers this head's slice of the query and value vectors and splits them into high and low int8 halves. The key vectors are read by the accelerator in place, in the qkv tensor. |
 | 10a, 10b | Two GEMMs compute the attention scores, one from the high halves and one from the low halves. They do not depend on each other, but run one after another today. |
 | 11 | Softmax. The CPU turns each row of scores into probabilities and divides them by the row sum, so that each row sums to 2^15. |
 | 12a, 12b | Two more GEMMs combine the probabilities with the value vector's high and low halves. |

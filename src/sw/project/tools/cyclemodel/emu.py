@@ -68,6 +68,8 @@ def run(elf_path, limit=4_000_000_000, profile_phase=-1, files=()):
     def mmio_read(uc, off, size, ud):
         c = int(st["cyc"]); return (c & 0xffffffff) if off == 4 else (c >> 32)
     def mmio_write(uc, off, size, value, ud):
+        if off == 24:
+            st["cyc"] += value                  # a stubbed job's estimated time
         if off == 20:
             print("output hash %08x" % value)
         if off == 12:

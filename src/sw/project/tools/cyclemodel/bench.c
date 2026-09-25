@@ -61,6 +61,11 @@ int dav2_accel_requant_rows_async(const int32_t *acc, int N, int M, int m0, int 
                                   const int32_t *par, int16_t *dst, int32_t *amax,
                                   const dav2_rq_epi_t *epi)
 { (void)acc;(void)N;(void)M;(void)m0;(void)mc;(void)par;(void)dst;(void)epi; *amax = 8000; return 1; }
+/* synchronous requantisation: the CPU waits for the job. Charged as
+ * 1.5 bus beats per element at 2 cycles per beat (MMIO[6] adds cycles). */
+int dav2_accel_requant(const int32_t *acc, int N, int M, const int32_t *params,
+                       int16_t *out, int32_t *amax_out)
+{ (void)acc;(void)params;(void)out; MMIO[6] = (uint32_t)(3 * N * M); *amax_out = 8000; return 1; }
 int dav2_accel_finish(void) { return 1; }
 int dav2_accel_busy(void) { return 0; }
 

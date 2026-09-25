@@ -1,4 +1,4 @@
-# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 4 s (estimated)
+# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 3.5 s (estimated)
 
 This is the record of the speed-up work: what was measured, what each change
 did, and what is left. Every step kept the FPGA output **bit-exact with the
@@ -642,6 +642,46 @@ are now 63 % of the CPU time. The software options for them that remain
 either lose accuracy (above) or save 1 to 2 Mcycles. The next large step
 is hardware: the LayerNorm row statistics or the softmax on the
 accelerator.
+
+### Round ten — LayerNorm on the requantisation job (estimated, not yet measured)
+
+The board was still not connected.
+
+| Change | Where | Tool (Mcycles) |
+|---|---|---|
+| LayerNorm with γ and β: the second half, out = (z γ[c] + β[c]) / scale, is a per-channel multiply, add and saturation, which is exactly the accelerator's requantisation job with the channels as its rows. The CPU computes only z = (x − mean) r in Q16 (one `mulh` per element), channel by channel, and keeps each channel's smallest and largest z. These give the exact output range before any output exists. The job applies γ, β and the scale, saturates, writes the output token by token and reports its range. Without an accelerator the CPU runs the same integer arithmetic. The tool charges the job 3 cycles per element (1.5 bus beats at 2 cycles). | `dav2_ops.c` | one call 2.04 → 1.26 |
+| Attention: k is no longer shifted to 11 bits and copied per head. The score GEMMs read it in place from qkv with its row stride, at 14 bits: 64 · 2047 · 8191 = 1.07·10^9 < 2^31. Only q is shifted and split. The score difference in the softmax is unsigned, since it can now exceed 2^31. | `dav2_engine.c` | one block 4.61 → 4.27 |
+| Softmax: 2^−f from a 1024-entry table (Q15, error below 11 units) instead of a parabola (error up to about 50 units), in the DDR3 arena. More accurate; about the same speed. | `dav2_engine.c` | in the line above |
+
+The accuracy test was extended to 11 images: the demo photo, all eight
+synthetic scenes and two photographs. Some synthetic scenes have an almost
+flat depth, so their 1 − r is larger and varies more. Mean of 1 − r
+against the float model:
+
+| Engine | Mean of 1 − r (11 images) |
+|---|---|
+| round seven | 2.16e-3 |
+| round nine | 1.69e-3 |
+| round ten | 1.69e-3 |
+
+On the demo image the correlation with PyTorch is 0.999898.
+
+Estimated whole frame, CPU time only: 183.8 → 161.2 Mcycles.
+
+| Operator | Round nine | Round ten |
+|---|---|---|
+| requantise | 16.5 | 16.5 |
+| attention | 53.7 | 47.7 |
+| layernorm | 62.7 | 46.1 |
+| gelu | 15.2 | 15.2 |
+| add/relu | 10.1 | 10.1 |
+| interpolate | 16.8 | 16.8 |
+| other | 8.8 | 8.8 |
+| total | 183.8 | 161.2 |
+
+With about 15 Mcycles of accelerator waits this is about 176 Mcycles,
+3.5 s per frame, if the board confirms the model. The boot self-test hash
+is now `7ca6973c`.
 
 ## 7. What is left, in order of expected gain
 
