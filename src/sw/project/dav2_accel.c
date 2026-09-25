@@ -77,8 +77,12 @@
 #define GEMM_ADD_MX   STUDENT_GEMM_ADD_MULT_X(0)
 #define GEMM_ADD_MH   STUDENT_GEMM_ADD_MULT_H(0)
 #define GEMM_ADD_SH   STUDENT_GEMM_ADD_SHIFT(0)
+#define GEMM_LUT_ADDR STUDENT_GEMM_LUT_ADDR(0)
 #define CTRL_ADD      0x8u
 #define CTRL_RELU     0x10u
+#define CTRL_LUT      0x20u
+#define CTRL_LUT_LOAD 0x40u
+#define CTRL_A16      0x80u
 
 #define STATUS_BUSY 0x1u
 #define STATUS_DONE 0x2u
@@ -105,6 +109,8 @@ static uint32_t accel_mcycle(void)
 static int      accel_probed;
 static int      accel_gather_ok = 1;   /* cleared if the gather self-test fails */
 static int      accel_epi_ok = 1;      /* cleared if the add/ReLU self-test fails */
+static int      accel_lut_ok;          /* CAPS bit 24, cleared if its self-test fails */
+static int      accel_a16_ok;          /* CAPS bit 25, cleared if its self-test fails */
 static int      accel_ok;
 static unsigned accel_nrows;
 static unsigned accel_kmax;
@@ -125,6 +131,8 @@ int dav2_accel_init(void)
     uint32_t caps = REG32(GEMM_CAPS);
     accel_nrows = caps & 0xffu;
     accel_kmax  = (caps >> 8) & 0xffffu;
+    accel_lut_ok = (int)((caps >> 24) & 1u);
+    accel_a16_ok = (int)((caps >> 25) & 1u);
 
     /* A missing block reads back as zero (or the bus errors out, which the
      * core reports separately); either way we simply stay on the CPU path. */
@@ -410,12 +418,14 @@ static int accel_wait_simple(const char *what)
 /* Requantise rows m0..m0+mc of acc (all N columns) into out; *amax is
  * raised to the largest |out| written (directly, or when a deferred last job
  * is collected by dav2_accel_finish). mc even, at most KMAX/2. */
-static int accel_requant_rows(const int32_t *acc, int N, int M, int m0, int mc,
+/* acc: int32 elements, or int16 with a16 (CTRL.a16) */
+static int accel_requant_rows(const void *acc, int N, int M, int m0, int mc,
                               const int32_t *params, int16_t *out, int32_t *amax,
-                              const dav2_rq_epi_t *epi)
+                              const dav2_rq_epi_t *epi, int a16)
 {
+    const unsigned esz = a16 ? 2u : 4u;
     const int nc_max = (int)accel_nrows;
-    uint32_t ctrl = CTRL_START | CTRL_REQUANT;
+    uint32_t ctrl = CTRL_START | CTRL_REQUANT | (a16 ? CTRL_A16 : 0u);
     if (!dav2_accel_finish())
         return 0;
     if (epi && epi->add) {
@@ -426,7 +436,12 @@ static int accel_requant_rows(const int32_t *acc, int N, int M, int m0, int mc,
     }
     if (epi && epi->relu)
         ctrl |= CTRL_RELU;
-    REG32(GEMM_A_STRIDE) = (uint32_t)N * 4u;
+    if (epi && epi->lut) {
+        REG32(GEMM_LUT_ADDR) = (uint32_t)(uintptr_t)epi->lut;
+        ctrl |= CTRL_LUT;
+    }
+    int lut_load = epi && epi->lut && epi->lut_load;
+    REG32(GEMM_A_STRIDE) = (uint32_t)N * esz;
     REG32(GEMM_C_STRIDE) = (uint32_t)M * 2u;
     REG32(GEMM_S_ADDR)   = 0u;
     REG32(GEMM_P_ADDR)   = (uint32_t)(uintptr_t)(params + (size_t)m0 * 3);
@@ -434,14 +449,16 @@ static int accel_requant_rows(const int32_t *acc, int N, int M, int m0, int mc,
     for (int n0 = 0; n0 < N; n0 += nc_max) {
         int nc = N - n0;
         if (nc > nc_max) nc = nc_max;
-        unsigned long beats = (unsigned long)mc * 3u + (unsigned long)mc * nc
-                            + (unsigned long)mc * nc / 2u;
-        REG32(GEMM_A_ADDR) = (uint32_t)(uintptr_t)(acc + (size_t)m0 * N + n0);
+        unsigned long beats = (unsigned long)mc * 3u + (unsigned long)mc * nc * esz / 4u
+                            + (unsigned long)mc * nc / 2u + (lut_load ? 8192u : 0u);
+        REG32(GEMM_A_ADDR) = (uint32_t)(uintptr_t)((const uint8_t *)acc
+                                                    + ((size_t)m0 * N + n0) * esz);
         REG32(GEMM_C_ADDR) = (uint32_t)(uintptr_t)(out + (size_t)n0 * M + m0);
         if (epi && epi->add)
             REG32(GEMM_X_ADDR) = (uint32_t)(uintptr_t)(epi->x + (size_t)n0 * M + m0);
         REG32(GEMM_N_ROWS) = (uint32_t)nc;
-        REG32(GEMM_CTRL)   = ctrl;
+        REG32(GEMM_CTRL)   = ctrl | (lut_load ? CTRL_LUT_LOAD : 0u);
+        lut_load = 0;                       /* the table stays in the block */
         if (accel_maybe_defer(n0 + nc >= N, beats, amax))
             return 2;
         if (!accel_wait_simple("requant"))
@@ -477,7 +494,7 @@ int dav2_accel_requant(const int32_t *acc, int N, int M, const int32_t *params,
     for (int m0 = 0; m0 < M; m0 += mc_max) {
         int mc = M - m0;
         if (mc > mc_max) mc = mc_max;
-        if (!accel_requant_rows(acc, N, M, m0, mc, params, out, &amax, 0))
+        if (!accel_requant_rows(acc, N, M, m0, mc, params, out, &amax, 0, 0))
             return 0;
     }
     if (amax_out) *amax_out = amax;
@@ -493,6 +510,8 @@ int dav2_accel_requant_rows_async(const int32_t *acc, int N, int M, int m0, int 
     const int add = epi && epi->add;
     if (epi && (epi->add || epi->relu) && !accel_epi_ok)
         return 0;
+    if (epi && epi->lut && (!accel_lut_ok || (((uintptr_t)epi->lut) & 3u)))
+        return 0;
     if (m0 < 0 || mc < 2 || (mc & 1) || m0 + mc > M
         || mc > (int)(accel_kmax / (add ? 4u : 2u)))
         return 0;
@@ -500,7 +519,7 @@ int dav2_accel_requant_rows_async(const int32_t *acc, int N, int M, int m0, int 
                 || epi->sh < 0 || epi->sh > 63 || epi->mx < 0 || epi->mh < 0))
         return 0;
     accel_defer = 1;
-    int r = accel_requant_rows(acc, N, M, m0, mc, params, out, amax, epi);
+    int r = accel_requant_rows(acc, N, M, m0, mc, params, out, amax, epi, 0);
     accel_defer = 0;
     return r;
 }
@@ -903,7 +922,7 @@ static int accel_check_epilogue(void)
         par[3 * m + 1] = 38 + (int32_t)(chk_rand(&seed) % 4u);
         par[3 * m + 2] = (int32_t)(chk_rand(&seed) % 2001u) - 1000;
     }
-    dav2_rq_epi_t epi = { x, 0x5a000000, 0x61000000, 31, 32, 1, 0 };
+    dav2_rq_epi_t epi = { x, 0x5a000000, 0x61000000, 31, 32, 1, 0, 0, 0 };
     int bad = 0;
     for (int pass = 0; pass < 2 && !bad; pass++) {
         int32_t amax = 0;
@@ -936,6 +955,130 @@ static int accel_check_epilogue(void)
         printf("GEMM accelerator: add/ReLU self-test ok\n");
     }
     return 0;      /* the plain paths are still good */
+}
+
+/* The lookup table (CTRL.lut): a random table in dav2_scratch (40 kB of
+ * on-chip RAM, free at boot), loaded with the first of two jobs and reused
+ * by the second, with and without ReLU. */
+static int accel_check_lut(void)
+{
+    if (!accel_lut_ok)
+        return 0;                      /* an older bitstream: GELU on the CPU */
+    enum { N = 20, M = 8 };
+    static int32_t par[3 * M] __attribute__((aligned(4)));
+    int32_t *acc = chk_sw;
+    int16_t *out = chk_a;
+    int16_t *tab = dav2_scratch;       /* 16384 int16 */
+    uint32_t seed = 0x2468aceu;
+    for (int i = 0; i < 16384; i++)
+        tab[i] = (int16_t)chk_rand(&seed);
+    for (int i = 0; i < M * N; i++)
+        acc[i] = (int32_t)(chk_rand(&seed) % 2000001u) - 1000000;
+    for (int m = 0; m < M; m++) {
+        par[3 * m]     = (int32_t)(0x40000000u + chk_rand(&seed) % 0x3fffffffu);
+        par[3 * m + 1] = 38 + (int32_t)(chk_rand(&seed) % 4u);
+        par[3 * m + 2] = (int32_t)(chk_rand(&seed) % 2001u) - 1000;
+    }
+    int bad = 0;
+    for (int pass = 0; pass < 2 && !bad; pass++) {
+        dav2_rq_epi_t epi = { 0, 0, 0, 0, 0, 0, pass, tab, pass == 0 };
+        int32_t amax = 0;
+        int r = dav2_accel_requant_rows_async(acc, N, M, 0, M, par, out, &amax, &epi);
+        if (r == 0 || !dav2_accel_finish()) {
+            printf("GEMM accelerator: lookup-table self-test could not run\n");
+            accel_lut_ok = 0;
+            return 0;
+        }
+        for (int n = 0; n < N; n++)
+            for (int m = 0; m < M; m++) {
+                int32_t h = chk_sat(chk_apply(acc[m * N + n], par[3 * m], par[3 * m + 1])
+                                    + par[3 * m + 2]);
+                if (pass && h < 0) h = 0;
+                int32_t e = tab[h + 8192];
+                if (out[n * M + m] != e) {
+                    if (bad < 4)
+                        printf("  lookup-table mismatch n=%d m=%d: hw %d != %d\n",
+                               n, m, (int)out[n * M + m], (int)e);
+                    bad++;
+                }
+            }
+    }
+    if (bad) {
+        printf("GEMM accelerator: LOOKUP-TABLE SELF-TEST FAILED (%d), GELU on the CPU\n", bad);
+        accel_lut_ok = 0;
+    } else {
+        printf("GEMM accelerator: lookup-table self-test ok\n");
+    }
+    return 0;      /* the other paths are still good */
+}
+
+int dav2_accel_lut_ok(void) { return accel_ok && accel_lut_ok; }
+
+/* int16 input (CTRL.a16): 8 rows of 20 int16, negative multipliers too,
+ * against the CPU's arithmetic. */
+static int accel_check_a16(void)
+{
+    if (!accel_a16_ok)
+        return 0;                      /* an older bitstream: LayerNorm on the CPU */
+    enum { N = 20, M = 8 };
+    static int32_t par[3 * M] __attribute__((aligned(4)));
+    int16_t *in  = chk_a;              /* M x N int16 */
+    int16_t *out = chk_a + 256;        /* N x M int16 */
+    uint32_t seed = 0x3579bdfu;
+    for (int i = 0; i < M * N; i++)
+        in[i] = (int16_t)((int32_t)(chk_rand(&seed) % 16383u) - 8191);
+    for (int m = 0; m < M; m++) {
+        int32_t mul = (int32_t)(0x40000000u + chk_rand(&seed) % 0x3fffffffu);
+        par[3 * m]     = (m & 1) ? -mul : mul;
+        par[3 * m + 1] = 30 + (int32_t)(chk_rand(&seed) % 4u);
+        par[3 * m + 2] = (int32_t)(chk_rand(&seed) % 2001u) - 1000;
+    }
+    int32_t amax = 0;
+    int bad = 0;
+    if (!dav2_accel_requant16(in, N, M, par, out, &amax)) {
+        printf("GEMM accelerator: int16-input self-test could not run\n");
+        accel_a16_ok = 0;
+        return 0;
+    }
+    for (int n = 0; n < N; n++)
+        for (int m = 0; m < M; m++) {
+            int32_t e = chk_sat(chk_apply(in[m * N + n], par[3 * m], par[3 * m + 1])
+                                + par[3 * m + 2]);
+            if (out[n * M + m] != e) {
+                if (bad < 4)
+                    printf("  int16-input mismatch n=%d m=%d: hw %d != %d\n",
+                           n, m, (int)out[n * M + m], (int)e);
+                bad++;
+            }
+        }
+    if (bad) {
+        printf("GEMM accelerator: INT16-INPUT SELF-TEST FAILED (%d), LayerNorm on the CPU\n", bad);
+        accel_a16_ok = 0;
+    } else {
+        printf("GEMM accelerator: int16-input self-test ok\n");
+    }
+    return 0;
+}
+
+int dav2_accel_requant16(const int16_t *in, int N, int M, const int32_t *params,
+                         int16_t *out, int32_t *amax_out)
+{
+    if (!dav2_accel_init() || !accel_a16_ok || (N & 1) || (M & 1) || N < 2 || M < 2)
+        return 0;
+    if ((((uintptr_t)in) | ((uintptr_t)params) | ((uintptr_t)out)) & 3u)
+        return 0;
+    const int mc_max = (int)(accel_kmax / 2u) & ~1;
+    int32_t amax = 0;
+    for (int m0 = 0; m0 < M; m0 += mc_max) {
+        int mc = M - m0;
+        if (mc > mc_max) mc = mc_max;
+        if (!accel_requant_rows(in, N, M, m0, mc, params, out, &amax, 0, 1))
+            return 0;
+    }
+    if (!dav2_accel_finish())
+        return 0;
+    *amax_out = amax;
+    return 1;
 }
 
 int dav2_accel_check(void)
@@ -981,6 +1124,10 @@ int dav2_accel_check(void)
         bad = accel_check_gather();
     if (!bad)
         bad = accel_check_epilogue();
+    if (!bad)
+        bad = accel_check_lut();
+    if (!bad)
+        bad = accel_check_a16();
     return bad;
 }
 
@@ -990,6 +1137,10 @@ int  dav2_accel_init(void)    { return 0; }
 int  dav2_accel_present(void) { return 0; }
 void dav2_accel_report(void)  { }
 int  dav2_accel_check(void)   { return 0; }
+int  dav2_accel_lut_ok(void)  { return 0; }
+int  dav2_accel_requant16(const int16_t *in, int N, int M, const int32_t *params,
+                          int16_t *out, int32_t *amax)
+{ (void)in; (void)N; (void)M; (void)params; (void)out; (void)amax; return 0; }
 
 int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc,
                      dav2_accel_stats_t *st)

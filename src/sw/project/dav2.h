@@ -131,6 +131,10 @@ void dav2_qgemm(const dav2_tensor_t *a, const dav2_qw_t *w, dav2_tensor_t *out);
 void dav2_qgemm_ex(const dav2_tensor_t *a, const dav2_qw_t *wt,
                    const dav2_tensor_t *res, int relu, dav2_tensor_t *out);
 
+/* dav2_qgemm then dav2_gelu, bit-identical. On the accelerator the GELU
+ * table is applied inside the requantisation job (CTRL.lut). */
+void dav2_qgemm_gelu(const dav2_tensor_t *a, const dav2_qw_t *w, dav2_tensor_t *out);
+
 /* LayerNorm over channels, producing a fresh dynamic scale. g_q15 = NULL
  * means no gamma and beta: out = (in - mean) / std. That is the final norm,
  * whose gamma and beta are folded offline into proj0..3

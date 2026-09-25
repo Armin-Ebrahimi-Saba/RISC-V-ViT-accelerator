@@ -59,6 +59,8 @@ module student_gemm_tb;
   localparam logic [31:0] R_ADD_MX   = 32'h68;
   localparam logic [31:0] R_ADD_MH   = 32'h6c;
   localparam logic [31:0] R_ADD_SH   = 32'h70;
+  localparam logic [31:0] R_LUT_ADDR = 32'h74;
+  localparam logic [31:0] L_BASE     = 32'h801C_0000;   // requant: lookup table
   localparam logic [31:0] X_BASE     = 32'h8016_0000;   // requant: residual
   localparam logic [31:0] S_BASE     = 32'h800C_0000;   // per-row {max,min}
   localparam logic [31:0] P_BASE     = 32'h800D_0000;   // requant params
@@ -516,6 +518,181 @@ module student_gemm_tb;
       $display("  ok, %0d outputs", ndim * mdim);
   endtask
 
+  // Requantisation with the lookup table: out = LUT[e + 8192], e the value
+  // after the optional add and ReLU. The table is random; the first job
+  // loads it (CTRL.lut_load), the later chunks reuse it. Chunks of 256 rows
+  // so the reuse is exercised.
+  task automatic run_requant_lut(input int ndim, input int mdim, input int add, input int relu);
+    int mismatches = 0;
+    logic [31:0] st;
+    int guard;
+    int first = 1;
+    longint mx = 32'h4000_0000 + ($urandom % 32'h3fff_ffff);
+    longint mh = 32'h4000_0000 + ($urandom % 32'h3fff_ffff);
+    int sx = 31 + ($urandom % 2), shh = 31 + ($urandom % 2);
+    $display("--- REQUANT+LUT%s%s N=%0d M=%0d", add ? "+ADD" : "", relu ? "+RELU" : "", ndim, mdim);
+
+    for (int i = 0; i < 8192; i++)
+      memory.mem[mem_word(L_BASE) + i] = $urandom;
+    for (int m = 0; m < mdim; m++) begin
+      memory.mem[mem_word(P_BASE) + 3*m]     = 32'h4000_0000 + ($urandom % 32'h3fff_ffff);
+      memory.mem[mem_word(P_BASE) + 3*m + 1] = 36 + ($urandom % 6);
+      memory.mem[mem_word(P_BASE) + 3*m + 2] = 32'($signed($urandom % 2001) - 1000);
+    end
+    for (int i = 0; i < ndim * mdim / 2; i++) begin
+      memory.mem[mem_word(X_BASE) + i] = {16'($signed($urandom % 16383) - 8191),
+                                          16'($signed($urandom % 16383) - 8191)};
+      memory.mem[mem_word(O_BASE) + i] = 32'hdead_beef;
+    end
+
+    for (int n0 = 0; n0 < ndim; n0 += NROWS) begin
+      int nc = (ndim - n0 > int'(NROWS)) ? NROWS : ndim - n0;
+      for (int m0 = 0; m0 < mdim; m0 += 256) begin
+        int mc = (mdim - m0 > 256) ? 256 : mdim - m0;
+        bus.put_word(R_A_ADDR,   C_BASE + 32'((m0 * ndim + n0) * 4));
+        bus.put_word(R_A_STRIDE, ndim * 4);
+        bus.put_word(R_P_ADDR,   P_BASE + 32'(m0 * 12));
+        bus.put_word(R_C_ADDR,   O_BASE + 32'(n0 * mdim * 2 + m0 * 2));
+        bus.put_word(R_X_ADDR,   X_BASE + 32'(n0 * mdim * 2 + m0 * 2));
+        bus.put_word(R_C_STRIDE, mdim * 2);
+        bus.put_word(R_ADD_MX,   32'(mx));
+        bus.put_word(R_ADD_MH,   32'(mh));
+        bus.put_word(R_ADD_SH,   {18'd0, 6'(shh), 2'd0, 6'(sx)});
+        bus.put_word(R_LUT_ADDR, L_BASE);
+        bus.put_word(R_M_LEN,    mc);
+        bus.put_word(R_N_ROWS,   nc);
+        bus.put_word(R_CTRL,     32'h3 | (add ? 32'h8 : 0) | (relu ? 32'h10 : 0)
+                               | 32'h20 | (first ? 32'h40 : 0));
+        first = 0;
+        guard = 0;
+        forever begin
+          bus.get_word(R_STATUS, st);
+          if (!(st & 32'h1)) break;
+          if (++guard > 400000) begin
+            $display("FAIL: lookup-table job did not finish (status=0x%08x)", st);
+            errors++;
+            return;
+          end
+        end
+      end
+    end
+
+    for (int n = 0; n < ndim; n++) begin
+      for (int m = 0; m < mdim; m++) begin
+        longint acc  = longint'(int'(memory.mem[mem_word(C_BASE) + m * ndim + n]));
+        longint mult = longint'(int'(memory.mem[mem_word(P_BASE) + 3*m]));
+        int     sh   = int'(memory.mem[mem_word(P_BASE) + 3*m + 1]);
+        longint bias = longint'(int'(memory.mem[mem_word(P_BASE) + 3*m + 2]));
+        int     idx  = n * mdim + m;
+        logic [31:0] xw = memory.mem[mem_word(X_BASE) + (idx >> 1)];
+        longint x    = idx[0] ? longint'($signed(xw[31:16])) : longint'($signed(xw[15:0]));
+        int     h    = sat14(apply_mult(acc, mult, sh) + bias);
+        int     e    = add ? sat14(longint'(int'(apply_mult(x, mx, sx))) +
+                               longint'(int'(apply_mult(h, mh, shh)))) : h;
+        int     li;
+        logic [31:0] lw, w;
+        int     got;
+        if (relu && e < 0) e = 0;
+        li  = e + 8192;
+        lw  = memory.mem[mem_word(L_BASE) + (li >> 1)];
+        e   = li[0] ? int'($signed(lw[31:16])) : int'($signed(lw[15:0]));
+        w   = memory.mem[mem_word(O_BASE) + (idx >> 1)];
+        got = idx[0] ? int'($signed(w[31:16])) : int'($signed(w[15:0]));
+        checks++;
+        if (got !== e) begin
+          if (mismatches < 5)
+            $display("  FAIL n=%0d m=%0d: got %0d expected %0d", n, m, got, e);
+          mismatches++;
+        end
+      end
+    end
+    if (mismatches) begin
+      $display("  %0d/%0d outputs wrong", mismatches, ndim * mdim);
+      errors += mismatches;
+    end else
+      $display("  ok, %0d outputs", ndim * mdim);
+  endtask
+
+  // Requantisation over int16 input (CTRL.a16): acc[m][n] int16, rows of
+  // ndim int16 (ndim even), optionally with the lookup table too.
+  task automatic run_requant_a16(input int ndim, input int mdim, input int lut);
+    int mismatches = 0;
+    logic [31:0] st;
+    int guard;
+    localparam logic [31:0] H_BASE = 32'h8018_0000;   // int16 input
+    $display("--- REQUANT A16%s N=%0d M=%0d", lut ? "+LUT" : "", ndim, mdim);
+    for (int i = 0; i < ndim * mdim / 2; i++) begin
+      memory.mem[mem_word(H_BASE) + i] = {16'($signed($urandom % 16383) - 8191),
+                                          16'($signed($urandom % 16383) - 8191)};
+      memory.mem[mem_word(O_BASE) + i] = 32'hdead_beef;
+    end
+    if (lut)
+      for (int i = 0; i < 8192; i++)
+        memory.mem[mem_word(L_BASE) + i] = $urandom;
+    for (int m = 0; m < mdim; m++) begin
+      memory.mem[mem_word(P_BASE) + 3*m]     = ($urandom % 2) ? 32'h4000_0000 + ($urandom % 32'h3fff_ffff)
+                                                             : -(32'h4000_0000 + ($urandom % 32'h3fff_ffff));
+      memory.mem[mem_word(P_BASE) + 3*m + 1] = 30 + ($urandom % 6);
+      memory.mem[mem_word(P_BASE) + 3*m + 2] = 32'($signed($urandom % 2001) - 1000);
+    end
+    for (int n0 = 0; n0 < ndim; n0 += NROWS) begin
+      int nc = (ndim - n0 > int'(NROWS)) ? NROWS : ndim - n0;
+      for (int m0 = 0; m0 < mdim; m0 += 256) begin
+        int mc = (mdim - m0 > 256) ? 256 : mdim - m0;
+        bus.put_word(R_A_ADDR,   H_BASE + 32'((m0 * ndim + n0) * 2));
+        bus.put_word(R_A_STRIDE, ndim * 2);
+        bus.put_word(R_P_ADDR,   P_BASE + 32'(m0 * 12));
+        bus.put_word(R_C_ADDR,   O_BASE + 32'(n0 * mdim * 2 + m0 * 2));
+        bus.put_word(R_C_STRIDE, mdim * 2);
+        bus.put_word(R_LUT_ADDR, L_BASE);
+        bus.put_word(R_M_LEN,    mc);
+        bus.put_word(R_N_ROWS,   nc);
+        bus.put_word(R_CTRL,     32'h83 | (lut ? 32'h60 : 0));
+        guard = 0;
+        forever begin
+          bus.get_word(R_STATUS, st);
+          if (!(st & 32'h1)) break;
+          if (++guard > 400000) begin
+            $display("FAIL: A16 job did not finish (status=0x%08x)", st);
+            errors++;
+            return;
+          end
+        end
+      end
+    end
+    for (int n = 0; n < ndim; n++) begin
+      for (int m = 0; m < mdim; m++) begin
+        int     ai   = m * ndim + n;
+        logic [31:0] aw = memory.mem[mem_word(H_BASE) + (ai >> 1)];
+        longint acc  = ai[0] ? longint'($signed(aw[31:16])) : longint'($signed(aw[15:0]));
+        longint mult = longint'(int'(memory.mem[mem_word(P_BASE) + 3*m]));
+        int     sh   = int'(memory.mem[mem_word(P_BASE) + 3*m + 1]);
+        longint bias = longint'(int'(memory.mem[mem_word(P_BASE) + 3*m + 2]));
+        int     idx  = n * mdim + m;
+        int     e    = sat14(apply_mult(acc, mult, sh) + bias);
+        logic [31:0] w, lw;
+        int     got;
+        if (lut) begin
+          lw = memory.mem[mem_word(L_BASE) + ((e + 8192) >> 1)];
+          e  = ((e + 8192) & 1) ? int'($signed(lw[31:16])) : int'($signed(lw[15:0]));
+        end
+        w   = memory.mem[mem_word(O_BASE) + (idx >> 1)];
+        got = idx[0] ? int'($signed(w[31:16])) : int'($signed(w[15:0]));
+        checks++;
+        if (got !== e) begin
+          if (mismatches < 5)
+            $display("  FAIL n=%0d m=%0d: got %0d expected %0d", n, m, got, e);
+          mismatches++;
+        end
+      end
+    end
+    if (mismatches) begin
+      $display("  %0d/%0d outputs wrong", mismatches, ndim * mdim);
+      errors += mismatches;
+    end else
+      $display("  ok, %0d outputs", ndim * mdim);
+  endtask
+
   task automatic run_requant(input int ndim, input int mdim, input int sh_min = 33);
     int mismatches = 0;
     logic [31:0] st;
@@ -666,6 +843,18 @@ module student_gemm_tb;
     run_gemm(70, 96, 1100);  run_requant_epi(70, 1100, 1);  // 512 + 512 + 76 rows
     run_gemm(130, 64, 8);    run_requant_epi(130, 8, 2);    // two n-tiles
     run_gemm(70, 96, 1100);  run_requant(70, 1100);   // M over one param chunk
+    // lookup table (GELU): plain, with ReLU, with add; several chunks
+    run_gemm(82, 96, 600);   run_requant_lut(82, 600, 0, 0);   // 3 chunks, table reused
+    run_requant_lut(82, 600, 0, 1);
+    run_gemm(20, 64, 30);    run_requant_lut(20, 30, 1, 0);
+    run_gemm(130, 64, 8);    run_requant_lut(130, 8, 1, 1);    // two n-tiles
+    // int16 input: LayerNorm's two shapes (tokens as rows, channels as
+    // rows), n-tiles, negative multipliers, and with the table
+    run_requant_a16(384, 82, 0);                     // 3 n-tiles of 128
+    run_requant_a16(82, 384, 0);                     // 2 m-chunks
+    run_requant_a16(20, 30, 1);
+    // and a plain job afterwards must not use the table
+    run_gemm(20, 64, 30);    run_requant_epi(20, 30, 1);
     stats_addr = 0;
 
     // Convolutions through gather mode.

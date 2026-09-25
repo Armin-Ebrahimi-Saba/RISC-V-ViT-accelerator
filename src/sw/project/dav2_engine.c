@@ -501,9 +501,7 @@ static void run_block(dav2_tensor_t *x, int16_t **spare, int i, int n_tokens)
 
     BDUMP("ln2", &n2);
     dav2_tensor_t h1 = dav2_tensor_new(n_tokens, 4 * ED);
-    dav2_qgemm(&n2, &bw.fc1, &h1);
-    BDUMP("fc1", &h1);
-    dav2_gelu(&h1);
+    dav2_qgemm_gelu(&n2, &bw.fc1, &h1);        /* GELU in the requantisation job */
     BDUMP("gelu", &h1);
 
     /* x = x + fc2(h1), likewise fused */

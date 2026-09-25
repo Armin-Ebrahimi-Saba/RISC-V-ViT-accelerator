@@ -28,7 +28,8 @@ static uint32_t regs[NREGS];
 
 /* the latched job */
 static struct {
-    int      busy, requant, gather, add, relu;
+    int      busy, requant, gather, add, relu, lut, lut_load, a16;
+    uint32_t lut_addr;
     uint32_t x_addr, add_mx, add_mh, add_shift;
     uint32_t a_addr, a_stride, w_addr, w_stride, c_addr, c_stride, s_addr, p_addr;
     uint32_t k, m, n;
@@ -38,6 +39,10 @@ static struct {
 } job;
 
 static void *ptr(uint32_t a) { return (void *)(uintptr_t)a; }
+
+/* the block's lookup-table RAM (CTRL.lut), kept between jobs */
+static int16_t lut_tab[16384];
+static int     lut_valid;
 
 static void fail(const char *what)
 {
@@ -104,10 +109,16 @@ static void requant_all(void)
 {
     const int32_t *par = (const int32_t *)ptr(job.p_addr);
     int32_t amax = 0;
+    if (job.lut_load) {
+        memcpy(lut_tab, ptr(job.lut_addr), sizeof lut_tab);
+        lut_valid = 1;
+    }
+    if (job.lut && !lut_valid) fail("CTRL.lut before any table was loaded");
     for (uint32_t n = 0; n < job.n; n++) {
         int16_t *orow = (int16_t *)ptr(job.c_addr + n * job.c_stride);
         for (uint32_t m = 0; m < job.m; m++) {
-            int64_t acc = ((const int32_t *)ptr(job.a_addr + m * job.a_stride))[n];
+            int64_t acc = job.a16 ? ((const int16_t *)ptr(job.a_addr + m * job.a_stride))[n]
+                                  : ((const int32_t *)ptr(job.a_addr + m * job.a_stride))[n];
             int64_t mult = par[3 * m];
             int     sh   = par[3 * m + 1];
             int64_t r = acc * mult;
@@ -123,6 +134,7 @@ static void requant_all(void)
                 r = v > 8191 ? 8191 : v < -8191 ? -8191 : v;
             }
             if (job.relu && r < 0) r = 0;
+            if (job.lut) r = lut_tab[r + 8192];
             orow[m] = (int16_t)r;
             int32_t a = r < 0 ? (int32_t)-r : (int32_t)r;
             if (a > amax) amax = a;
@@ -145,6 +157,12 @@ static void latch(void)
     job.gather   = ((ctrl >> 2) & 1u) && !job.requant;
     job.add      = ((ctrl >> 3) & 1u) && job.requant;
     job.relu     = ((ctrl >> 4) & 1u) && job.requant;
+    job.lut      = ((ctrl >> 5) & 1u) && job.requant;
+    job.lut_load = ((ctrl >> 6) & 1u) && job.requant;
+    job.lut_addr = R(LUT_ADDR);
+    job.a16      = ((ctrl >> 7) & 1u) && job.requant;
+    if (job.a16 && (job.n & 1u)) fail("requant A16: N_ROWS odd");
+    if (job.lut_load && (job.lut_addr & 3u)) fail("LUT_ADDR unaligned");
     job.x_addr   = R(X_ADDR);   job.add_mx = R(ADD_MULT_X);
     job.add_mh   = R(ADD_MULT_H); job.add_shift = R(ADD_SHIFT);
     job.a_addr   = R(A_ADDR);   job.a_stride = R(A_STRIDE);
@@ -207,7 +225,7 @@ volatile uint32_t *dav2_emu_reg(uint32_t addr)
     static int init;
     if (!init) {
         init = 1;
-        R(CAPS) = ((uint32_t)KMAX << 8) | NROWS;
+        R(CAPS) = (3u << 24) | ((uint32_t)KMAX << 8) | NROWS;   /* bits 24, 25: table, int16 input */
     }
     if (addr < STUDENT_GEMM0_BASE_ADDR || addr >= STUDENT_GEMM0_BASE_ADDR + NREGS * 4u)
         fail("register access outside the block");

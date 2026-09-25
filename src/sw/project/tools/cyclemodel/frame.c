@@ -67,6 +67,12 @@ int dav2_accel_requant(const int32_t *acc, int N, int M, const int32_t *params,
                        int16_t *out, int32_t *amax_out)
 { (void)acc;(void)params;(void)out; MMIO[6] = (uint32_t)(3 * N * M); *amax_out = 8000; return 1; }
 int dav2_accel_finish(void) { return 1; }
+int dav2_accel_lut_ok(void) { return 1; }   /* GELU in the requantisation job */
+/* int16-input requantisation (LayerNorm): N*M/2 words in and out, charged
+ * at 2 cycles per beat */
+int dav2_accel_requant16(const int16_t *in, int N, int M, const int32_t *params,
+                         int16_t *out, int32_t *amax)
+{ (void)in;(void)params;(void)out; MMIO[6] = (uint32_t)(2 * N * M); *amax = 8000; return 1; }
 int dav2_accel_busy(void) { return 0; }
 
 

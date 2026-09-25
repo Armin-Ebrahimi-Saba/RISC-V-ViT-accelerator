@@ -1,4 +1,4 @@
-# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 3.1 s (estimated)
+# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 2.9 s (estimated)
 
 This is the record of the speed-up work: what was measured, what each change
 did, and what is left. Every step kept the FPGA output **bit-exact with the
@@ -722,6 +722,46 @@ may cost a little on photographs (less than two standard errors; on the
 synthetic scenes they were better). In absolute terms all of them stay
 near r = 0.999: the median 1 − r over the 24 crops is 4.1e-4 for both
 round seven and round eleven.
+
+### Round twelve — GELU and LayerNorm on the accelerator (hardware; estimated, not yet measured)
+
+The FPGA had most of its resources free (LUT 18.9 %, BRAM 54.4 %, DSP
+20.4 %), so this round moved work from the CPU into `student_gemm`. Two
+features were added to the requantisation job; both are announced in
+`CAPS` and have a boot self-test, and without them the same arithmetic
+runs on the CPU.
+
+| Change | Where | Tool (Mcycles per frame) |
+|---|---|---|
+| **Lookup table** (`CTRL.lut`, `CTRL.lut_load`, `LUT_ADDR`): after saturation, add and ReLU, out = LUT[v + 8192], a 16384 × int16 table in 8 BRAM36, one more pipeline stage (q12). The first job of a GEMM loads the table (8192 words), later jobs reuse it. fc1's requantisation applies GELU this way (`dav2_qgemm_gelu`); the CPU only builds the table (the same table as before, so the same output). | `student_gemm.sv`, `dav2_ops.c`, `dav2_engine.c` | gelu 15.2 → 2.5 |
+| **int16 input** (`CTRL.a16`): the job reads int16 values, two per word; the loader writes each word into two tile rows, the output stage takes the half by the column's parity. LayerNorm with γ and β is now two such jobs: z = (x − mean) r at a common 14-bit scale (tokens as rows), then z γ + β (channels as rows). The CPU keeps the row statistics and the channels' ranges, so the output range stays exact. | `student_gemm.sv`, `dav2_ops.c` | layernorm 35.1 → 31.6 |
+
+Estimated whole frame, CPU time only: 140.0 → 128.8 Mcycles; with about
+15 Mcycles of accelerator waits about 145 Mcycles, 2.9 s per frame. The
+new jobs are charged in the tool at 2 to 3 cycles per element, as bus
+time the CPU waits for.
+
+Checks:
+
+- `student_gemm_tb` has new tests for both features: the table alone,
+  with ReLU, with the add, over several chunks (loaded once, reused) and
+  two row tiles; int16 input in LayerNorm's two shapes (three column
+  tiles; two row chunks) with negative multipliers, and with the table. A
+  plain job after them does not use the table. PASSED, 579,005 words
+  checked.
+- `dav2_host` (CPU arithmetic) and `dav2_host_emu` (the accelerator
+  emulator, which models both features) give the same output on all 11
+  test images.
+- Accuracy on the 24 photo crops against round eleven: +6 % ± 6 % in
+  1 − r, within the noise; the median 1 − r is unchanged (4.1e-4). The
+  two-job LayerNorm keeps z at 14 bits: its largest error in a unit test
+  is 2 output steps instead of 1.
+- Bitstream: timing met, WNS +0.395 ns, WHS +0.029 ns, 0 failing endpoints. Resources: LUT 19.4 % (25,935, +615), BRAM 56.6 % (206.5 tiles, +8 for the table), DSP 20.4 % (151, unchanged). The DRC report still lists 20 REQP-1840 warnings (RAMB18 async control check) on the parameter RAM's enable pins, driven by the state machine and the read buffer, which have an asynchronous reset; this kind existed before. The ones this round's counters caused on RAM address pins were removed (the counters rq_m_q, rq_p_cnt_q and lut_cnt_q no longer have a reset: every job sets them).
+
+LayerNorm is now mostly the CPU's range tracking: a compare per value in
+the statistics pass and in the channel pass (a taken branch costs 3
+cycles). Row statistics written by the job itself, as the GEMM drain
+already does, would remove the channel pass.
 
 ## 7. What is left, in order of expected gain
 

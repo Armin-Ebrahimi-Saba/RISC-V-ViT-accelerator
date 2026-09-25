@@ -183,6 +183,25 @@ a GEMM doesn't need a pass of its own:
   by the bus anyway (~6 cycles per element), so this costs nothing. A chunk
   is at most 512 rows in this mode.
 - **`CTRL.relu`** — clamp the output at 0.
+- **`CTRL.lut`** — map the final value v through a lookup table,
+  out = LUT[v + 8192]. The table has one int16 per possible value
+  (16384 entries, 8192 words in 8 BRAM36). With **`CTRL.lut_load`** the
+  job first reads it from `LUT_ADDR`; later jobs reuse it. The engine
+  loads the GELU table for fc1's result here, so the GELU pass on the CPU
+  disappears. It is one pipeline stage (q12) after saturation and ReLU.
+
+A second input format serves LayerNorm:
+
+- **`CTRL.a16`** — the input is int16 instead of int32, two per word.
+  The loader writes each word into two tile rows, and the output stage
+  takes the low or the high half by the column's parity. LayerNorm runs
+  as two such jobs: z = (x − mean)·r at a common 14-bit scale with the
+  tokens as rows, then z·γ + β with the channels as rows. The CPU keeps
+  the row statistics and the channel ranges.
+
+`CAPS` bits 24 and 25 announce the lookup table and the int16 input. The
+driver uses them only when the bit is set and its boot self-test passes;
+otherwise the same arithmetic runs on the CPU.
 
 The add needs the output scale of *h* before any *h* exists. Per row,
 requantisation is non-decreasing in the accumulator, so the row's largest

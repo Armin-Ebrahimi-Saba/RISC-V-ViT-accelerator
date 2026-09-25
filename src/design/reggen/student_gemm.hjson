@@ -90,6 +90,21 @@
           desc: "Requantisation job only: 1 - clamp the final output below at 0."
         }
         {
+          bits: 5
+          name: "lut"
+          desc: "Requantisation job only: 1 - map the final output v (after add and ReLU) through the lookup table: out = LUT[v + 8192], an int16. Used for GELU. Present when CAPS bit 24 is set."
+        }
+        {
+          bits: 6
+          name: "lut_load"
+          desc: "Requantisation job only: 1 - first load the lookup table from LUT_ADDR: 8192 words, word i holding LUT[2i] in bits 15:0 and LUT[2i+1] in bits 31:16. The table is kept for later jobs."
+        }
+        {
+          bits: 7
+          name: "a16"
+          desc: "Requantisation job only: 1 - the input acc[m][n] is int16 instead of int32: rows of N_ROWS int16 (N_ROWS even), two per word, rows A_STRIDE bytes apart. Present when CAPS bit 25 is set."
+        }
+        {
           bits: 2
           name: "gather"
           desc: "GEMM job only: 1 - the A tile is gathered from an NHWC int16 image as im2col would lay it out (G_ADDR, G_GEOM, G_CHAN, G_CONV, G_START), instead of read from A_ADDR. K_LEN must equal kpos_count * C. C must be even."
@@ -201,7 +216,7 @@
     }
     {
       name: caps
-      desc: "Hardware capabilities: bits [7:0] = NROWS, bits [23:8] = KMAX. Reads 0 when no accelerator is present."
+      desc: "Hardware capabilities: bits [7:0] = NROWS, bits [23:8] = KMAX, bit 24 = the requantisation lookup table (CTRL.lut) exists, bit 25 = the int16 requantisation input (CTRL.a16) exists. Reads 0 when no accelerator is present."
       swaccess: ro
       hwaccess: hwo
       hwext: "true"
@@ -475,6 +490,20 @@
     {
       name: add_shift
       desc: "Requantisation job with CTRL.add: shift for the residual (bits 5:0) and for the requantised value (bits 13:8)."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: lut_addr
+      desc: "Requantisation job with CTRL.lut_load: byte address of the lookup table, 8192 words. 4-byte aligned."
       swaccess: rw
       hwaccess: hro
       fields:

@@ -139,14 +139,14 @@ accelerator applies those parameters to produce int16 output.*
 
 | Step | What happens |
 |---|---|
-| 7 | LayerNorm 1. The CPU computes each token's mean and 1/√variance in fixed point, then z = (x − mean)/std channel by channel. The accelerator's requantisation job applies γ and β per channel, scales, saturates and writes the result token by token. |
+| 7 | LayerNorm 1. The CPU computes each token's mean, 1/√variance and range in fixed point. A first requantisation job (int16 input, tokens as rows) computes z = (x − mean)/std at a common 14-bit scale and writes it channel by channel. The CPU finds each channel's range; a second job applies γ and β per channel, scales, saturates and writes the result token by token. |
 | 8 | GEMM + requant. The block's qkv weights produce query, key and value vectors for all 6 attention heads at once. |
 | 9 to 13 | Attention, repeated for each of the 6 heads. See the table below. Heads do not depend on each other, but run one after another today. |
 | 14 | GEMM + requant. The combined attention output is projected back to 384 dimensions. |
 | 15 | Residual add. The block's output is added to its input, so information is not lost. This runs inside step 14's requantisation job, on the accelerator, and updates the token matrix in place. |
 | 16 | LayerNorm 2, the same idea as step 7. |
-| 17 | GEMM + requant. The MLP's first layer expands the data from 384 to 1536 dimensions. |
-| 18 | GELU. A smooth activation function, applied to each element. It uses a 257-entry lookup table with linear interpolation, because the CPU has no floating-point unit. The table is built from a fixed Φ table in the program. |
+| 17 | GEMM + requant + GELU. The MLP's first layer expands the data from 384 to 1536 dimensions. The requantisation job also applies GELU through its lookup table. |
+| 18 | GELU. A smooth activation function, applied to each element. The CPU builds a table with one output per possible input (16384 entries, from 257 interpolated points of a fixed Φ table); the accelerator loads it with step 17's first job and applies it to every element. |
 | 19 | GEMM + requant. The MLP's second layer compresses the data back to 384 dimensions. |
 | 20 | Residual add, the same idea as step 15, inside step 19's requantisation job. The result feeds the next block's step 7. |
 | 21 | After blocks 3, 6, 9 and 12 only: a normalised copy of the data is saved as one of the four feature maps the decoder needs. |

@@ -458,11 +458,19 @@ typedef struct { int h, w, k, stride, pad; } conv_desc_t;
 
 static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
                        const dav2_qw_t *wt, const dav2_tensor_t *res, int relu,
-                       dav2_tensor_t *out);
+                       int gelu, dav2_tensor_t *out);
+static int16_t *gelu_table(dav2_xf_t in_scale, dav2_xf_t *out_scale_ret);
 
 void dav2_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, dav2_tensor_t *out)
 {
-    qgemm_impl(a, 0, wt, 0, 0, out);
+    qgemm_impl(a, 0, wt, 0, 0, 0, out);
+}
+
+/* dav2_qgemm then dav2_gelu, bit-identical; on the accelerator the GELU
+ * table is applied inside the requantisation job (CTRL.lut). */
+void dav2_qgemm_gelu(const dav2_tensor_t *a, const dav2_qw_t *wt, dav2_tensor_t *out)
+{
+    qgemm_impl(a, 0, wt, 0, 0, 1, out);
 }
 
 /* dav2_qgemm followed by dav2_add(res, result) and/or dav2_relu, with the
@@ -472,14 +480,14 @@ void dav2_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, dav2_tensor_t *out)
 void dav2_qgemm_ex(const dav2_tensor_t *a, const dav2_qw_t *wt,
                    const dav2_tensor_t *res, int relu, dav2_tensor_t *out)
 {
-    qgemm_impl(a, 0, wt, res, relu, out);
+    qgemm_impl(a, 0, wt, res, relu, 0, out);
 }
 
 /* a is the input image when cv is set: N = output pixels, K = k*k*C.
  * res, relu: the epilogue, see dav2_qgemm_ex. */
 static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
                        const dav2_qw_t *wt, const dav2_tensor_t *res, int relu,
-                       dav2_tensor_t *out)
+                       int gelu, dav2_tensor_t *out)
 {
     const int M = wt->m;
     const int N = cv ? ((cv->h + 2 * cv->pad - cv->k) / cv->stride + 1)
@@ -704,6 +712,20 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
         dav2_rq_epi_t epi;
         memset(&epi, 0, sizeof epi);
         epi.relu = relu;
+        uint64_t gelu_cycles = 0;
+        if (gelu && dav2_accel_lut_ok()) {
+            /* GELU inside the job: the table for this result's scale goes
+             * into the block's lookup-table RAM with the first chunk */
+            uint64_t g0 = dav2_cycles();
+            dav2_xf_t gscale;
+            int16_t *tab = gelu_table(out_scale, &gscale);
+            if (tab) {
+                epi.lut = tab;
+                epi.lut_load = 1;
+                fin_scale = gscale;
+            }
+            gelu_cycles = dav2_cycles() - g0;
+        }
         if (res) {
             /* The add's scale needs the largest |h| of this result before
              * any h exists. Per row, h is a non-decreasing function of the
@@ -745,7 +767,8 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
             PAR_UPTO(m0 + mc);                    /* overlaps the previous chunk */
             uint64_t w0 = dav2_cycles();
             ok = dav2_accel_requant_rows_async(acc, N, M, m0, mc, par, dst, &rq_amax,
-                                               (epi.add || epi.relu) ? &epi : 0) != 0;
+                                               (epi.add || epi.relu || epi.lut) ? &epi : 0) != 0;
+            epi.lut_load = 0;                     /* the block keeps the table */
             waited += dav2_cycles() - w0;         /* includes settling the previous */
         }
         if (ok) {
@@ -758,12 +781,15 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
         if (ok) {
             uint64_t now = dav2_cycles();
             dav2_prof_add(DAV2_PROF_GEMM_ACCEL, waited);
-            dav2_prof_add(DAV2_PROF_REQUANT, (now - t_start) - waited);
+            dav2_prof_add(DAV2_PROF_GELU, gelu_cycles);
+            dav2_prof_add(DAV2_PROF_REQUANT, (now - t_start) - waited - gelu_cycles);
             out->n = N;
             out->c = M;
             out->scale = fin_scale;
-            out->amax_q = rq_amax;
+            out->amax_q = epi.lut ? -1 : rq_amax;
             trace_tensor("qgemm", out);
+            if (gelu && !epi.lut)
+                dav2_gelu(out);                   /* no lookup table: on the CPU */
             dav2_arena_release(mark);
             return;
         }
@@ -847,6 +873,8 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
         dav2_add(res, hdst, out);
     if (relu)
         dav2_relu(out);
+    if (gelu)
+        dav2_gelu(out);
     dav2_arena_release(mark);
     return;
 
@@ -855,7 +883,7 @@ redo_on_cpu:
      * printed why); acc is incomplete. Start over -- every path is now the
      * CPU's. */
     dav2_arena_release(mark);
-    qgemm_impl(a, cv, wt, res, relu, out);
+    qgemm_impl(a, cv, wt, res, relu, gelu, out);
 }
 
 /* -------------------------------------------------------------- LayerNorm */
@@ -868,7 +896,7 @@ static inline int32_t mul_hi_round(int32_t d, int32_t mult, int32_t rnd, int s)
     return (mulh32(d, mult) + rnd) >> s;
 }
 
-static void layernorm_affine(const dav2_tensor_t *in, const int32_t *gq,
+static void layernorm_affine_cpu(const dav2_tensor_t *in, const int32_t *gq,
                              const int32_t *bq, dav2_tensor_t *out)
 {
     const int N = in->n, C = in->c;
@@ -1048,6 +1076,193 @@ static void layernorm_affine(const dav2_tensor_t *in, const int32_t *gq,
             }
         }
     }
+    SUB_LAP(DAV2_SUB_LN_OUT);
+    out->scale = out_scale;
+    out->n = N;
+    out->c = C;
+    out->amax_q = omax;
+    dav2_arena_release(mark);
+}
+
+/* A requantisation job over int16 input (the block's A16 mode):
+ * out[n][m] = sat14(round(in[m][n] * mult_m / 2^shift_m) + bias_m), in
+ * rows of N int16, out rows of M int16. On the accelerator when it has the
+ * mode, otherwise the same arithmetic on the CPU. Returns the largest
+ * |out|. */
+static int32_t requant16(const int16_t *in, int N, int M, const int32_t *par, int16_t *out)
+{
+    int32_t amax = -1;
+    if (dav2_accel_requant16(in, N, M, par, out, &amax))
+        return amax;
+    amax = 0;
+    for (int n = 0; n < N; n++) {
+        int16_t *orow = out + (size_t)n * M;
+        for (int m = 0; m < M; m++) {
+            int32_t o = sat_act(apply_multiplier(in[(size_t)m * N + n], par[3 * m],
+                                                 par[3 * m + 1]) + par[3 * m + 2]);
+            orow[m] = (int16_t)o;
+            if (o < 0) o = -o;
+            if (o > amax) amax = o;
+        }
+    }
+    return amax;
+}
+
+static void layernorm_affine(const dav2_tensor_t *in, const int32_t *gq,
+                             const int32_t *bq, dav2_tensor_t *out)
+{
+    const int N = in->n, C = in->c;
+    const size_t mark = dav2_arena_mark();
+
+    /* All integer, in three steps, two of them requantisation jobs:
+     *
+     *   1. CPU, per token n: mean, r = s * inv_std (exact integer
+     *      statistics, xf_rsqrt) and the extremes of x. They give the
+     *      largest |z| of the tensor, z = (x - mean) * r, hence a common
+     *      14-bit scale zs for z.
+     *   2. Job, tokens as rows: zq[c][n] = sat14(round(x[n][c] * mult_n)
+     *      + bias_n), mult_n = r_n / zs, bias_n = -round(mean_n r_n / zs).
+     *      The output is channel by channel, the layout step 3 reads.
+     *   3. CPU: each channel's smallest and largest zq (contiguous rows,
+     *      one pass), hence the exact range of y = zq zs g[c] + b[c] and
+     *      the output scale. Job, channels as rows: out[n][c] =
+     *      sat14(round(zq[c][n] * G_c) + B_c) with G_c = g_c zs / scale,
+     *      B_c = b_c / scale.
+     *
+     * Both jobs read int16 (the block's A16 mode); without it the CPU runs
+     * the same arithmetic. zq keeps 14 bits of z, the same resolution as
+     * the output. */
+    int16_t *zq   = (int16_t *)dav2_arena_alloc((size_t)N * C * sizeof(int16_t));
+    int32_t *rowp = (int32_t *)dav2_arena_alloc((size_t)N * 3 * sizeof(int32_t));
+    int32_t *parn = (int32_t *)dav2_arena_alloc((size_t)(N > C ? N : C) * 3 * sizeof(int32_t));
+    if (!zq || !rowp || !parn || (N & 1)) {
+        dav2_arena_release(mark);
+        layernorm_affine_cpu(in, gq, bq, out);
+        return;
+    }
+
+    const dav2_xf_t inv_c2 = xf_recip(xf_from_int((int64_t)C * C));
+    const dav2_xf_t inv_s  = xf_recip(in->scale);
+    const dav2_xf_t eps_s2 = xf_mul(xf_from_f32_bits(0x358637bdu), xf_mul(inv_s, inv_s));
+    const int wide = (((uintptr_t)in->v) & 3u) == 0 && (C & 1) == 0;
+    SUB_START();
+    dav2_xf_t zmax_all = XF_ZERO;
+    for (int n = 0; n < N; n++) {
+        const int16_t *row = in->v + (size_t)n * C;
+        int32_t sum = 0, xmax = -32768, xmin = 32767;
+        uint64_t sq = 0;
+        if (wide) {
+            /* x^2 in 32 bits, 64 at a time: activations are within
+             * +-DAV2_ACT_QMAX, and 64 * 8191^2 < 2^32 */
+            const uint32_t *rw = (const uint32_t *)row;
+            for (int c0 = 0; c0 < C / 2; c0 += 32) {
+                const int c1 = c0 + 32 < C / 2 ? c0 + 32 : C / 2;
+                uint32_t sq32 = 0;
+                #pragma GCC unroll 4
+                for (int c = c0; c < c1; c++) {
+                    uint32_t x = rw[c];
+                    int32_t d0 = lo16(x), d1 = hi16(x);
+                    sum += d0 + d1;
+                    sq32 += (uint32_t)(d0 * d0) + (uint32_t)(d1 * d1);
+                    if (d0 > xmax) xmax = d0;
+                    if (d0 < xmin) xmin = d0;
+                    if (d1 > xmax) xmax = d1;
+                    if (d1 < xmin) xmin = d1;
+                }
+                sq += sq32;
+            }
+        } else {
+            for (int c = 0; c < C; c++) {
+                int32_t d = (int32_t)row[c];
+                sum += d;
+                sq += (uint64_t)((int64_t)d * (int64_t)d);
+                if (d > xmax) xmax = d;
+                if (d < xmin) xmin = d;
+            }
+        }
+        int64_t num = (int64_t)C * (int64_t)sq - (int64_t)sum * sum;  /* C^2 * var_q, exact */
+        if (num < 0) num = 0;
+        dav2_xf_t r = xf_rsqrt(xf_add(xf_mul(xf_from_int(num), inv_c2), eps_s2));
+        int64_t s16 = (int64_t)sum * 65536;
+        int32_t mean16 = (int32_t)(s16 >= 0 ? (s16 + C / 2) / C : -((-s16 + C / 2) / C));
+        int32_t dmax = (xmax << 16) - mean16, dmin = (xmin << 16) - mean16;
+        int32_t dev = dmax > -dmin ? dmax : -dmin;
+        dav2_xf_t zmax = xf_mul(xf_norm(dev, 16), r);
+        if (xf_cmp_abs(zmax, zmax_all) > 0) zmax_all = zmax;
+        int32_t *p = rowp + (size_t)n * 3;
+        p[0] = mean16; p[1] = r.m; p[2] = r.sh;
+    }
+
+    /* step 2: per token, mult = r / zs, bias = -mean r / zs */
+    dav2_xf_t zs = zmax_all.m ? xf_div(zmax_all, xf_from_int(DAV2_ACT_QMAX)) : XF_ONE;
+    dav2_xf_t izs = xf_recip(zs);
+    for (int n = 0; n < N; n++) {
+        const int32_t *p = rowp + (size_t)n * 3;
+        dav2_xf_t k = xf_mul((dav2_xf_t){ p[1], p[2] }, izs);
+        int sh;
+        xf_to_mult(k, &parn[3 * n], &sh);
+        parn[3 * n + 1] = sh;
+        parn[3 * n + 2] = (int32_t)-xf_round(xf_mul(xf_norm(p[0], 16), k), 0);
+    }
+    SUB_LAP(DAV2_SUB_LN_STATS);
+    requant16(in->v, C, N, parn, zq);            /* rows n, C columns -> zq[c][n] */
+
+    /* step 3: channel extremes of zq, the exact range of y in Q16, with
+     * ZS = zs 2^32 (|zq g| < 2^33, ZS < 2^24: the product fits int64) */
+    const int64_t ZS = xf_round(zs, 32);
+    int64_t ymax_all = 0;
+    for (int c = 0; c < C; c++) {
+        const int16_t *zr = zq + (size_t)c * N;
+        int32_t lo = 32767, hi = -32768;
+        if ((N & 1) == 0 && (((uintptr_t)zr) & 3u) == 0) {
+            const uint32_t *zw = (const uint32_t *)zr;
+            #pragma GCC unroll 4
+            for (int n = 0; n < N / 2; n++) {
+                uint32_t w = zw[n];
+                int32_t a = lo16(w), b = hi16(w);
+                if (a < lo) lo = a;
+                if (a > hi) hi = a;
+                if (b < lo) lo = b;
+                if (b > hi) hi = b;
+            }
+        } else {
+            for (int n = 0; n < N; n++) {
+                if (zr[n] < lo) lo = zr[n];
+                if (zr[n] > hi) hi = zr[n];
+            }
+        }
+        const int64_t g = gq[c], b = bq[c];
+        int64_t y0 = (((int64_t)lo * g * ZS) >> 31) + b;   /* Q15 * 2^32 >> 31 = Q16 */
+        int64_t y1 = (((int64_t)hi * g * ZS) >> 31) + b;
+        if (y0 < 0) y0 = -y0;
+        if (y1 < 0) y1 = -y1;
+        if (y0 > ymax_all) ymax_all = y0;
+        if (y1 > ymax_all) ymax_all = y1;
+    }
+    SUB_LAP(DAV2_SUB_LN_Y);
+
+    /* per channel: G = g zs / scale, B = b / scale; G = mulh(g << 12, F.m)
+     * with F = zs 2^-15 / scale, one shift F.sh - 20 for every channel */
+    dav2_xf_t out_scale = ymax_all ? xf_div(xf_norm(ymax_all, 16), xf_from_int(DAV2_ACT_QMAX))
+                                   : XF_ONE;
+    dav2_xf_t inv = xf_recip(out_scale);
+    dav2_xf_t F = xf_mul(zs, inv);
+    F.sh += 15;
+    int shift = F.sh - 20, rr = 0;
+    if (shift > 62) { rr = shift - 62; shift = 62; }
+    if (rr > 31) rr = 31;
+    for (int c = 0; c < C; c++) {
+        if (shift >= 1) {
+            parn[3 * c] = mulh32(gq[c] << 12, F.m) >> rr;
+            parn[3 * c + 1] = shift;
+        } else {                           /* factor >= 1: never in this model */
+            int sh;
+            xf_to_mult(xf_mul(xf_norm(gq[c], 15), F), &parn[3 * c], &sh);
+            parn[3 * c + 1] = sh;
+        }
+        parn[3 * c + 2] = sat_i32(shr_round64((int64_t)bq[c] * inv.m, inv.sh + 16));
+    }
+    int32_t omax = requant16(zq, N, C, parn, out->v);   /* rows c, N columns -> out[n][c] */
     SUB_LAP(DAV2_SUB_LN_OUT);
     out->scale = out_scale;
     out->n = N;
@@ -1377,14 +1592,17 @@ static dav2_xf_t gelu_xf(dav2_xf_t x)
     return xf_mul(x, xf_norm(phi, DAV2_PHI_Q));
 }
 
-void dav2_gelu(dav2_tensor_t *t)
+/* The GELU table for inputs of scale in_scale: T[x + 8192] for x in
+ * -8192..8191 (16384 int16 in the DDR3 arena, 4-byte aligned), and the
+ * scale of its outputs. Used by the CPU pass (dav2_gelu) and, loaded into
+ * the accelerator's lookup-table RAM, by fc1's requantisation job
+ * (dav2_qgemm_gelu); the same table, so the same result. */
+static int16_t *gelu_table(dav2_xf_t in_scale, dav2_xf_t *out_scale_ret)
 {
-    PROF_START();
-    SUB_START();
     dav2_xf_t g[257];
     dav2_xf_t amax = XF_ZERO;
     for (int i = 0; i < 257; i++) {
-        g[i] = gelu_xf(xf_mul(xf_from_int(i * 64 - 8192), t->scale));
+        g[i] = gelu_xf(xf_mul(xf_from_int(i * 64 - 8192), in_scale));
         if (xf_cmp_abs(g[i], amax) > 0) amax = xf_abs(g[i]);
     }
     dav2_xf_t out_scale = amax.m ? xf_div(amax, xf_from_int(DAV2_ACT_QMAX)) : XF_ONE;
@@ -1407,9 +1625,9 @@ void dav2_gelu(dav2_tensor_t *t)
      * takes about 4 cycles longer than a DDR3 cache hit. The activations
      * cluster near zero, so the part of the table in use stays mostly in
      * the cache. */
-    const size_t mark = dav2_arena_mark();
     int16_t *tab = (int16_t *)dav2_arena_alloc(16384 * sizeof(int16_t));
-    if (!tab) { dav2_arena_release(mark); PROF_STOP(DAV2_PROF_GELU); return; }
+    if (!tab)
+        return 0;
     for (int i = 0; i < 256; i++) {
         const int32_t lo = lut[i], step = lut[i + 1] - lut[i];
         uint32_t *tw = (uint32_t *)(tab + 64 * i);
@@ -1423,6 +1641,18 @@ void dav2_gelu(dav2_tensor_t *t)
             tw[f >> 1] = pack16(v0, v1);
         }
     }
+    *out_scale_ret = out_scale;
+    return tab;
+}
+
+void dav2_gelu(dav2_tensor_t *t)
+{
+    PROF_START();
+    SUB_START();
+    const size_t mark = dav2_arena_mark();
+    dav2_xf_t out_scale;
+    int16_t *tab = gelu_table(t->scale, &out_scale);
+    if (!tab) { dav2_arena_release(mark); PROF_STOP(DAV2_PROF_GELU); return; }
     const int16_t *T = tab + 8192;
 
     SUB_LAP(DAV2_SUB_GELU_TABLE);
@@ -1635,12 +1865,12 @@ dav2_tensor_t dav2_conv2d_ex(const dav2_tensor_t *in, int h, int w,
     if (k == 1 && stride == 1 && pad == 0) {
         /* A 1x1 convolution is a GEMM over the pixels as they are; im2col
          * would only copy the tensor. */
-        qgemm_impl(in, 0, wt, res, relu, &out);
+        qgemm_impl(in, 0, wt, res, relu, 0, &out);
     } else {
         /* Gathered in hardware when the accelerator can (no patch matrix is
          * ever built); otherwise im2col in software, inside qgemm_impl. */
         conv_desc_t cv = { h, w, k, stride, pad };
-        qgemm_impl(in, &cv, wt, res, relu, &out);
+        qgemm_impl(in, &cv, wt, res, relu, 0, &out);
     }
     dav2_arena_release(mark);
 

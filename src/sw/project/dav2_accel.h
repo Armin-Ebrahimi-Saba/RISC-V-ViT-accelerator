@@ -117,7 +117,22 @@ typedef struct {
     int32_t        mx, mh;
     int            sx, sh;
     int            add, relu;
+    /* CTRL.lut: out = lut[v + 8192] after add and ReLU (GELU). lut holds
+     * 16384 int16 (32 kB, 4-byte aligned). lut_load: the block reads the
+     * table first; set it on the first job of a GEMM only, the table is
+     * kept for later jobs. */
+    const int16_t *lut;
+    int            lut_load;
 } dav2_rq_epi_t;
+/* Non-zero if the block has the lookup table (CAPS bit 24) and its boot
+ * self-test passed. */
+int dav2_accel_lut_ok(void);
+/* A requantisation over int16 input (CTRL.a16): out[n][m] = sat14(round(
+ * in[m][n] * mult_m / 2^shift_m) + bias_m), in rows of N int16 (N even),
+ * out rows of M int16 (M even). Synchronous. Returns 0 when the block
+ * lacks the mode (CAPS bit 25) or the shape; *amax gets the largest |out|. */
+int dav2_accel_requant16(const int16_t *in, int N, int M, const int32_t *params,
+                         int16_t *out, int32_t *amax);
 
 int dav2_accel_requant_rows_async(const int32_t *acc, int N, int M, int m0, int mc,
                                   const int32_t *params, int16_t *out, int32_t *amax,
