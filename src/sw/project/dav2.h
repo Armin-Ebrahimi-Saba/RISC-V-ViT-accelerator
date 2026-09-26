@@ -206,6 +206,21 @@ typedef struct {
 } dav2_lnplain_t;
 int dav2_lnplain_begin(dav2_lnplain_t *s, const dav2_tensor_t *in, int16_t *out_v, int skip);
 
+/* dav2_add as a producer: begin finds the output scale (out's n, c and
+ * scale are set at once; amax_q by the last step), each step adds
+ * step_pix pixels. */
+typedef struct {
+    dav2_producer_t base;
+    const dav2_tensor_t *a, *b;
+    dav2_tensor_t *out;
+    int total, step_elems, e, wide, small;
+    int32_t ma, mb, omax;
+    int sa, sb;
+    dav2_xf_t out_scale;
+} dav2_add_t;
+void dav2_add_begin(dav2_add_t *st, const dav2_tensor_t *a, const dav2_tensor_t *b,
+                    dav2_tensor_t *out, int step_pix);
+
 /* dav2_interpolate as a producer: begin (index arrays and row buffers in
  * the arena; out's n, c and scale are set at once), then its steps. */
 typedef struct {

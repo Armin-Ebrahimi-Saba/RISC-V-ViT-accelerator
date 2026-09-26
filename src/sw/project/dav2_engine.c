@@ -1041,16 +1041,27 @@ static dav2_tensor_t fusion(int idx, const dav2_tensor_t *a,
 
     /* a is read, never written: no copy of it. Its amax_q (known from the
      * producing conv) spares dav2_add a scan; a scan gives the same value. */
-    dav2_tensor_t cur = *a;
+    dav2_tensor_t cur = *a, res, s;
+    const dav2_tensor_t *u_in = &cur;
+    dav2_add_t addp;
+    int add_prod = 0;
 
     if (b) {
-        dav2_tensor_t res = res_conv_unit(b, h, w, prefix, 1);
-        dav2_tensor_t s = dav2_tensor_new(h * w, DAV2_FEATURES);
-        dav2_add(&cur, &res, &s);
-        cur = s;
+        /* the sum as a producer: the next unit's first convolution starts
+         * on its first rows while the CPU adds the rest (same result) */
+        res = res_conv_unit(b, h, w, prefix, 1);
+        s = dav2_tensor_new(h * w, DAV2_FEATURES);
+        dav2_add_begin(&addp, &cur, &res, &s, w);
+        dav2_producer_set(&addp.base);
+        add_prod = 1;
+        u_in = &s;
     }
 
-    dav2_tensor_t u2 = res_conv_unit(&cur, h, w, prefix, 2);
+    dav2_tensor_t u2 = res_conv_unit(u_in, h, w, prefix, 2);
+    if (add_prod) {
+        dav2_producer_complete();
+        dav2_producer_set(0);
+    }
     dav2_tensor_t up = dav2_tensor_new(oh * ow, DAV2_FEATURES);
     dav2_qw_t oc;
     sprintf(nm, "%sout", prefix); dav2_qw(&oc, nm, DAV2_FEATURES);

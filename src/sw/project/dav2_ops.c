@@ -1746,16 +1746,125 @@ void dav2_layernorm(const dav2_tensor_t *in, const int32_t *gq, const int32_t *b
     trace_tensor("layernorm", out);
 }
 
-void dav2_add(const dav2_tensor_t *a, const dav2_tensor_t *b, dav2_tensor_t *out)
+/* The elements e0 .. e1 - 1 (even for the word paths) of the sum; the
+ * largest |value| goes into *omax_io. */
+static void add_range(const dav2_tensor_t *a, const dav2_tensor_t *b, dav2_tensor_t *out,
+                      int wide, int small, int32_t ma, int sa, int32_t mb, int sb,
+                      int e0, int e1, int32_t *omax_io)
+{
+    int32_t omax = *omax_io;
+    if (wide && sa >= 17 && sa <= 47 && sb >= 17 && sb <= 47 && small) {
+        /* round(v m / 2^s) with m = mh 2^16 + ml, all in 32 bits and with
+         * two 1-cycle multiplies instead of a 6-cycle mulh:
+         *   (v mh + ((v ml) >> 16) + 2^(s-17)) >> (s-16),
+         * since 2^(s-1) is a multiple of 2^16 and floor shifts compose.
+         * |v| < 2^14: |v mh| < 2^29, |v ml| < 2^30, 2^(s-17) <= 2^30. */
+        const int32_t mah = ma >> 16, mal = ma & 0xffff, mbh = mb >> 16, mbl = mb & 0xffff;
+        const int32_t ra = 1 << (sa - 17), rb = 1 << (sb - 17);
+        const int ka = sa - 16, kb = sb - 16;
+        const uint32_t *aw = (const uint32_t *)a->v, *bw = (const uint32_t *)b->v;
+        uint32_t *ow = (uint32_t *)out->v;
+        #pragma GCC unroll 2
+        for (int i = e0 / 2; i < e1 / 2; i++) {
+            uint32_t x = aw[i], y = bw[i];
+            int32_t x0 = lo16(x), x1 = hi16(x), y0 = lo16(y), y1 = hi16(y);
+            int32_t r0 = sat_act(((x0 * mah + ((x0 * mal) >> 16) + ra) >> ka)
+                               + ((y0 * mbh + ((y0 * mbl) >> 16) + rb) >> kb));
+            int32_t r1 = sat_act(((x1 * mah + ((x1 * mal) >> 16) + ra) >> ka)
+                               + ((y1 * mbh + ((y1 * mbl) >> 16) + rb) >> kb));
+            ow[i] = pack16(r0, r1);
+            if (r0 < 0) r0 = -r0;
+            if (r1 < 0) r1 = -r1;
+            if (r0 > omax) omax = r0;
+            if (r1 > omax) omax = r1;
+        }
+    } else if (wide && sa >= 17 && sb >= 17) {
+        /* The factors are near 1, so the shifts are about 31 and
+         * apply_multiplier takes its slower branch (shift <= 32). With the
+         * int16 input moved up by 16 bits the shift becomes >= 33 and one
+         * mulh does it: round(v m / 2^s) = round((v 2^16) m / 2^(s+16)),
+         * the same value. |v| < 2^15, so v << 16 fits. */
+        const int32_t ra = 1 << (sa + 16 - 33), rb = 1 << (sb + 16 - 33);
+        const int ka = sa + 16 - 32, kb = sb + 16 - 32;
+        const uint32_t *aw = (const uint32_t *)a->v, *bw = (const uint32_t *)b->v;
+        uint32_t *ow = (uint32_t *)out->v;
+        #pragma GCC unroll 2
+        for (int i = e0 / 2; i < e1 / 2; i++) {
+            uint32_t x = aw[i], y = bw[i];
+            int32_t r0 = sat_act(((mulh32(lo16(x) << 16, ma) + ra) >> ka)
+                               + ((mulh32(lo16(y) << 16, mb) + rb) >> kb));
+            int32_t r1 = sat_act(((mulh32(hi16(x) << 16, ma) + ra) >> ka)
+                               + ((mulh32(hi16(y) << 16, mb) + rb) >> kb));
+            ow[i] = pack16(r0, r1);
+            if (r0 < 0) r0 = -r0;
+            if (r1 < 0) r1 = -r1;
+            if (r0 > omax) omax = r0;
+            if (r1 > omax) omax = r1;
+        }
+    } else if (wide) {
+        const uint32_t *aw = (const uint32_t *)a->v, *bw = (const uint32_t *)b->v;
+        uint32_t *ow = (uint32_t *)out->v;
+        #pragma GCC unroll 4
+        for (int i = e0 / 2; i < e1 / 2; i++) {
+            uint32_t x = aw[i], y = bw[i];
+            int32_t r0 = sat_act(apply_multiplier(lo16(x), ma, sa) + apply_multiplier(lo16(y), mb, sb));
+            int32_t r1 = sat_act(apply_multiplier(hi16(x), ma, sa) + apply_multiplier(hi16(y), mb, sb));
+            ow[i] = pack16(r0, r1);
+            if (r0 < 0) r0 = -r0;
+            if (r1 < 0) r1 = -r1;
+            if (r0 > omax) omax = r0;
+            if (r1 > omax) omax = r1;
+        }
+    } else {
+        for (int i = e0; i < e1; i++) {
+            int32_t v = sat_act(apply_multiplier(a->v[i], ma, sa)
+                              + apply_multiplier(b->v[i], mb, sb));
+            out->v[i] = (int16_t)v;
+            if (v < 0) v = -v;
+            if (v > omax) omax = v;
+        }
+    }
+    *omax_io = omax;
+}
+
+/* dav2_add in parts (dav2_add_t, dav2.h): begin finds the scale, each step
+ * adds step_elems elements (a producer for the next convolution). */
+static int add_step(dav2_producer_t *pr)
+{
+    dav2_add_t *st = (dav2_add_t *)pr;
+    if (st->e >= st->total)
+        return 0;
+    const uint64_t t0 = dav2_cycles();
+    int e1 = st->e + st->step_elems;
+    if (e1 > st->total) e1 = st->total;
+    add_range(st->a, st->b, st->out, st->wide, st->small, st->ma, st->sa, st->mb, st->sb,
+              st->e, e1, &st->omax);
+    st->e = e1;
+    pr->done_pix = st->e / st->out->c;
+    if (st->e >= st->total)
+        st->out->amax_q = st->omax;
+    dav2_prof_add(DAV2_PROF_ADD_RELU, dav2_cycles() - t0);
+    dav2_producer_cycles += dav2_cycles() - t0;
+    return st->e < st->total;
+}
+
+void dav2_add_begin(dav2_add_t *st, const dav2_tensor_t *a, const dav2_tensor_t *b,
+                    dav2_tensor_t *out, int step_pix)
 {
     const int total = a->n * a->c;
-    PROF_START();
+    memset(st, 0, sizeof *st);
+    st->base.step = add_step;
+    st->base.total_pix = a->n;
+    st->a = a; st->b = b; st->out = out;
+    st->total = total;
+    st->step_elems = (step_pix > 0 ? step_pix : a->n) * a->c;
+    if (st->step_elems & 1) st->step_elems *= 2;      /* whole words */
     /* Upper bound on the sum's magnitude; at most one bit of range is lost.
      * The operands' ranges come from their producers when known (every
      * streaming operator records the largest |value| it wrote), otherwise
      * from a scan; either way the same number. */
     int32_t amax_a = a->amax_q, amax_b = b->amax_q;
-    const int wide = words_ok(a->v, b->v, out->v, total);
+    const int wide = st->wide = words_ok(a->v, b->v, out->v, total);
     if (amax_a >= 0 && amax_b >= 0) {
         /* nothing to scan */
     } else if (wide) {
@@ -1782,86 +1891,22 @@ void dav2_add(const dav2_tensor_t *a, const dav2_tensor_t *b, dav2_tensor_t *out
             if (vb > amax_b) amax_b = vb;
         }
     }
-    dav2_xf_t out_scale;
-    int32_t ma, mb; int sa, sb;
-    add_params(amax_a, a->scale, amax_b, b->scale, &out_scale, &ma, &sa, &mb, &sb);
+    add_params(amax_a, a->scale, amax_b, b->scale, &st->out_scale, &st->ma, &st->sa, &st->mb, &st->sb);
 
-    int32_t omax = 0;
-    if (wide && sa >= 17 && sa <= 47 && sb >= 17 && sb <= 47
-        && amax_a <= 16383 && amax_b <= 16383) {
-        /* round(v m / 2^s) with m = mh 2^16 + ml, all in 32 bits and with
-         * two 1-cycle multiplies instead of a 6-cycle mulh:
-         *   (v mh + ((v ml) >> 16) + 2^(s-17)) >> (s-16),
-         * since 2^(s-1) is a multiple of 2^16 and floor shifts compose.
-         * |v| < 2^14: |v mh| < 2^29, |v ml| < 2^30, 2^(s-17) <= 2^30. */
-        const int32_t mah = ma >> 16, mal = ma & 0xffff, mbh = mb >> 16, mbl = mb & 0xffff;
-        const int32_t ra = 1 << (sa - 17), rb = 1 << (sb - 17);
-        const int ka = sa - 16, kb = sb - 16;
-        const uint32_t *aw = (const uint32_t *)a->v, *bw = (const uint32_t *)b->v;
-        uint32_t *ow = (uint32_t *)out->v;
-        #pragma GCC unroll 2
-        for (int i = 0; i < total / 2; i++) {
-            uint32_t x = aw[i], y = bw[i];
-            int32_t x0 = lo16(x), x1 = hi16(x), y0 = lo16(y), y1 = hi16(y);
-            int32_t r0 = sat_act(((x0 * mah + ((x0 * mal) >> 16) + ra) >> ka)
-                               + ((y0 * mbh + ((y0 * mbl) >> 16) + rb) >> kb));
-            int32_t r1 = sat_act(((x1 * mah + ((x1 * mal) >> 16) + ra) >> ka)
-                               + ((y1 * mbh + ((y1 * mbl) >> 16) + rb) >> kb));
-            ow[i] = pack16(r0, r1);
-            if (r0 < 0) r0 = -r0;
-            if (r1 < 0) r1 = -r1;
-            if (r0 > omax) omax = r0;
-            if (r1 > omax) omax = r1;
-        }
-    } else if (wide && sa >= 17 && sb >= 17) {
-        /* The factors are near 1, so the shifts are about 31 and
-         * apply_multiplier takes its slower branch (shift <= 32). With the
-         * int16 input moved up by 16 bits the shift becomes >= 33 and one
-         * mulh does it: round(v m / 2^s) = round((v 2^16) m / 2^(s+16)),
-         * the same value. |v| < 2^15, so v << 16 fits. */
-        const int32_t ra = 1 << (sa + 16 - 33), rb = 1 << (sb + 16 - 33);
-        const int ka = sa + 16 - 32, kb = sb + 16 - 32;
-        const uint32_t *aw = (const uint32_t *)a->v, *bw = (const uint32_t *)b->v;
-        uint32_t *ow = (uint32_t *)out->v;
-        #pragma GCC unroll 2
-        for (int i = 0; i < total / 2; i++) {
-            uint32_t x = aw[i], y = bw[i];
-            int32_t r0 = sat_act(((mulh32(lo16(x) << 16, ma) + ra) >> ka)
-                               + ((mulh32(lo16(y) << 16, mb) + rb) >> kb));
-            int32_t r1 = sat_act(((mulh32(hi16(x) << 16, ma) + ra) >> ka)
-                               + ((mulh32(hi16(y) << 16, mb) + rb) >> kb));
-            ow[i] = pack16(r0, r1);
-            if (r0 < 0) r0 = -r0;
-            if (r1 < 0) r1 = -r1;
-            if (r0 > omax) omax = r0;
-            if (r1 > omax) omax = r1;
-        }
-    } else if (wide) {
-        const uint32_t *aw = (const uint32_t *)a->v, *bw = (const uint32_t *)b->v;
-        uint32_t *ow = (uint32_t *)out->v;
-        #pragma GCC unroll 4
-        for (int i = 0; i < total / 2; i++) {
-            uint32_t x = aw[i], y = bw[i];
-            int32_t r0 = sat_act(apply_multiplier(lo16(x), ma, sa) + apply_multiplier(lo16(y), mb, sb));
-            int32_t r1 = sat_act(apply_multiplier(hi16(x), ma, sa) + apply_multiplier(hi16(y), mb, sb));
-            ow[i] = pack16(r0, r1);
-            if (r0 < 0) r0 = -r0;
-            if (r1 < 0) r1 = -r1;
-            if (r0 > omax) omax = r0;
-            if (r1 > omax) omax = r1;
-        }
-    } else {
-        for (int i = 0; i < total; i++) {
-            int32_t v = sat_act(apply_multiplier(a->v[i], ma, sa)
-                              + apply_multiplier(b->v[i], mb, sb));
-            out->v[i] = (int16_t)v;
-            if (v < 0) v = -v;
-            if (v > omax) omax = v;
-        }
-    }
+    st->small = amax_a <= 16383 && amax_b <= 16383;
     out->n = a->n;
     out->c = a->c;
-    out->scale = out_scale;
+    out->scale = st->out_scale;
+    out->amax_q = -1;                  /* set by the last step */
+}
+
+void dav2_add(const dav2_tensor_t *a, const dav2_tensor_t *b, dav2_tensor_t *out)
+{
+    PROF_START();
+    dav2_add_t st;
+    dav2_add_begin(&st, a, b, out, 0);
+    int32_t omax = 0;
+    add_range(a, b, out, st.wide, st.small, st.ma, st.sa, st.mb, st.sb, 0, st.total, &omax);
     out->amax_q = omax;
     PROF_STOP(DAV2_PROF_ADD_RELU);
     trace_tensor("add", out);

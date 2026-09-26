@@ -1,4 +1,4 @@
-# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 1.59 s (estimated)
+# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 1.57 s (estimated)
 
 This is the record of the speed-up work: what was measured, what each change
 did, and what is left. Every step kept the FPGA output **bit-exact with the
@@ -1200,6 +1200,22 @@ self-test hash stays `c1bf94c1`.
 
 Model: ln stats 3.5 → 2.9 Mcycles; frame 83.7 → 82.8 Mcycles, **about
 1.59 s** (1.66 s, less the model's 4 %).
+
+### Round twenty-six — the fusion blocks' adds as producers (software; estimated, not yet measured)
+
+A fusion block adds its two inputs and passes the sum to a residual conv
+unit, whose first convolution gathers it with ReLU. The add
+(`dav2_add_t`: the scale first, then one image row per step) is now a
+producer for that convolution, as the interpolations are for theirs
+(round twenty-one): the tiles start as their rows exist and the CPU adds
+the next rows while the block works. The unit gets the sum's tensor itself,
+whose largest |value| the last step sets (its second convolution's
+residual add needs it). Same output, bit for bit (11 images, host and
+emulator, also with `-DDAV2_PRODUCER_NO_IDLE`); bus errors injected into
+five jobs of the head end with a valid result.
+
+Model: block idle before convolution GEMMs 4.2 → 0.5 Mcycles; frame 82.8
+→ 82.0 Mcycles, **about 1.57 s** (1.64 s, less the model's 4 %).
 
 ## 7. What is left, in order of expected gain
 
