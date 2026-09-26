@@ -235,7 +235,11 @@ a ReLU copy of their input.
 
 `CAPS` bits 24 to 31 announce the lookup table, the int16 input, the int16
 weights, the row statistics, the result RAM, tap reuse, the row sums and
-the gather ReLU. The
+the gather ReLU. Two later options have no CAPS bit and are found by the
+boot self-tests: **`CTRL.wsh`** shifts int16 weights right as they enter
+the multipliers (the score GEMM reads q from qkv this way), and
+**`CTRL.lutint`** makes the lookup table a 257-point interpolating one
+(GELU's table is then 256 words, and the block interpolates). The
 driver uses them only when the bit is set and its boot self-test passes;
 otherwise the same arithmetic runs on the CPU.
 

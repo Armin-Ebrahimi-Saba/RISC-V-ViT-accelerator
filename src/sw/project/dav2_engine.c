@@ -84,6 +84,7 @@ typedef struct {
     int16_t *pt;
     int32_t *epar;
     uint32_t *psum;
+    int      q_direct;          /* the score GEMM reads q from qkv (CTRL.wsh) */
 } attn_bufs_t;
 
 /* A GEMM that may be left running on the accelerator (see dav2_accel.h):
@@ -535,11 +536,20 @@ static void attn_normalise(int head, int n, attn_bufs_t *b, dav2_tensor_t *ctx)
 
 /* q of a head, shifted to 11 bits, as int16 rows [t][HD]: the score GEMM's
  * weights. No int8 split: the block multiplies by int16 weights. */
+/* qkv's column extremes from its GEMM (dav2_qgemm_colext), or NULL */
+static const int16_t *g_qkv_cmax, *g_qkv_cmin;
+
 static void attn_prep_q16(const dav2_tensor_t *qkv, int head, int n, attn_bufs_t *b)
 {
     const int HD = DAV2_HEAD_DIM;
     uint32_t qmax = 0;
 #define ABS16(x) ({ int32_t v_ = (x), s_ = v_ >> 31; (uint32_t)((v_ ^ s_) - s_); })
+    if (g_qkv_cmax) {
+        /* the shift below depends only on the bit length of qmax, and the
+         * largest |q| has the same bit length as the OR of all |q| */
+        for (int d = head * HD; d < (head + 1) * HD; d++)
+            qmax |= ABS16(g_qkv_cmax[d]) | ABS16(g_qkv_cmin[d]);
+    } else
     for (int t = 0; t < n; t++) {
         const uint32_t *qr = (const uint32_t *)(qkv->v + (size_t)t * qkv->c + head * HD);
         #pragma GCC unroll 4
@@ -551,6 +561,9 @@ static void attn_prep_q16(const dav2_tensor_t *qkv, int head, int n, attn_bufs_t
 #undef ABS16
     int q_sh = 0;
     while ((qmax >> q_sh) > (uint32_t)DAV2_QK_QMAX) q_sh++;
+    b->q_sh = q_sh;
+    if (b->q_direct)
+        return;                  /* the block shifts q as it reads it */
     for (int t = 0; t < n; t++) {
         const uint32_t *qr = (const uint32_t *)(qkv->v + (size_t)t * qkv->c + head * HD);
         uint32_t *qd = (uint32_t *)(b->q16 + (size_t)t * HD);
@@ -584,12 +597,15 @@ static void attn_prep_vt16(const dav2_tensor_t *qkv, int head, int n, attn_bufs_
 /* acc[m][n] = sum_k a[n][k] w[m][k] with int16 weights, strides in
  * elements, and optionally each row's {max, min}: on the block (left
  * running, see gemm_i32_start) or computed here. */
+/* wsh: the weights shifted right by wsh first (CTRL.wsh on the block) */
 static void gemm16_start(const int16_t *a, int a_stride, const int16_t *w, int w_stride,
-                         int32_t *acc, int N, int K, int M, int32_t *st)
+                         int32_t *acc, int N, int K, int M, int32_t *st, int wsh)
 {
     gemm_i32_finish();
-    if (dav2_accel_gemm16_async(a, (uint32_t)a_stride * 2u, w, (uint32_t)w_stride * 2u,
-                                acc, N, K, M, st)) {
+    if (wsh ? dav2_accel_gemm16_shift_async(a, (uint32_t)a_stride * 2u, w,
+                                            (uint32_t)w_stride * 2u, wsh, acc, N, K, M, st)
+            : dav2_accel_gemm16_async(a, (uint32_t)a_stride * 2u, w, (uint32_t)w_stride * 2u,
+                                      acc, N, K, M, st)) {
         g16_pending = 1;                  /* collected by gemm16_finish */
         return;
     }
@@ -600,7 +616,7 @@ static void gemm16_start(const int16_t *a, int a_stride, const int16_t *w, int w
             const int16_t *ar = a + (size_t)n * a_stride;
             int32_t s = 0;
             for (int k = 0; k < K; k++)
-                s += (int32_t)ar[k] * (int32_t)wr[k];
+                s += (int32_t)ar[k] * ((int32_t)wr[k] >> wsh);
             acc[(size_t)m * N + n] = s;
             if (s > mx) mx = s;
             if (s < mn) mn = s;
@@ -610,14 +626,14 @@ static void gemm16_start(const int16_t *a, int a_stride, const int16_t *w, int w
 }
 
 static void gemm16_finish(const int16_t *a, int a_stride, const int16_t *w, int w_stride,
-                          int32_t *acc, int N, int K, int M, int32_t *st)
+                          int32_t *acc, int N, int K, int M, int32_t *st, int wsh)
 {
     if (!g16_pending)
         return;
     g16_pending = 0;
     if (!dav2_accel_finish()) {
         /* the block failed and has disabled itself: redo on the CPU */
-        gemm16_start(a, a_stride, w, w_stride, acc, N, K, M, st);
+        gemm16_start(a, a_stride, w, w_stride, acc, N, K, M, st, wsh);
     }
 }
 
@@ -666,6 +682,7 @@ static void attention_all16(const dav2_tensor_t *qkv, int n, dav2_tensor_t *ctx)
     if (dav2_arena_failed) { dav2_arena_release(mark); return; }
     exp2_tab_init();
     dav2_copy16((int16_t *)b.exp2, (const int16_t *)exp2_tab, 1024);
+    b.q_direct = dav2_accel_wsh_ok() && (qkv->c & 1) == 0;
     for (int d = 0; d < HD; d++) {
         b.cpar[3 * d] = 1 << 30;
         b.cpar[3 * d + 1] = 45;
@@ -681,11 +698,15 @@ static void attention_all16(const dav2_tensor_t *qkv, int n, dav2_tensor_t *ctx)
         /* S[t][m] = q_t . k_m: k in place (A, rows qkv->c apart), q16 as
          * the weights, so the statistics are per query */
         const int16_t *k = qkv->v + ED + h * HD;
-        gemm16_start(k, qkv->c, b.q16, HD, b.s, n, HD, n, b.sst);
+        /* q straight from qkv, shifted by the block as it reads it
+         * (CTRL.wsh), or the shifted copy made by attn_prep_q16 */
+        const int16_t *qw = b.q_direct ? qkv->v + h * HD : b.q16;
+        const int qws = b.q_direct ? qkv->c : HD, qsh = b.q_direct ? b.q_sh : 0;
+        gemm16_start(k, qkv->c, qw, qws, b.s, n, HD, n, b.sst, qsh);
         LAP(DAV2_SUB_ATT_WAIT);
         attn_prep_vt16(qkv, h, n, &b);
         LAP(DAV2_SUB_ATT_PREP_V);
-        gemm16_finish(k, qkv->c, b.q16, HD, b.s, n, HD, n, b.sst);
+        gemm16_finish(k, qkv->c, qw, qws, b.s, n, HD, n, b.sst, qsh);
         LAP(DAV2_SUB_ATT_WAIT);
         /* the exponential on the block; its table is loaded with the
          * first job of this call (fc1's GELU table replaces it) */
@@ -695,12 +716,12 @@ static void attention_all16(const dav2_tensor_t *qkv, int n, dav2_tensor_t *ctx)
             attn_softmax(qkv, n, &b);
         LAP(DAV2_SUB_ATT_SOFTMAX);
         /* C[d][t] = sum_m P[t][m] v[m][d] */
-        gemm16_start(b.p16, Kp, b.vt16, Kp, b.c, n, Kp, HD, 0);
+        gemm16_start(b.p16, Kp, b.vt16, Kp, b.c, n, Kp, HD, 0, 0);
         LAP(DAV2_SUB_ATT_WAIT);
         if (h + 1 < DAV2_N_HEADS)
             attn_prep_q16(qkv, h + 1, n, &b);
         LAP(DAV2_SUB_ATT_PREP_QK);
-        gemm16_finish(b.p16, Kp, b.vt16, Kp, b.c, n, Kp, HD, 0);
+        gemm16_finish(b.p16, Kp, b.vt16, Kp, b.c, n, Kp, HD, 0, 0);
         LAP(DAV2_SUB_ATT_WAIT);
         attn_context16(h, n, &b, ctx);
         LAP(DAV2_SUB_ATT_NORM);
@@ -844,7 +865,15 @@ static void run_block(dav2_tensor_t *x, int16_t **spare, uint32_t *rst, uint32_t
 
     BDUMP("ln1", &n);
     dav2_tensor_t qkv = dav2_tensor_new(n_tokens, 3 * ED);
-    dav2_qgemm(&n, &bw.qkv, &qkv);
+    /* with each column's extremes: the heads' q ranges for attention */
+    int16_t *qext = (int16_t *)dav2_arena_alloc((size_t)qkv.c * 2 * sizeof(int16_t));
+    if (qext) {
+        dav2_qgemm_colext(&n, &bw.qkv, &qkv, qext, qext + qkv.c);
+        g_qkv_cmax = qext;
+        g_qkv_cmin = qext + qkv.c;
+    } else {
+        dav2_qgemm(&n, &bw.qkv, &qkv);
+    }
     BDUMP("qkv", &qkv);
 
     dav2_tensor_t ctx = dav2_tensor_new(n_tokens, ED);
@@ -852,6 +881,7 @@ static void run_block(dav2_tensor_t *x, int16_t **spare, uint32_t *rst, uint32_t
     {
         uint64_t t0 = dav2_cycles();
         attention_all(&qkv, n_tokens, &ctx);
+        g_qkv_cmax = g_qkv_cmin = 0;
         dav2_prof_add(DAV2_PROF_ATTENTION, dav2_cycles() - t0);
     }
 

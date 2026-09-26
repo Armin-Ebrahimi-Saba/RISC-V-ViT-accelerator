@@ -175,6 +175,8 @@ module student_gemm #(
   logic start_lut, start_lut_load;
   assign start_lut      = reg2hw.ctrl.lut.q;      // requant job: map the output through the LUT
   assign start_lut_load = reg2hw.ctrl.lut_load.q; // requant job: load the LUT first
+  logic start_lutint;
+  assign start_lutint   = reg2hw.ctrl.lutint.q;   // requant job: interpolating table
   logic start_a16;
   assign start_a16      = reg2hw.ctrl.a16.q;      // requant job: int16 input
   logic start_w16;
@@ -205,6 +207,8 @@ module student_gemm #(
   logic [5:0]     add_sx_q, add_sh_q;        // their shifts
   // Requant lookup table (CTRL.lut, CTRL.lut_load): out = LUT[v + 8192].
   logic           lut_q;                     // map the output through the table
+  logic           lutint_q;                  // ... a 257-point interpolating table
+  logic [3:0]     wsh_q;                     // int16 weights: arithmetic right shift
   logic [31:0]    p_addr_q;                  // parameter table, read after a table load
   logic [12:0]    lut_cnt_q;                 // table load: word being filled
   logic           lut_ld_done;               // table load: the last word has arrived
@@ -217,6 +221,8 @@ module student_gemm #(
   localparam int unsigned CRA = $clog2(CRW);
   logic [31:0]    cr_rdata_q;                // result RAM: the word read for the load
   logic           cr_v_q;                    // cr_rdata_q holds the next input word
+  logic [31:0]    cr_rdata2_q;               // ... one stage later, near the tile RAM
+  logic           cr_v2_q;
   logic           acc_valid;                 // requant load: an input word arrives
   // Gather parameters (snapshot at start) and the walker signals the read
   // engine and the A-load writer use; the walkers themselves are further down.
@@ -557,7 +563,7 @@ module student_gemm #(
   logic [31:0] g1_prev;                  // row t-1's word, for a copy
   assign g1_prev = a_q[RW'(g1_row_q - 1'b1)];
 
-  assign a_wr_data = (onchip_q && state_q == RQ_LOAD_ACC) ? cr_rdata_q
+  assign a_wr_data = (onchip_q && state_q == RQ_LOAD_ACC) ? cr_rdata2_q
                    : g1_we_q ? (g1_copy_q ? g1_prev : g1_data_q) : ld_data;
   always_comb begin
     a_we      = '0;
@@ -627,8 +633,8 @@ module student_gemm #(
   logic signed [15:0] wbyte, wbyte1;   // weights k and k+1
   always_comb begin
     if (w16_q) begin
-      wbyte  = $signed(wbuf_q[15:0]);
-      wbyte1 = $signed(wbuf_q[31:16]);
+      wbyte  = $signed(wbuf_q[15:0]) >>> wsh_q;    // CTRL.wsh
+      wbyte1 = $signed(wbuf_q[31:16]) >>> wsh_q;
     end else if (wsel_q == 2'd0) begin
       wbyte  = 16'($signed(wbuf_q[7:0]));
       wbyte1 = 16'($signed(wbuf_q[15:8]));
@@ -795,7 +801,7 @@ module student_gemm #(
       s_addr_q    <= '0;
       gather_q    <= 1'b0;
       add_q <= 1'b0; relu_q <= 1'b0; x_addr_q <= '0;
-      lut_q <= 1'b0; p_addr_q <= '0;
+      lut_q <= 1'b0; lutint_q <= 1'b0; wsh_q <= '0; p_addr_q <= '0;
       a16_q <= 1'b0;
       w16_q <= 1'b0;
       ostats_q <= 1'b0;
@@ -916,6 +922,8 @@ module student_gemm #(
             add_q      <= start_add & start_requant;
             relu_q     <= start_relu & start_requant;
             lut_q      <= start_lut & start_requant;
+            lutint_q   <= start_lutint & start_lut & start_requant;
+            wsh_q      <= reg2hw.ctrl.wsh.q;
             a16_q      <= start_a16 & start_requant;
             w16_q      <= start_w16 & ~start_requant;
             ostats_q   <= start_ostats & start_requant;
@@ -963,13 +971,14 @@ module student_gemm #(
               rd_stride_q    <= 32'(reg2hw.m_len.q) * 32'd12;
               rd_left_q      <= 32'(reg2hw.m_len.q) * 32'd3;
               if (start_lut_load) begin
-                // Lookup table first: 8192 contiguous words.
+                // Lookup table first: 8192 contiguous words, or 256 for
+                // the interpolating table (CTRL.lutint).
                 rd_addr_q      <= reg2hw.lut_addr.q;
                 rd_row_base_q  <= reg2hw.lut_addr.q;
-                rd_row_beats_q <= 32'd8192;
-                rd_row_left_q  <= 32'd8192;
+                rd_row_beats_q <= start_lutint ? 32'd256 : 32'd8192;
+                rd_row_left_q  <= start_lutint ? 32'd256 : 32'd8192;
                 rd_stride_q    <= 32'd32768;
-                rd_left_q      <= 32'd8192;
+                rd_left_q      <= start_lutint ? 32'd256 : 32'd8192;
               end
             end
 
@@ -1537,13 +1546,18 @@ module student_gemm #(
   (* ram_style = "block" *) logic [31:0] lut_ram [8192];
   logic [31:0]        lut_rd12;
   logic               rq_v12, rq_odd12, rq_last12, rq_hi12;
+  logic [5:0]         rq_f12;         // interpolating table: fraction
+  logic signed [16:0] lut_step12;     // L[i+1] - L[i]
+  (* use_dsp = "no" *) logic signed [22:0] lut_prod12;   // step * f: a small multiply, in logic
+  logic signed [31:0] lut_int12;      // L[i] + (step * f) >>> 6
   logic signed [31:0] rq_pass12, rq_val12;
   logic [13:0]        lut_idx11;
   assign lut_idx11   = 14'(rq_val11 + 32'sd8192);
-  assign lut_ld_done = (state_q == RQ_LOAD_L) & rd_valid & (lut_cnt_q == 13'd8191);
+  assign lut_ld_done = (state_q == RQ_LOAD_L) & rd_valid
+                     & (lut_cnt_q == (lutint_q ? 13'd255 : 13'd8191));
   always_ff @(posedge clk_i) begin
     if ((state_q == RQ_LOAD_L) && rd_valid) lut_ram[lut_cnt_q] <= rd_data;
-    lut_rd12 <= lut_ram[lut_idx11[13:1]];
+    lut_rd12 <= lut_ram[lutint_q ? 13'(lut_idx11[13:6]) : lut_idx11[13:1]];
   end
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) rq_v12 <= 1'b0;
@@ -1552,10 +1566,15 @@ module student_gemm #(
   always_ff @(posedge clk_i) begin
     rq_odd12  <= rq_odd11; rq_last12 <= rq_last11;
     rq_hi12   <= lut_idx11[0];
+    rq_f12    <= lut_idx11[5:0];
     rq_pass12 <= rq_val11;
   end
-  assign rq_val12 = !lut_q ? rq_pass12
-                  : rq_hi12 ? 32'($signed(lut_rd12[31:16])) : 32'($signed(lut_rd12[15:0]));
+  assign lut_step12 = 17'($signed(lut_rd12[31:16])) - 17'($signed(lut_rd12[15:0]));
+  assign lut_prod12 = lut_step12 * $signed({1'b0, rq_f12});
+  assign lut_int12  = 32'($signed(lut_rd12[15:0])) + 32'(lut_prod12 >>> 6);
+  assign rq_val12 = !lut_q   ? rq_pass12
+                  : lutint_q ? lut_int12
+                  : rq_hi12  ? 32'($signed(lut_rd12[31:16])) : 32'($signed(lut_rd12[15:0]));
   assign rq_acc1 = !a16_q ? a_q[rq_row1[RW-1:0]]
                  : rq_row1[0] ? 32'($signed(a_q[rq_row1[RW-1:0]][31:16]))
                               : 32'($signed(a_q[rq_row1[RW-1:0]][15:0]));
@@ -1688,18 +1707,21 @@ module student_gemm #(
   logic [NRW-1:0] cr_n_q;                // request side: column
   logic [AW-1:0]  cr_m_q;                // request side: row
   logic           cr_act_q;              // request side: words left to read
-  assign acc_valid = onchip_q ? cr_v_q : rd_valid;
+  assign acc_valid = onchip_q ? cr_v2_q : rd_valid;
   always_ff @(posedge clk_i) begin
     if ((state_q == ST_DRAIN) && onchip_q && t_is_acc && (t_q != n_wr))
       cr_ram[CRA'(c_ptr_q) + CRA'(t_q)] <= acc_q[t_q[RW-1:0]];
     cr_rdata_q <= cr_ram[cr_base_q + CRA'(cr_n_q)];
+    cr_rdata2_q <= cr_rdata_q;
   end
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       cr_v_q   <= 1'b0;
+      cr_v2_q  <= 1'b0;
       cr_act_q <= 1'b0;
     end else begin
       cr_v_q <= (state_q == RQ_LOAD_ACC) & onchip_q & cr_act_q;
+      cr_v2_q <= cr_v_q & (state_q == RQ_LOAD_ACC);
       if (rq_p_done & onchip_q) begin
         cr_act_q <= 1'b1;
       end else if ((state_q == RQ_LOAD_ACC) & cr_act_q

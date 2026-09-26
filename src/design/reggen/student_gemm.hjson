@@ -135,6 +135,16 @@
           desc: "Gather GEMM job: 1 - the job reads relu(image): every int16 value read from G_ADDR that is negative enters the tile as 0. Present when CAPS bit 31 is set."
         }
         {
+          bits: "17:14"
+          name: "wsh"
+          desc: "GEMM job with CTRL.w16: the int16 weights enter the multipliers shifted right by this amount (arithmetic). No CAPS bit: the driver's self-test finds out whether it exists."
+        }
+        {
+          bits: 18
+          name: "lutint"
+          desc: "Requantisation job with CTRL.lut: the table holds 257 points L[0..256], word i = {L[i+1], L[i]} (256 words, so a table load reads 256 words); a value v maps to L[i] + (((L[i+1] - L[i]) * f) >> 6) with u = v + 8192, i = u >> 6, f = u & 63 (arithmetic shift). No CAPS bit: the driver's self-test finds out whether it exists."
+        }
+        {
           bits: 2
           name: "gather"
           desc: "GEMM job only: 1 - the A tile is gathered from an NHWC int16 image as im2col would lay it out (G_ADDR, G_GEOM, G_CHAN, G_CONV, G_START), instead of read from A_ADDR. K_LEN must equal kpos_count * C. C must be even."

@@ -29,6 +29,7 @@ static uint32_t regs[NREGS];
 /* the latched job */
 static struct {
     int      busy, requant, gather, add, relu, lut, lut_load, a16, w16, ostats, onchip, osums, grelu;
+    int      lutint, wsh;
     uint32_t lut_addr;
     uint32_t x_addr, add_mx, add_mh, add_shift;
     uint32_t a_addr, a_stride, w_addr, w_stride, c_addr, c_stride, s_addr, p_addr;
@@ -99,7 +100,7 @@ static void gemm_row(uint32_t m)
     for (uint32_t t = 0; t < job.n; t++) {
         int32_t s = 0;
         for (uint32_t kk = 0; kk < job.k; kk++)
-            s += a_elem(t, kk) * (job.w16 ? (int32_t)wr16[kk] : (int32_t)wr[kk]);
+            s += a_elem(t, kk) * (job.w16 ? ((int32_t)wr16[kk] >> job.wsh) : (int32_t)wr[kk]);
         cr[t] = s;
         if (t == 0 || s > mx) mx = s;
         if (t == 0 || s < mn) mn = s;
@@ -126,7 +127,8 @@ static void requant_all(void)
     const int32_t *par = (const int32_t *)ptr(job.p_addr);
     int32_t amax = 0;
     if (job.lut_load) {
-        memcpy(lut_tab, ptr(job.lut_addr), sizeof lut_tab);
+        /* CTRL.lutint loads 256 words (into the RAM's first words) */
+        memcpy(lut_tab, ptr(job.lut_addr), job.lutint ? 256u * 4u : sizeof lut_tab);
         lut_valid = 1;
     }
     if (job.lut && !lut_valid) fail("CTRL.lut before any table was loaded");
@@ -151,7 +153,14 @@ static void requant_all(void)
                 r = v > 8191 ? 8191 : v < -8191 ? -8191 : v;
             }
             if (job.relu && r < 0) r = 0;
-            if (job.lut) r = lut_tab[r + 8192];
+            if (job.lut && job.lutint) {
+                /* CTRL.lutint: word i = {L[i+1], L[i]} of the first 256 */
+                const uint32_t u = (uint32_t)(r + 8192);
+                const int32_t lo = lut_tab[2 * (u >> 6)], hi = lut_tab[2 * (u >> 6) + 1];
+                r = lo + (((hi - lo) * (int32_t)(u & 63u)) >> 6);
+            } else if (job.lut) {
+                r = lut_tab[r + 8192];
+            }
             orow[m] = (int16_t)r;
             int32_t a = r < 0 ? (int32_t)-r : (int32_t)r;
             if (a > amax) amax = a;
@@ -205,6 +214,8 @@ static void latch(void)
     job.onchip   = (ctrl >> 10) & 1u;
     job.osums    = ((ctrl >> 12) & 1u) && job.ostats;
     job.grelu    = ((ctrl >> 13) & 1u) && job.gather;
+    job.wsh      = job.w16 ? (int)((ctrl >> 14) & 15u) : 0;
+    job.lutint   = ((ctrl >> 18) & 1u) && job.lut;
     if (((ctrl >> 13) & 1u) && !job.gather) fail("CTRL.grelu without CTRL.gather");
     if (job.a16 && (job.n & 1u)) fail("requant A16: N_ROWS odd");
     if (job.lut_load && (job.lut_addr & 3u)) fail("LUT_ADDR unaligned");

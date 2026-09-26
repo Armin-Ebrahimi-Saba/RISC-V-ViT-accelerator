@@ -147,6 +147,16 @@ int dav2_accel_qgemm_async(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t 
 #define GRELU_C 1                       /* ReLU while gathering, CTRL.grelu (round 19) */
 #endif
 int dav2_accel_grelu_ok(void) { return GRELU_C; }
+#ifndef WSH_C
+#define WSH_C 1                         /* CTRL.wsh and CTRL.lutint (round 22) */
+#endif
+int dav2_accel_wsh_ok(void) { return WSH_C; }
+int dav2_accel_lutint_ok(void) { return WSH_C; }
+int dav2_accel_gemm16_shift_async(const int16_t *a, uint32_t as, const int16_t *w, uint32_t ws,
+                                  int wsh, int32_t *acc, int N, int K, int M, int32_t *st)
+{ (void)a;(void)as;(void)w;(void)ws;(void)wsh;(void)acc;(void)st;
+  if (!WSH_C) return 0;
+  job_kind = K_ATT; start_job(gemm_cycles(N, K, M, 1)); return 2; }
 int dav2_accel_conv_async(const int16_t *img, int h, int w, int C, int k, int stride,
                           int pad, const int8_t *wt, int M, int32_t *acc, dav2_accel_stats_t *st,
                           int in_relu)
@@ -186,7 +196,10 @@ int dav2_accel_requant_rows_async(const int32_t *acc, int N, int M, int m0, int 
           r[1] = (uint32_t)(mc * 100); r[2] = (uint32_t)sq; r[3] = (uint32_t)(sq >> 32);
       }
   }
-  start_job(requant_cycles(N, mc, 0, epi && epi->add) + (uint64_t)N * wpr * BEAT / 10);
+  /* a table load first: 8192 words, or 256 for the interpolating table */
+  const uint64_t lutw = (epi && epi->lut && epi->lut_load) ? (epi->lut_int ? 256u : 8192u) : 0u;
+  start_job(requant_cycles(N, mc, 0, epi && epi->add) + (uint64_t)N * wpr * BEAT / 10
+            + lutw * BEAT / 10);
   *amax = 8000; return 2; }
 #ifndef OSUMS_C
 #define OSUMS_C 1                       /* output row sums, CTRL.osums (round 18) */

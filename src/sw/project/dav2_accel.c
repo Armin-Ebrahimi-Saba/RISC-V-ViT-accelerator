@@ -90,6 +90,8 @@
 #define CTRL_GREUSE   0x800u
 #define CTRL_OSUMS    0x1000u
 #define CTRL_GRELU    0x2000u
+#define CTRL_WSH(s)   ((uint32_t)(s) << 14)
+#define CTRL_LUTINT   0x40000u
 
 #define STATUS_BUSY 0x1u
 #define STATUS_DONE 0x2u
@@ -125,8 +127,11 @@ static int      accel_greuse_ok;       /* CAPS bit 29, cleared if its self-test 
 static int      accel_osums_ok;        /* CAPS bit 30, cleared if its self-test fails */
 static int      accel_grelu_ok;        /* CAPS bit 31, cleared if its self-test fails */
 static int      accel_conv_relu;       /* dav2_accel_conv: ReLU on the image (CTRL.grelu) */
+static int      accel_wsh_ok;          /* CTRL.wsh: found by its self-test (no CAPS bit) */
+static int      accel_lutint_ok;       /* CTRL.lutint: likewise */
 static int      accel_conv_onchip;     /* dav2_accel_conv: result into the result RAM */
 static uint32_t accel_gemm_ctrl;       /* extra CTRL bits for accel_run (CTRL.w16) */
+static uint32_t accel_gemm_wsh;        /* CTRL.wsh for the next int16-weight GEMM */
 static int      accel_out_stride;      /* requant output row length in int16, 0 = M */
 static int      accel_ok;
 static unsigned accel_nrows;
@@ -469,7 +474,7 @@ static int accel_requant_rows(const void *acc, int N, int M, int m0, int mc,
         ctrl |= CTRL_RELU;
     if (epi && epi->lut) {
         REG32(GEMM_LUT_ADDR) = (uint32_t)(uintptr_t)epi->lut;
-        ctrl |= CTRL_LUT;
+        ctrl |= CTRL_LUT | (epi->lut_int ? CTRL_LUTINT : 0u);
     }
     int lut_load = epi && epi->lut && epi->lut_load;
     if (epi && epi->ostats)
@@ -490,7 +495,8 @@ static int accel_requant_rows(const void *acc, int N, int M, int m0, int mc,
         int nc = N - n0;
         if (nc > nc_max) nc = nc_max;
         unsigned long beats = (unsigned long)mc * 3u + (unsigned long)mc * nc * esz / 4u
-                            + (unsigned long)mc * nc / 2u + (lut_load ? 8192u : 0u);
+                            + (unsigned long)mc * nc / 2u
+                            + (lut_load ? ((epi && epi->lut_int) ? 256u : 8192u) : 0u);
         REG32(GEMM_A_ADDR) = onchip ? (uint32_t)((size_t)m0 * N + n0)
                                     : (uint32_t)(uintptr_t)((const uint8_t *)acc
                                                             + ((size_t)m0 * N + n0) * esz);
@@ -554,6 +560,8 @@ int dav2_accel_requant_rows_async(const int32_t *acc, int N, int M, int m0, int 
     if (epi && (epi->add || epi->relu) && !accel_epi_ok)
         return 0;
     if (epi && epi->lut && (!accel_lut_ok || (((uintptr_t)epi->lut) & 3u)))
+        return 0;
+    if (epi && epi->lut_int && (!epi->lut || !accel_lutint_ok))
         return 0;
     if (epi && epi->ostats && (!accel_ostats_ok || (((uintptr_t)epi->ostats) & 3u)))
         return 0;
@@ -694,6 +702,20 @@ int dav2_accel_conv(const int16_t *img, int h, int w, int C, int k, int stride,
 }
 
 int dav2_accel_w16_ok(void) { return dav2_accel_init() && accel_w16_ok; }
+int dav2_accel_wsh_ok(void) { return dav2_accel_init() && accel_w16_ok && accel_wsh_ok; }
+int dav2_accel_lutint_ok(void) { return dav2_accel_init() && accel_lut_ok && accel_lutint_ok; }
+
+int dav2_accel_gemm16_shift_async(const int16_t *a, uint32_t a_stride,
+                                  const int16_t *w, uint32_t w_stride, int wsh,
+                                  int32_t *acc, int N, int K, int M, int32_t *stats)
+{
+    if (wsh < 0 || wsh > 15 || (wsh && !dav2_accel_wsh_ok()))
+        return 0;
+    accel_gemm_wsh = (uint32_t)wsh;
+    int r = dav2_accel_gemm16_async(a, a_stride, w, w_stride, acc, N, K, M, stats);
+    accel_gemm_wsh = 0;
+    return r;
+}
 
 int dav2_accel_gemm16_async(const int16_t *a, uint32_t a_stride,
                             const int16_t *w, uint32_t w_stride,
@@ -709,7 +731,7 @@ int dav2_accel_gemm16_async(const int16_t *a, uint32_t a_stride,
     if (stats && N > (int)accel_nrows)
         return 0;                          /* one tile: one set of statistics */
     accel_defer = 1;
-    accel_gemm_ctrl = CTRL_W16;
+    accel_gemm_ctrl = CTRL_W16 | CTRL_WSH(accel_gemm_wsh);
     int r = accel_run(a, a_stride, (const int8_t *)w, w_stride ? w_stride : (uint32_t)K * 2u,
                       acc, N, K, M, stats);
     accel_gemm_ctrl = 0;
@@ -1112,7 +1134,7 @@ static int accel_check_epilogue(void)
         par[3 * m + 1] = 38 + (int32_t)(chk_rand(&seed) % 4u);
         par[3 * m + 2] = (int32_t)(chk_rand(&seed) % 2001u) - 1000;
     }
-    dav2_rq_epi_t epi = { x, 0x5a000000, 0x61000000, 31, 32, 1, 0, 0, 0, 0, 0, 0 };
+    dav2_rq_epi_t epi = { x, 0x5a000000, 0x61000000, 31, 32, 1, 0, 0, 0, 0, 0, 0, 0 };
     int bad = 0;
     for (int pass = 0; pass < 2 && !bad; pass++) {
         int32_t amax = 0;
@@ -1171,7 +1193,7 @@ static int accel_check_lut(void)
     }
     int bad = 0;
     for (int pass = 0; pass < 2 && !bad; pass++) {
-        dav2_rq_epi_t epi = { 0, 0, 0, 0, 0, 0, pass, tab, pass == 0, 0, 0, 0 };
+        dav2_rq_epi_t epi = { 0, 0, 0, 0, 0, 0, pass, tab, pass == 0, 0, 0, 0, 0 };
         int32_t amax = 0;
         int r = dav2_accel_requant_rows_async(acc, N, M, 0, M, par, out, &amax, &epi);
         if (r == 0 || !dav2_accel_finish()) {
@@ -1196,8 +1218,45 @@ static int accel_check_lut(void)
     if (bad) {
         printf("GEMM accelerator: LOOKUP-TABLE SELF-TEST FAILED (%d), GELU on the CPU\n", bad);
         accel_lut_ok = 0;
+        return 0;
+    }
+    printf("GEMM accelerator: lookup-table self-test ok\n");
+    /* The interpolating table (CTRL.lutint): 256 words at the start of the
+     * same 16384-int16 buffer, so an older block, which loads 8192 words,
+     * reads nothing outside it; it then gives other values and this finds
+     * out. */
+    uint32_t *tw = (uint32_t *)tab;
+    for (int i = 0; i < 256; i++)
+        tw[i] = chk_rand(&seed);
+    accel_lutint_ok = 1;
+    {
+        dav2_rq_epi_t epi;
+        memset(&epi, 0, sizeof epi);
+        epi.lut = tab;
+        epi.lut_load = 1;
+        epi.lut_int = 1;
+        int32_t amax = 0;
+        int r = dav2_accel_requant_rows_async(acc, N, M, 0, M, par, out, &amax, &epi);
+        if (r == 0 || !dav2_accel_finish()) {
+            accel_lutint_ok = 0;
+            return 0;
+        }
+    }
+    int ibad = 0;
+    for (int n = 0; n < N; n++)
+        for (int m = 0; m < M; m++) {
+            int32_t h = chk_sat(chk_apply(acc[m * N + n], par[3 * m], par[3 * m + 1])
+                                + par[3 * m + 2]);
+            const uint32_t u = (uint32_t)(h + 8192), wv = tw[u >> 6];
+            const int32_t lo = (int16_t)(wv & 0xffffu), hi = (int16_t)(wv >> 16);
+            const int32_t e = lo + (((hi - lo) * (int32_t)(u & 63u)) >> 6);
+            if (out[n * M + m] != e) ibad++;
+        }
+    if (ibad) {
+        accel_lutint_ok = 0;
+        printf("GEMM accelerator: interpolating table not present (%d), GELU table on the CPU\n", ibad);
     } else {
-        printf("GEMM accelerator: lookup-table self-test ok\n");
+        printf("GEMM accelerator: interpolating-table self-test ok\n");
     }
     return 0;      /* the other paths are still good */
 }
@@ -1436,8 +1495,32 @@ static int accel_check_w16(void)
     if (bad) {
         printf("GEMM accelerator: INT16-WEIGHT SELF-TEST FAILED (%d), attention as before\n", bad);
         accel_w16_ok = 0;
+        return 0;
+    }
+    printf("GEMM accelerator: int16-weight self-test ok\n");
+    /* the weights shifted by 3 as they enter the multipliers (CTRL.wsh):
+     * an older block ignores the bits, and this finds out */
+    for (int i = 0; i < M * K; i++)
+        w[i] = (int16_t)((int32_t)(chk_rand(&seed) % 16383u) - 8191);
+    accel_wsh_ok = 1;
+    r = dav2_accel_gemm16_shift_async(a, 0, w, 0, 3, acc, N, K, M, st);
+    if (r == 0 || !dav2_accel_finish()) {
+        accel_wsh_ok = 0;
+        return 0;
+    }
+    int sbad = 0;
+    for (int m = 0; m < M; m++)
+        for (int n = 0; n < N; n++) {
+            int32_t e = 0;
+            for (int k = 0; k < K; k++)
+                e += (int32_t)a[n * K + k] * (w[m * K + k] >> 3);
+            if (acc[m * N + n] != e) sbad++;
+        }
+    if (sbad) {
+        accel_wsh_ok = 0;
+        printf("GEMM accelerator: weight-shift not present (%d), q shifted on the CPU\n", sbad);
     } else {
-        printf("GEMM accelerator: int16-weight self-test ok\n");
+        printf("GEMM accelerator: weight-shift self-test ok\n");
     }
     return 0;
 }
@@ -1656,6 +1739,13 @@ int dav2_accel_conv_async(const int16_t *img, int h, int w, int C, int k, int st
     return dav2_accel_conv(img, h, w, C, k, stride, pad, wt, M, acc, st);
 }
 int dav2_accel_grelu_ok(void) { return 0; }
+int dav2_accel_wsh_ok(void) { return 0; }
+int dav2_accel_lutint_ok(void) { return 0; }
+int dav2_accel_gemm16_shift_async(const int16_t *a, uint32_t a_stride,
+                                  const int16_t *w, uint32_t w_stride, int wsh,
+                                  int32_t *acc, int N, int K, int M, int32_t *stats)
+{ (void)a;(void)a_stride;(void)w;(void)w_stride;(void)wsh;(void)acc;(void)N;(void)K;(void)M;(void)stats;
+  return 0; }
 
 int dav2_accel_gemm_raw_async(const int16_t *a, uint32_t a_stride,
                               const int8_t *w, uint32_t w_stride,

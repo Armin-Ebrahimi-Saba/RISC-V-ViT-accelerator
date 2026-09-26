@@ -134,6 +134,9 @@ typedef struct {
     /* CTRL.onchip: the input is the result the last GEMM left in the
      * block's result RAM (dav2_accel_qgemm_onchip_async), not acc */
     int            onchip;
+    /* with lut: the table is the 257-point interpolating one (CTRL.lutint,
+     * 256 words, word i = {L[i+1], L[i]}); see dav2_accel_lutint_ok */
+    int            lut_int;
 } dav2_rq_epi_t;
 /* A GEMM whose int32 result stays in the block's result RAM (CTRL.onchip,
  * CAPS bit 28): N <= CAPS.NROWS, N*M <= DAV2_ACCEL_CR_WORDS. Only the row
@@ -170,6 +173,16 @@ int dav2_accel_w16_ok(void);
 int dav2_accel_gemm16_async(const int16_t *a, uint32_t a_stride,
                             const int16_t *w, uint32_t w_stride,
                             int32_t *acc, int N, int K, int M, int32_t *stats);
+/* the same with the weights shifted right by wsh (arithmetic) as they
+ * enter the multipliers (CTRL.wsh); 0 (declined) without that feature */
+int dav2_accel_gemm16_shift_async(const int16_t *a, uint32_t a_stride,
+                                  const int16_t *w, uint32_t w_stride, int wsh,
+                                  int32_t *acc, int N, int K, int M, int32_t *stats);
+/* Non-zero if the block shifts int16 weights (CTRL.wsh) and has the
+ * interpolating lookup table (CTRL.lutint); no CAPS bits, found by the
+ * boot self-tests. */
+int dav2_accel_wsh_ok(void);
+int dav2_accel_lutint_ok(void);
 /* dav2_accel_requant with output rows out_stride int16 apart (instead of
  * M): writes into a slice of a wider tensor. */
 int dav2_accel_requant_stride(const int32_t *acc, int N, int M, const int32_t *params,

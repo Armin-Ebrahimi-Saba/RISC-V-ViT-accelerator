@@ -1,4 +1,4 @@
-# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 1.8 s (estimated)
+# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 1.7 s (estimated)
 
 This is the record of the speed-up work: what was measured, what each change
 did, and what is left. Every step kept the FPGA output **bit-exact with the
@@ -1092,6 +1092,33 @@ Model: 97.5 → 92.0 Mcycles per frame, **about 1.77 s** (1.84 s, less the
 model's 4 %). The model starts each job at once and lets the CPU produce
 while it runs, which is the ideal overlap; on the board a tile may wait
 for its rows, and the CPU makes a row (about 40,000 cycles) at a time.
+
+### Round twenty-two — no copies of q, no GELU table on the CPU (hardware; estimated, not yet measured)
+
+| Change | Where | Model (Mcycles) |
+|---|---|---|
+| **q's range without a pass over q.** `dav2_qgemm_colext` returns each output column's largest and smallest value. The requantisation is non-decreasing in the accumulator (multipliers ≥ 0), so these are the requantised extremes of the column's accumulators, which the range pass reads anyway. The shift of a head's q depends only on the bit length of its largest \|q\|, which these give exactly. | `dav2_ops.c`, `dav2_engine.c` | q preparation 5.0 → 2.6; frame 92.0 → 90.0 |
+| **Weight shift** (`CTRL.wsh`, 4 bits): int16 weights enter the multipliers as w >>> wsh. The score GEMM reads q straight from qkv (rows 1152 apart) and the block applies the head's shift, so the shifted copy of q is gone. | `student_gemm.sv`, `dav2_accel.c`, `dav2_engine.c` | q preparation 2.6 → 0.1 |
+| **Interpolating lookup table** (`CTRL.lutint`): the table holds the 257 GELU points, word i = {L[i+1], L[i]} (256 words), and the block computes L[i] + (((L[i+1] − L[i]) · f) >> 6), the formula by which the CPU built the 16,384 entries. The CPU no longer builds them, and a table load is 256 words instead of 8192. | `student_gemm.sv`, `dav2_ops.c` | gelu 2.7 → 1.7 |
+
+All three give the same output, bit for bit (11 images, host and emulator).
+The CAPS register has no free bit left, so the two block features are
+found by boot self-tests: "weight-shift self-test ok" (an int16-weight
+GEMM with the weights shifted by 3) and "interpolating-table self-test ok"
+(the table in the same 16,384-entry buffer as the direct table's test, so
+an older block, which loads 8192 words, reads nothing outside it). An
+emulator of the older block reports both as not present and gives the same
+output. The 17 × 6 multiply of the table is kept in logic
+(`use_dsp = "no"`); in a DSP48 it had no registers.
+
+`student_gemm_tb`: int16-weight GEMMs with the weights shifted by 2 and 5,
+the interpolating table loaded and then reused, with ReLU and over two
+tiles, and the direct table again afterwards. PASSED, 680,835 words.
+Bitstream: timing met, WNS +0.395 ns (DDR3 controller), worst `sys_clk` path +0.667 ns (lookup table through the interpolation), WHS +0.026 ns; LUT 26.9 %, BRAM 91.6 %, DSP 37.8 %; the warnings are those of round twenty-one. A first build had only +0.103 ns on the path from the result RAM across the chip to the tile RAM (a path from round sixteen that earlier placements gave 1.0 to 1.5 ns); the on-chip requantisation load now has a register stage there.
+
+The model now also counts the table loads (it had left out the 8192 words
+per GELU before, about 0.2 Mcycles). Model: 92.0 → 88.0 Mcycles per frame,
+**about 1.7 s** (1.76 s, less the model's 4 %).
 
 ## 7. What is left, in order of expected gain
 

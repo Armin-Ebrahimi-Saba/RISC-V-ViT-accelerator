@@ -135,6 +135,10 @@ void dav2_embed_tokens(const dav2_tensor_t *patches, const int32_t *cls_q24,
 /* out = A * W^T + bias, with dynamic output scale. out must be preallocated
  * with n = A->n and c = W->m. */
 void dav2_qgemm(const dav2_tensor_t *a, const dav2_qw_t *w, dav2_tensor_t *out);
+/* dav2_qgemm and each output column's largest and smallest value (exact,
+ * from the accumulators' extremes; no pass over the output) */
+void dav2_qgemm_colext(const dav2_tensor_t *a, const dav2_qw_t *w, dav2_tensor_t *out,
+                       int16_t *cmax, int16_t *cmin);
 /* dav2_qgemm, then dav2_add(res, result) if res, then dav2_relu if relu --
  * bit-identical, but on the accelerator the add and the ReLU run inside the
  * requantisation job. out may be res (in-place residual update). */

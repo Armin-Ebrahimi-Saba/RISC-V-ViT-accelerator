@@ -231,20 +231,22 @@ module student_gemm_tb;
   // |W| <= 2047 keep K <= 128 sums within int32. wstride_mode: 0 = W_STRIDE
   // 0 (contiguous, K*2), 1 = explicit rows twice as wide.
   task automatic run_gemm_w16(input int ndim, input int kdim, input int mdim,
-                              input int wstride_mode);
+                              input int wstride_mode, input int wsh = 0);
     int mismatches = 0;
     int wrow = wstride_mode ? kdim * 2 : kdim;     // int16 per W row in memory
-    $display("--- GEMM W16 N=%0d K=%0d M=%0d%s", ndim, kdim, mdim,
-             wstride_mode ? " (strided W rows)" : "");
+    $display("--- GEMM W16 N=%0d K=%0d M=%0d%s, weights >>> %0d", ndim, kdim, mdim,
+             wstride_mode ? " (strided W rows)" : "", wsh);
     for (int n = 0; n < ndim; n++)
       for (int k = 0; k < kdim; k++)
         poke_a(n, k, kdim, 16'($signed($urandom % 16383) - 8191));
     for (int i = 0; i < mdim * wrow / 2; i++)
-      memory.mem[mem_word(W_BASE) + i] = {16'($signed($urandom % 4095) - 2047),
-                                          16'($signed($urandom % 4095) - 2047)};
+      memory.mem[mem_word(W_BASE) + i] = wsh ? {16'($signed($urandom % 16383) - 8191),
+                                                16'($signed($urandom % 16383) - 8191)}
+                                          : {16'($signed($urandom % 4095) - 2047),
+                                             16'($signed($urandom % 4095) - 2047)};
     for (int i = 0; i < mdim * ndim; i++)
       memory.mem[mem_word(C_BASE) + i] = 32'hdead_beef;
-    ctrl_extra = 32'h100;
+    ctrl_extra = 32'h100 | (32'(wsh) << 14);      // CTRL.w16, CTRL.wsh
     for (int n0 = 0; n0 < ndim; n0 += NROWS) begin
       int nt = (ndim - n0 > int'(NROWS)) ? NROWS : ndim - n0;
       run_job(A_BASE + 32'(n0 * kdim * 2), W_BASE, C_BASE + 32'(n0 * 4),
@@ -258,6 +260,7 @@ module student_gemm_tb;
           int wi = m * wrow + k;
           logic [31:0] ww = memory.mem[mem_word(W_BASE) + (wi >> 1)];
           int w = wi[0] ? int'($signed(ww[31:16])) : int'($signed(ww[15:0]));
+          w = w >>> wsh;
           expected += int'(peek_a(n, k, kdim)) * w;
         end
         got = int'(memory.mem[mem_word(C_BASE) + m * ndim + n]);
@@ -490,6 +493,80 @@ module student_gemm_tb;
   // apply(h, mh, sh)) with h the plain requantised value, optionally ReLU.
   // mode: 0 = requant only + relu, 1 = add, 2 = add + relu. Chunks of at
   // most 512 rows, as the add mode requires.
+  // The interpolating lookup table (CTRL.lutint): 256 words, word i =
+  // {L[i+1], L[i]}; out = L[i] + ((L[i+1] - L[i]) * f >>> 6) for u = h + 8192,
+  // i = u >> 6, f = u & 63. The first job loads the table, the second uses it.
+  task automatic run_requant_lutint(input int ndim, input int mdim, input int relu);
+    int mismatches = 0;
+    logic [31:0] st;
+    int guard;
+    $display("--- REQUANT+LUTINT%s N=%0d M=%0d", relu ? "+RELU" : "", ndim, mdim);
+    for (int i = 0; i < 256; i++)
+      memory.mem[mem_word(L_BASE) + i] = $urandom;
+    for (int m = 0; m < mdim; m++) begin
+      memory.mem[mem_word(P_BASE) + 3*m]     = 32'h4000_0000 + ($urandom % 32'h3fff_ffff);
+      memory.mem[mem_word(P_BASE) + 3*m + 1] = 36 + ($urandom % 6);
+      memory.mem[mem_word(P_BASE) + 3*m + 2] = 32'($signed($urandom % 2001) - 1000);
+    end
+    for (int pass = 0; pass < 2; pass++) begin
+      for (int i = 0; i < ndim * mdim / 2; i++)
+        memory.mem[mem_word(O_BASE) + i] = 32'hdead_beef;
+      for (int n0 = 0; n0 < ndim; n0 += NROWS) begin
+        int nc = (ndim - n0 > int'(NROWS)) ? NROWS : ndim - n0;
+        bus.put_word(R_A_ADDR,   C_BASE + 32'(n0 * 4));
+        bus.put_word(R_A_STRIDE, ndim * 4);
+        bus.put_word(R_P_ADDR,   P_BASE);
+        bus.put_word(R_C_ADDR,   O_BASE + 32'(n0 * mdim * 2));
+        bus.put_word(R_C_STRIDE, mdim * 2);
+        bus.put_word(R_LUT_ADDR, L_BASE);
+        bus.put_word(R_M_LEN,    mdim);
+        bus.put_word(R_N_ROWS,   nc);
+        bus.put_word(R_CTRL,     32'h3 | 32'h20 | ((pass == 0 && n0 == 0) ? 32'h40 : 0)
+                                 | 32'h4_0000 | (relu ? 32'h10 : 0));
+        guard = 0;
+        forever begin
+          bus.get_word(R_STATUS, st);
+          if (!(st & 32'h1)) break;
+          if (++guard > 200000) begin
+            $display("FAIL: interpolating-table job did not finish (status=0x%08x)", st);
+            errors++;
+            return;
+          end
+        end
+      end
+      for (int n = 0; n < ndim; n++)
+        for (int m = 0; m < mdim; m++) begin
+          longint acc  = longint'(int'(memory.mem[mem_word(C_BASE) + m * ndim + n]));
+          longint mult = longint'(int'(memory.mem[mem_word(P_BASE) + 3*m]));
+          int     sh   = int'(memory.mem[mem_word(P_BASE) + 3*m + 1]);
+          longint bias = longint'(int'(memory.mem[mem_word(P_BASE) + 3*m + 2]));
+          int     h    = sat14(apply_mult(acc, mult, sh) + bias);
+          int     u, e, lo, hi, got, idx;
+          logic [31:0] tw, w;
+          if (relu && h < 0) h = 0;
+          u  = h + 8192;
+          tw = memory.mem[mem_word(L_BASE) + (u >> 6)];
+          lo = int'($signed(tw[15:0]));
+          hi = int'($signed(tw[31:16]));
+          e  = lo + (((hi - lo) * (u & 63)) >>> 6);
+          idx = n * mdim + m;
+          w   = memory.mem[mem_word(O_BASE) + (idx >> 1)];
+          got = idx[0] ? int'($signed(w[31:16])) : int'($signed(w[15:0]));
+          checks++;
+          if (got !== e) begin
+            if (mismatches < 5)
+              $display("  FAIL pass %0d n=%0d m=%0d: got %0d expected %0d (h=%0d)", pass, n, m, got, e, h);
+            mismatches++;
+          end
+        end
+    end
+    if (mismatches) begin
+      $display("  %0d wrong", mismatches);
+      errors += mismatches;
+    end else
+      $display("  ok, %0d outputs, loaded and reused", 2 * ndim * mdim);
+  endtask
+
   task automatic run_requant_epi(input int ndim, input int mdim, input int mode);
     int mismatches = 0;
     logic [31:0] st;
@@ -1093,6 +1170,14 @@ module student_gemm_tb;
     run_gemm_w16(82, 64, 82, 0);
     run_gemm_w16(82, 84, 64, 1);
     run_gemm_w16(130, 64, 8, 0);
+    // weights shifted as they enter the MACs (CTRL.wsh)
+    run_gemm_w16(82, 64, 82, 1, 2);
+    run_gemm_w16(20, 64, 30, 0, 5);
+    run_gemm_w16(20, 64, 30, 0, 0);            // and without again
+    // the interpolating lookup table (CTRL.lutint), then the direct one again
+    run_gemm(82, 64, 30);   run_requant_lutint(82, 30, 0);
+    run_gemm(130, 64, 8);   run_requant_lutint(130, 8, 1);
+    run_gemm(20, 64, 30);   run_requant_epi(20, 30, 0);
     run_gemm(20, 64, 30);
     // int16 input: LayerNorm's two shapes (tokens as rows, channels as
     // rows), n-tiles, negative multipliers, and with the table

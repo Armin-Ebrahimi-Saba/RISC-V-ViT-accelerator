@@ -102,6 +102,11 @@ int dav2_accel_conv_onchip_async(const int16_t *img, int h, int w, int C, int k,
 { (void)img;(void)h;(void)w;(void)C;(void)k;(void)stride;(void)pad;(void)wt;(void)M;(void)in_relu;
   st->v = 0; st->tiles = 0; return 0; }
 int dav2_accel_grelu_ok(void) { return 0; }
+int dav2_accel_wsh_ok(void) { return 0; }
+int dav2_accel_lutint_ok(void) { return 0; }
+int dav2_accel_gemm16_shift_async(const int16_t *a, uint32_t as, const int16_t *w, uint32_t ws,
+                                  int wsh, int32_t *acc, int N, int K, int M, int32_t *st)
+{ (void)a;(void)as;(void)w;(void)ws;(void)wsh;(void)acc;(void)N;(void)K;(void)M;(void)st; return 0; }
 int dav2_accel_busy(void) { return 0; }
 
 static uint32_t rs = 12345;

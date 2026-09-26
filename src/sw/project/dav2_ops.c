@@ -543,12 +543,42 @@ typedef struct { int h, w, k, stride, pad, in_relu; } conv_desc_t;
 static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
                        const dav2_qw_t *wt, const dav2_tensor_t *res, int relu,
                        int gelu, dav2_tensor_t *out);
-static int16_t *gelu_table(dav2_xf_t in_scale, dav2_xf_t *out_scale_ret);
+static int16_t *gelu_table(dav2_xf_t in_scale, dav2_xf_t *out_scale_ret, int packed);
 static int qgemm_no_onchip;             /* set while redoing a GEMM on the CPU */
+/* dav2_qgemm_colext: each output column's largest and smallest value */
+static int16_t *g_cext_max, *g_cext_min;
 
 void dav2_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, dav2_tensor_t *out)
 {
     qgemm_impl(a, 0, wt, 0, 0, 0, out);
+}
+
+/* dav2_qgemm, and each output column m's largest and smallest value in
+ * cmax[m], cmin[m]. The requantisation is non-decreasing in the
+ * accumulator (the multipliers are >= 0), so they are the requantised
+ * extremes of the column's accumulators, which the range pass reads
+ * anyway: exact, without a pass over the output. */
+void dav2_qgemm_colext(const dav2_tensor_t *a, const dav2_qw_t *wt, dav2_tensor_t *out,
+                       int16_t *cmax, int16_t *cmin)
+{
+    g_cext_max = cmax;
+    g_cext_min = cmin;
+    qgemm_impl(a, 0, wt, 0, 0, 0, out);
+    g_cext_max = g_cext_min = 0;
+}
+
+/* the requested column extremes (see dav2_qgemm_colext) from the row
+ * extremes of acc and the finished parameters */
+static void qgemm_colext(const int32_t *rmax, const int32_t *rmin, const int32_t *par, int M)
+{
+    if (!g_cext_max || !rmax)
+        return;
+    for (int m = 0; m < M; m++) {
+        g_cext_max[m] = sat_act(apply_multiplier(rmax[m], par[3 * m], par[3 * m + 1])
+                                + par[3 * m + 2]);
+        g_cext_min[m] = sat_act(apply_multiplier(rmin[m], par[3 * m], par[3 * m + 1])
+                                + par[3 * m + 2]);
+    }
 }
 
 /* dav2_qgemm then dav2_gelu, bit-identical; on the accelerator the GELU
@@ -614,9 +644,12 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
      * the layout the accelerator's requantisation job reads */
     int32_t *par    = (int32_t *)dav2_arena_alloc((size_t)M * 3 * sizeof(int32_t));
     /* with a residual: each row's extreme accumulators, kept for the add */
-    int32_t *rmax   = res ? (int32_t *)dav2_arena_alloc((size_t)M * 2 * sizeof(int32_t)) : 0;
+    /* ... also for the column extremes of dav2_qgemm_colext (plain only) */
+    const int want_ext = g_cext_max && !res && !relu && !gelu;
+    int32_t *rmax   = (res || want_ext)
+                    ? (int32_t *)dav2_arena_alloc((size_t)M * 2 * sizeof(int32_t)) : 0;
     int32_t *rmin   = rmax ? rmax + M : 0;
-    if (!acc || !par || (res && !rmax)) {
+    if (!acc || !par || ((res || want_ext) && !rmax)) {
         /* dav2_arena_failed is set; unwinding here beats faulting on NULL,
          * which on the target just hangs the core. */
         dav2_arena_release(mark);
@@ -869,10 +902,12 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
              * into the block's lookup-table RAM with the first chunk */
             uint64_t g0 = dav2_cycles();
             dav2_xf_t gscale;
-            int16_t *tab = gelu_table(out_scale, &gscale);
+            const int packed = dav2_accel_lutint_ok();
+            int16_t *tab = gelu_table(out_scale, &gscale, packed);
             if (tab) {
                 epi.lut = tab;
                 epi.lut_load = 1;
+                epi.lut_int = packed;
                 fin_scale = gscale;
             }
             gelu_cycles = dav2_cycles() - g0;
@@ -969,6 +1004,8 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
                 if (sums) out->rsum = rsum_want;
             }
             trace_tensor("qgemm", out);
+            if (want_ext)
+                qgemm_colext(rmax, rmin, par, M);
             if (gelu && !epi.lut)
                 dav2_gelu(out);                   /* no lookup table: on the CPU */
             dav2_arena_release(mark);
@@ -1050,6 +1087,8 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
     }
 
     PROF_STOP(DAV2_PROF_REQUANT);
+    if (want_ext)
+        qgemm_colext(rmax, rmin, par, M);
     hdst->n = N;
     hdst->c = M;
     hdst->scale = out_scale;
@@ -1841,7 +1880,7 @@ static dav2_xf_t gelu_xf(dav2_xf_t x)
  * scale of its outputs. Used by the CPU pass (dav2_gelu) and, loaded into
  * the accelerator's lookup-table RAM, by fc1's requantisation job
  * (dav2_qgemm_gelu); the same table, so the same result. */
-static int16_t *gelu_table(dav2_xf_t in_scale, dav2_xf_t *out_scale_ret)
+static int16_t *gelu_table(dav2_xf_t in_scale, dav2_xf_t *out_scale_ret, int packed)
 {
     dav2_xf_t g[257];
     dav2_xf_t amax = XF_ZERO;
@@ -1855,6 +1894,18 @@ static int16_t *gelu_table(dav2_xf_t in_scale, dav2_xf_t *out_scale_ret)
     int16_t lut[257];
     for (int i = 0; i < 257; i++)
         lut[i] = sat_act((int32_t)xf_round(xf_mul(g[i], inv), 0));
+
+    if (packed) {
+        /* the 257 points for the block's interpolating table (CTRL.lutint):
+         * word i = {lut[i+1], lut[i]}; it computes the entries below */
+        uint32_t *pw = (uint32_t *)dav2_arena_alloc(256 * sizeof(uint32_t));
+        if (!pw)
+            return 0;
+        for (int i = 0; i < 256; i++)
+            pw[i] = pack16(lut[i], lut[i + 1]);
+        *out_scale_ret = out_scale;
+        return (int16_t *)pw;
+    }
 
     /* A direct table: one int16 output per input value, T[x + 8192] for
      * x in -8192..8191, each entry the linear interpolation between the
@@ -1893,7 +1944,7 @@ void dav2_gelu(dav2_tensor_t *t)
     SUB_START();
     const size_t mark = dav2_arena_mark();
     dav2_xf_t out_scale;
-    int16_t *tab = gelu_table(t->scale, &out_scale);
+    int16_t *tab = gelu_table(t->scale, &out_scale, 0);
     if (!tab) { dav2_arena_release(mark); PROF_STOP(DAV2_PROF_GELU); return; }
     const int16_t *T = tab + 8192;
 
