@@ -188,6 +188,18 @@ int dav2_accel_lutint_ok(void);
  * b = t + row_stride bytes; row_stride a non-zero multiple of 4. Left
  * running (collect with dav2_accel_finish); 0 when declined. */
 int dav2_accel_lerp_ok(void);
+/* The attention's matrices in the result RAM (CTRL.onchip), at word
+ * cr_base: an int16-weight GEMM that drains there (acc[m][n] at cr_base +
+ * m*N + n; the statistics still go to stats), and the requantisations
+ * that read their input from there. Left running; 0 when declined. */
+int dav2_accel_gemm16_cr_async(const int16_t *a, uint32_t a_stride, const int16_t *w,
+                               uint32_t w_stride, int wsh, uint32_t cr_base,
+                               int N, int K, int M, int32_t *stats);
+int dav2_accel_requant_lut_cr_async(uint32_t cr_base, int N, int M, const int32_t *params,
+                                    int16_t *out, int out_stride, const int16_t *lut,
+                                    int lut_load);
+int dav2_accel_requant_stride_cr_async(uint32_t cr_base, int N, int M, const int32_t *params,
+                                       int16_t *out, int out_stride);
 int dav2_accel_lerp_async(const int16_t *t, uint32_t row_stride, int16_t *out, int n, int w);
 /* dav2_accel_requant with output rows out_stride int16 apart (instead of
  * M): writes into a slice of a wider tensor. */

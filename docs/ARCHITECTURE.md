@@ -216,7 +216,10 @@ A **result RAM** of 131,072 words (**`CTRL.onchip`**) keeps a GEMM's int32
 result on chip: the drain writes it there instead of to DDR3, and the next
 requantisation job reads it from there. The encoder's results fit (82
 tokens); this removes two of the two and a half bus words per output.
-Single-chunk convolutions with N·M ≤ 131,072 use it as well.
+Single-chunk convolutions with N·M ≤ 131,072 use it as well. In the
+attention, the score matrix S of a head (at word 0) and its context C (at
+word 16384) stay there too: the exponential job and the context
+requantisation read them from there.
 
 **Tap reuse** (**`CTRL.greuse`**) shortens a gather's A load. With stride 1
 and all k·k kernel positions in one job, a pixel's taps kx = 0..k−2 are

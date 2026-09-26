@@ -260,6 +260,28 @@ int dav2_accel_requant16(const int16_t *in, int N, int M, const int32_t *params,
   job_kind = K_RQ16; start_job(requant_cycles(N, M, 1, 0) + (ostats ? (uint64_t)N * BEAT / 10 : 0)); wait_done();
   *amax = 8000; return 1; }
 int dav2_accel_ostats_ok(void) { return 1; }
+#ifndef ATTCR_C
+#define ATTCR_C 1                       /* the attention's S and C in the result RAM (round 28) */
+#endif
+int dav2_accel_gemm16_cr_async(const int16_t *a, uint32_t as, const int16_t *w, uint32_t ws,
+                               int wsh, uint32_t cr_base, int N, int K, int M, int32_t *st)
+{ (void)a;(void)as;(void)w;(void)ws;(void)wsh;(void)st;
+  if (!ATTCR_C || !ONCHIP_C || cr_base + (long)N * M > CR_WORDS) return 0;
+  job_kind = K_ATT; start_job(gemm_core(N, K, M, 1, 1, 0, 1)); return 2; }
+int dav2_accel_requant_lut_cr_async(uint32_t cr_base, int N, int M, const int32_t *params,
+                                    int16_t *out, int out_stride, const int16_t *lut, int lut_load)
+{ (void)params;(void)out;(void)out_stride;(void)lut;
+  if (!EXP_C || !ATTCR_C || cr_base + (long)N * M > CR_WORDS) return 0;
+  onchip_last = 1;
+  job_kind = K_RQ_EXP;
+  start_job(requant_cycles(N, M, 0, 0) + (lut_load ? 8192u * BEAT / 10 : 0));
+  return 2; }
+int dav2_accel_requant_stride_cr_async(uint32_t cr_base, int N, int M, const int32_t *params,
+                                       int16_t *out, int out_stride)
+{ (void)params;(void)out;(void)out_stride;
+  if (!ATTCR_C || cr_base + (long)N * M > CR_WORDS) return 0;
+  onchip_last = 1;
+  job_kind = K_RQ_CTX; start_job(requant_cycles(N, M, 0, 0)); return 2; }
 int dav2_accel_onchip_ok(void) { return ONCHIP_C; }
 int dav2_accel_qgemm_onchip_async(const dav2_tensor_t *a, const dav2_qw_t *wt,
                                   dav2_accel_stats_t *st)

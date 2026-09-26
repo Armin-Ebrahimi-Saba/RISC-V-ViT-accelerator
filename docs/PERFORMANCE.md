@@ -1,4 +1,4 @@
-# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 1.47 s (estimated)
+# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 1.46 s (estimated)
 
 This is the record of the speed-up work: what was measured, what each change
 did, and what is left. Every step kept the FPGA output **bit-exact with the
@@ -1252,6 +1252,43 @@ output. `student_gemm_tb`: rows of 2016, 64, 8 and 2048 int16, weights 0,
 Model: interpolation (CPU) 15.1 → 5.7 Mcycles, block +3.0 (LERP);
 frame 82.0 → 76.7 Mcycles, **about 1.47 s** (1.53 s, less the model's
 4 %). The accelerator now runs about 1946 jobs per frame.
+
+### Round twenty-eight — the attention's matrices in the result RAM (software; estimated, not yet measured)
+
+The result RAM (131,072 words of BRAM, round sixteen) held only the
+encoder's GEMM results; it was unused during the attention. Per head, the
+score matrix S (82 × 82 int32) went to DDR3 and came back for the
+exponential job, and the context C (64 × 82 int32) went to DDR3 and came
+back for its requantisation: about 24K bus words per head, 1.7M per frame.
+
+Now the score GEMM drains S into the result RAM at word 0, and the context
+GEMM drains C at word 16384 (`dav2_accel_gemm16_cr_async`: `CTRL.w16 |
+CTRL.onchip`, the statistics still go to DDR3). The exponential job and
+the context requantisation read them from there
+(`dav2_accel_requant_lut_cr_async`, `dav2_accel_requant_stride_cr_async`).
+A new driver offset `accel_cr_base` places a job's data in the result RAM.
+No hardware change: both modes already exist. Only the jobs read S and C.
+When a job is declined or fails, the CPU makes the lost matrix again in
+DDR3 (S from q and k, C from P and v^T; a v^T slot that already holds
+the next head's is made again) and continues as before. A boot self-test
+("attention result-RAM self-test ok") runs a 20 × 64 × 8 int16-weight
+GEMM at word 16384 and its strided requantisation against the CPU; if it
+fails, the attention keeps S and C in DDR3.
+
+A bug from round twenty is fixed: `dav2_accel_requant_lut_async` gave the
+deferred job the address of a local `amax`, and `dav2_accel_finish` wrote
+through it after the function had returned (found by AddressSanitizer).
+It now uses a static sink.
+
+Checks: same output, bit for bit (11 images, emulator; also with an
+emulator of a block without the result RAM). Bus errors injected into
+each of the first 230 jobs (four encoder blocks), with AddressSanitizer
+and UBSan: no errors, and every output is within 1.3·10⁻⁴ of the
+reference (1 − r).
+
+Model: accelerator busy in the attention 6.6 → 3.2 Mcycles; the attention
+is now limited by the CPU (softmax sums and normalisation 6.1 Mcycles,
+v^T 2.2), so the frame gains less: 76.7 → 76.1 Mcycles, **about 1.46 s**.
 
 ## 7. What is left, in order of expected gain
 

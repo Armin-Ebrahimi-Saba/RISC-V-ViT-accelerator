@@ -113,6 +113,17 @@ int dav2_accel_lutint_ok(void) { return 0; }
 int dav2_accel_gemm16_shift_async(const int16_t *a, uint32_t as, const int16_t *w, uint32_t ws,
                                   int wsh, int32_t *acc, int N, int K, int M, int32_t *st)
 { (void)a;(void)as;(void)w;(void)ws;(void)wsh;(void)acc;(void)N;(void)K;(void)M;(void)st; return 0; }
+int dav2_accel_gemm16_cr_async(const int16_t *a, uint32_t as, const int16_t *w, uint32_t ws,
+                               int wsh, uint32_t cr_base, int N, int K, int M, int32_t *st)
+{ (void)a;(void)as;(void)w;(void)ws;(void)wsh;(void)cr_base;(void)N;(void)K;(void)M;(void)st;
+  return 0; }
+int dav2_accel_requant_lut_cr_async(uint32_t cr_base, int N, int M, const int32_t *params,
+                                    int16_t *out, int out_stride, const int16_t *lut, int lut_load)
+{ (void)cr_base;(void)N;(void)M;(void)params;(void)out;(void)out_stride;(void)lut;(void)lut_load;
+  return 0; }
+int dav2_accel_requant_stride_cr_async(uint32_t cr_base, int N, int M, const int32_t *params,
+                                       int16_t *out, int out_stride)
+{ (void)cr_base;(void)N;(void)M;(void)params;(void)out;(void)out_stride; return 0; }
 int dav2_accel_busy(void) { return 0; }
 
 static uint32_t rs = 12345;

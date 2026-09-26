@@ -415,8 +415,14 @@ static inline int32_t job_round(int32_t v, int32_t mult, int sh)
 
 /* Start the exponential job for the head whose scores are b->s, b->sst:
  * 1 when started (then attn_softmax_accel_finish), 0 to use attn_softmax */
+/* The attention's matrices in the result RAM: S of one head at word
+ * ATT_CR_S, C at ATT_CR_C. Only the jobs read them; when a job is
+ * declined or fails, the CPU makes the matrix again in DDR3. */
+#define ATT_CR_S 0u
+#define ATT_CR_C 16384u
+
 static int attn_softmax_accel_start(const dav2_tensor_t *qkv, int n, attn_bufs_t *b,
-                                    int lut_load)
+                                    int lut_load, int s_cr)
 {
     const int Kp = (n + 3) & ~3;
     if (!g_exp_lut || (n & 1))
@@ -434,6 +440,9 @@ static int attn_softmax_accel_start(const dav2_tensor_t *qkv, int n, attn_bufs_t
         b->epar[3 * q + 1] = sh;
         b->epar[3 * q + 2] = -job_round(b->sst[2 * q], mult, sh);
     }
+    if (s_cr)
+        return dav2_accel_requant_lut_cr_async(ATT_CR_S, n, n, b->epar, b->pt, Kp, g_exp_lut,
+                                               lut_load) != 0;
     return dav2_accel_requant_lut_async(b->s, n, n, b->epar, b->pt, Kp, g_exp_lut, lut_load) != 0;
 }
 
@@ -672,13 +681,13 @@ static void attn_context16_cpu(int head, int n, attn_bufs_t *b, dav2_tensor_t *c
 /* 1 when the requantisation job was started (collect it with
  * dav2_accel_finish; on failure attn_context16_cpu, b->c is intact), 0
  * when it was declined and the CPU has done it */
-static int attn_context16_start(int head, int n, attn_bufs_t *b, dav2_tensor_t *ctx)
+static int attn_context16_start(int head, int n, attn_bufs_t *b, dav2_tensor_t *ctx, int c_cr)
 {
     const int HD = DAV2_HEAD_DIM, ED = DAV2_EMBED_DIM;
-    if (dav2_accel_requant_stride_async(b->c, n, HD, b->cpar, ctx->v + head * HD, ED))
+    if (c_cr ? dav2_accel_requant_stride_cr_async(ATT_CR_C, n, HD, b->cpar, ctx->v + head * HD, ED)
+             : dav2_accel_requant_stride_async(b->c, n, HD, b->cpar, ctx->v + head * HD, ED))
         return 1;
-    attn_context16_cpu(head, n, b, ctx);
-    return 0;
+    return -1;                   /* declined: the caller makes C in DDR3 */
 }
 
 /* The heads with int16 weights: two GEMMs per head instead of four, no
@@ -733,12 +742,33 @@ static void attention_all16(const dav2_tensor_t *qkv, int n, dav2_tensor_t *ctx)
 #define Q_W(h)   (b.q_direct ? qkv->v + (h) * HD : b.q16)
 #define Q_WS     (b.q_direct ? qkv->c : HD)
 #define K_A(h)   (qkv->v + ED + (h) * HD)
+    /* S and C in the result RAM when they fit (att_cr); s_cr: this head's
+     * S is there, c_cr: this head's C is there */
+    const int att_cr = dav2_accel_onchip_ok() && (long)n * n <= (long)ATT_CR_C
+                       && (long)ATT_CR_C + (long)HD * n <= DAV2_ACCEL_CR_WORDS;
+    int s_cr = 0, c_cr = 0;
 #define S_START(h) do { attn_prep_q16(qkv, (h), n, &b);                          \
         qsh2[(h) & 1] = b.q_direct ? b.q_sh : 0;                                  \
-        gemm16_start(K_A(h), qkv->c, Q_W(h), Q_WS, s2[(h) & 1], n, HD, n,         \
-                     st2[(h) & 1], qsh2[(h) & 1]); } while (0)
-#define S_FINISH(h) gemm16_finish(K_A(h), qkv->c, Q_W(h), Q_WS, s2[(h) & 1], n, HD, n, \
-                                  st2[(h) & 1], qsh2[(h) & 1])
+        gemm_i32_finish();                                                        \
+        s_cr = att_cr && dav2_accel_gemm16_cr_async(K_A(h), (uint32_t)qkv->c * 2u, \
+                     Q_W(h), (uint32_t)Q_WS * 2u, qsh2[(h) & 1], ATT_CR_S, n, HD, n, \
+                     st2[(h) & 1]);                                               \
+        if (s_cr) g16_pending = 1;                                                \
+        else gemm16_start(K_A(h), qkv->c, Q_W(h), Q_WS, s2[(h) & 1], n, HD, n,    \
+                          st2[(h) & 1], qsh2[(h) & 1]); } while (0)
+#define S_FINISH(h) do { if (s_cr && g16_pending && !dav2_accel_finish()) {        \
+            g16_pending = 0; s_cr = 0; S_DDR(h); }                                \
+        gemm16_finish(K_A(h), qkv->c, Q_W(h), Q_WS, s2[(h) & 1], n, HD, n,        \
+                      st2[(h) & 1], qsh2[(h) & 1]); } while (0)
+    /* S of head h in DDR3 (s2), computed again: the exponential job was
+     * declined or failed, or the block failed */
+#define S_DDR(h) do { gemm16_start(K_A(h), qkv->c, Q_W(h), Q_WS, s2[(h) & 1], n, HD, n, \
+                      st2[(h) & 1], qsh2[(h) & 1]);                              \
+        gemm16_finish(K_A(h), qkv->c, Q_W(h), Q_WS, s2[(h) & 1], n, HD, n,        \
+                      st2[(h) & 1], qsh2[(h) & 1]); } while (0)
+    /* C of head h in DDR3 (b.c) from P (b.p16) and v^T, computed again */
+#define C_DDR(vt) do { gemm16_start(b.p16, Kp, (vt), Kp, b.c, n, Kp, HD, 0, 0);     \
+        gemm16_finish(b.p16, Kp, (vt), Kp, b.c, n, Kp, HD, 0, 0); } while (0)
     /* head 0: scores, v^T while they run, the exponential job */
     S_START(0);
     LAP(DAV2_SUB_ATT_PREP_QK);
@@ -747,9 +777,11 @@ static void attention_all16(const dav2_tensor_t *qkv, int n, dav2_tensor_t *ctx)
     LAP(DAV2_SUB_ATT_PREP_V);
     S_FINISH(0);
     b.s = s2[0]; b.sst = st2[0]; b.pt = pt2[0];
-    int exp_ok = attn_softmax_accel_start(qkv, n, &b, !lut_loaded);
+    int exp_ok = attn_softmax_accel_start(qkv, n, &b, !lut_loaded, s_cr);
     if (exp_ok) lut_loaded = 1;
     exp_ok = exp_ok && dav2_accel_finish();
+    if (!exp_ok && s_cr)
+        S_DDR(0);                                /* attn_softmax reads S in DDR3 */
     if (exp_ok)
         attn_softmax_accel_sums(n, &b);
     LAP(DAV2_SUB_ATT_WAIT);
@@ -771,8 +803,17 @@ static void attention_all16(const dav2_tensor_t *qkv, int n, dav2_tensor_t *ctx)
             attn_prep_vt16(qkv, h + 1, n, &b);
         }
         LAP(DAV2_SUB_ATT_PREP_V);
-        if (ctx_pending && !dav2_accel_finish())
-            attn_context16_cpu(h - 1, n, &b, ctx);   /* b.c is still head h-1's */
+        if (ctx_pending && !dav2_accel_finish()) {
+            if (c_cr) {
+                /* C of head h-1 was on chip; its v^T slot may already hold
+                 * head h+1's, so it is made again (and head h+1's after) */
+                b.vt16 = vt2[(h - 1) & 1];
+                attn_prep_vt16(qkv, h - 1, n, &b);
+                C_DDR(b.vt16);
+                if (nx) attn_prep_vt16(qkv, h + 1, n, &b);
+            }
+            attn_context16_cpu(h - 1, n, &b, ctx);   /* b.c is head h-1's */
+        }
         ctx_pending = 0;
         LAP(DAV2_SUB_ATT_NORM);
         if (nx) S_START(h + 1);
@@ -784,7 +825,7 @@ static void attention_all16(const dav2_tensor_t *qkv, int n, dav2_tensor_t *ctx)
         if (nx) {
             S_FINISH(h + 1);
             HEAD_BUFS(h + 1);
-            exp_next = attn_softmax_accel_start(qkv, n, &b, !lut_loaded);
+            exp_next = attn_softmax_accel_start(qkv, n, &b, !lut_loaded, s_cr);
             if (exp_next) lut_loaded = 1;
         }
         LAP(DAV2_SUB_ATT_WAIT);
@@ -798,27 +839,47 @@ static void attention_all16(const dav2_tensor_t *qkv, int n, dav2_tensor_t *ctx)
          * GEMM so that a failure is known (then that head's softmax runs
          * on the CPU; its S is intact in DDR3) */
         exp_next = exp_next && dav2_accel_finish();
+        if (nx && !exp_next && s_cr)
+            S_DDR(h + 1);                        /* attn_softmax reads S in DDR3 */
         LAP(DAV2_SUB_ATT_WAIT);
         /* C[d][t] = sum_m P[t][m] v[m][d]; the next head's sums meanwhile */
-        gemm16_start(b.p16, Kp, vt2[h & 1], Kp, b.c, n, Kp, HD, 0, 0);
+        gemm_i32_finish();
+        c_cr = att_cr && dav2_accel_gemm16_cr_async(b.p16, (uint32_t)Kp * 2u, vt2[h & 1],
+                                                    (uint32_t)Kp * 2u, 0, ATT_CR_C, n, Kp, HD, 0);
+        if (c_cr) g16_pending = 1;
+        else gemm16_start(b.p16, Kp, vt2[h & 1], Kp, b.c, n, Kp, HD, 0, 0);
         LAP(DAV2_SUB_ATT_WAIT);
         if (exp_next) {
             HEAD_BUFS(h + 1);
             attn_softmax_accel_sums(n, &b);
         }
         LAP(DAV2_SUB_ATT_SOFTMAX);
+        if (c_cr && g16_pending && !dav2_accel_finish()) {
+            g16_pending = 0; c_cr = 0;
+            C_DDR(vt2[h & 1]);
+        }
         gemm16_finish(b.p16, Kp, vt2[h & 1], Kp, b.c, n, Kp, HD, 0, 0);
         LAP(DAV2_SUB_ATT_WAIT);
-        ctx_pending = attn_context16_start(h, n, &b, ctx);
+        ctx_pending = attn_context16_start(h, n, &b, ctx, c_cr);
+        if (ctx_pending < 0) {
+            if (c_cr) C_DDR(vt2[h & 1]);
+            c_cr = 0;
+            attn_context16_cpu(h, n, &b, ctx);
+            ctx_pending = 0;
+        }
         LAP(DAV2_SUB_ATT_NORM);
         exp_ok = exp_next;
     }
-    if (ctx_pending && !dav2_accel_finish())
+    if (ctx_pending && !dav2_accel_finish()) {
+        if (c_cr) C_DDR(vt2[(DAV2_N_HEADS - 1) & 1]);
         attn_context16_cpu(DAV2_N_HEADS - 1, n, &b, ctx);
+    }
     LAP(DAV2_SUB_ATT_NORM);
 #undef HEAD_BUFS
 #undef S_START
 #undef S_FINISH
+#undef S_DDR
+#undef C_DDR
 #undef Q_W
 #undef Q_WS
 #undef K_A
