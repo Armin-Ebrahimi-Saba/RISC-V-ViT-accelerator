@@ -51,8 +51,9 @@ int dav2_accel_qgemm_async(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t 
                            dav2_accel_stats_t *st)
 { (void)a; (void)acc; st->v = stats_buf; st->tiles = 1; (void)wt; return 1; }
 int dav2_accel_conv_async(const int16_t *img, int h, int w, int C, int k, int stride,
-                          int pad, const int8_t *wt, int M, int32_t *acc, dav2_accel_stats_t *st)
-{ (void)img;(void)h;(void)w;(void)C;(void)k;(void)stride;(void)pad;(void)wt;(void)M;(void)acc;
+                          int pad, const int8_t *wt, int M, int32_t *acc, dav2_accel_stats_t *st,
+                          int in_relu)
+{ (void)img;(void)h;(void)w;(void)C;(void)k;(void)stride;(void)pad;(void)wt;(void)M;(void)acc;(void)in_relu;
   st->v = stats_buf; st->tiles = 1; return 1; }
 int dav2_accel_gemm_raw_async(const int16_t *a, uint32_t as, const int8_t *w, uint32_t ws,
                               int32_t *acc, int N, int K, int M)
@@ -92,9 +93,11 @@ int dav2_accel_qgemm_onchip_async(const dav2_tensor_t *a, const dav2_qw_t *wt,
                                   dav2_accel_stats_t *st)
 { (void)a; (void)wt; st->v = 0; st->tiles = 0; return 0; }
 int dav2_accel_conv_onchip_async(const int16_t *img, int h, int w, int C, int k, int stride,
-                                 int pad, const int8_t *wt, int M, dav2_accel_stats_t *st)
-{ (void)img;(void)h;(void)w;(void)C;(void)k;(void)stride;(void)pad;(void)wt;(void)M;
+                                 int pad, const int8_t *wt, int M, dav2_accel_stats_t *st,
+                                 int in_relu)
+{ (void)img;(void)h;(void)w;(void)C;(void)k;(void)stride;(void)pad;(void)wt;(void)M;(void)in_relu;
   st->v = 0; st->tiles = 0; return 0; }
+int dav2_accel_grelu_ok(void) { return 0; }
 int dav2_accel_busy(void) { return 0; }
 
 static uint32_t rs = 12345;

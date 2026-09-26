@@ -388,9 +388,9 @@ module student_gemm_tb;
     logic [31:0] st, cyc;
     longint total_cyc = 0;
     int guard;
-    $display("--- CONV %0dx%0dx%0d k=%0d s=%0d p=%0d -> %0dx%0d, M=%0d, K=%0d in chunks of %0d positions%s",
+    $display("--- CONV %0dx%0dx%0d k=%0d s=%0d p=%0d -> %0dx%0d, M=%0d, K=%0d in chunks of %0d positions%s%s",
              h, w, C, k, stride, pad, oh, ow, mdim, kfull, kchunk,
-             (ctrl_extra & 32'h800) ? ", tap reuse" : "");
+             (ctrl_extra & 32'h800) ? ", tap reuse" : "", (ctrl_extra & 32'h2000) ? ", ReLU" : "");
 
     // image and weights
     for (int i = 0; i < h*w*C/2; i++)
@@ -456,6 +456,7 @@ module student_gemm_tb;
               int e = (iy*w + ix)*C + c;
               logic [31:0] wd = memory.mem[mem_word(I_BASE) + (e >> 1)];
               int a = e[0] ? int'($signed(wd[31:16])) : int'($signed(wd[15:0]));
+              if ((ctrl_extra & 32'h2000) && a < 0) a = 0;   // CTRL.grelu
               expected += a * int'(peek_w(m, (ky*k + kx)*C + c, kfull));
             end
           end
@@ -1136,6 +1137,13 @@ module student_gemm_tb;
     run_conv(11, 13, 8, 5, 1, 2, 4, 25);       // k=5, pad 2
     run_conv(8, 9, 12, 2, 1, 0, 4, 4);         // k=2, no padding
     run_conv(9, 9, 16, 1, 1, 0, 4, 1);         // k=1: nothing to reuse
+    // ReLU on the gathered image (CTRL.grelu), with and without reuse
+    ctrl_extra = 32'h2800;
+    run_conv(20, 20, 32, 3, 1, 1, 8, 9);
+    run_conv(12, 12, 16, 3, 1, 1, 4, 9);
+    ctrl_extra = 32'h2000;
+    run_conv(9, 9, 384, 3, 2, 1, 6, 5);        // split kernel, stride 2
+    run_conv(9, 9, 64, 3, 1, 1, 12, 9);
     ctrl_extra = 32'h0;
     run_conv(20, 20, 32, 3, 1, 1, 8, 9);       // the same shape without reuse, for the cycles
 

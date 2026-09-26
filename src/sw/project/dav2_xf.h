@@ -30,13 +30,32 @@ typedef struct {
 #define XF_ZERO ((dav2_xf_t){ 0, 0 })
 #define XF_ONE  ((dav2_xf_t){ 1 << 30, 30 })
 
+/* Leading zeros of a != 0. The core has no clz instruction, and
+ * __builtin_clzll is a libgcc call there; a binary search inline costs
+ * less. Elsewhere the builtin. Both give the same number. */
+static inline int xf_clz64(uint64_t a)
+{
+#if defined(__riscv) && !defined(__riscv_zbb)
+    uint32_t x = (uint32_t)(a >> 32);
+    int n = 0;
+    if (!x) { x = (uint32_t)a; n = 32; }
+    if (!(x >> 16)) { n += 16; x <<= 16; }
+    if (!(x >> 24)) { n += 8;  x <<= 8; }
+    if (!(x >> 28)) { n += 4;  x <<= 4; }
+    if (!(x >> 30)) { n += 2;  x <<= 2; }
+    return n + (int)(!(x >> 31));
+#else
+    return __builtin_clzll(a);
+#endif
+}
+
 /* Normalise v * 2^-sh, rounding to nearest (ties away from zero). */
 static inline dav2_xf_t xf_norm(int64_t v, int32_t sh)
 {
     if (v == 0)
         return XF_ZERO;
     uint64_t a = v < 0 ? (uint64_t)0 - (uint64_t)v : (uint64_t)v;
-    int s = 33 - __builtin_clzll(a);          /* bits(a) - 31 */
+    int s = 33 - xf_clz64(a);                 /* bits(a) - 31 */
     if (s > 0) {
         a = (a + ((uint64_t)1 << (s - 1))) >> s;
         if (a >> 31) {                        /* rounding carried to 2^31 */

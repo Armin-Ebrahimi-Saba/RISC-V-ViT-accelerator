@@ -454,6 +454,18 @@ static void add_params(int32_t amax_a, dav2_xf_t sa, int32_t amax_b, dav2_xf_t s
     xf_to_mult(xf_mul(sb, inv), mb, shb);
 }
 
+/* round(sum * 2^16 / C), halves away from zero, for 1 <= C <= 65535 and
+ * |sum| < 2^31: a row mean in Q16 with two 32-bit divisions instead of a
+ * 64-bit one. With |sum| = q C + r: (|sum| 2^16 + C/2) / C
+ * = q 2^16 + (r 2^16 + C/2) / C, and r 2^16 + C/2 < 2^32. */
+static inline int32_t mean_q16(int32_t sum, int C)
+{
+    const uint32_t u = sum < 0 ? (uint32_t)0 - (uint32_t)sum : (uint32_t)sum;
+    const uint32_t c = (uint32_t)C, q = u / c, r = u - q * c;
+    const uint32_t m = (q << 16) + ((r << 16) + c / 2u) / c;
+    return sum < 0 ? -(int32_t)m : (int32_t)m;
+}
+
 /* The mantissa of a (m, sh) pair at the common exponent e <= sh:
  * m * 2^-(sh - e), truncated. */
 static inline int32_t align_mant(dav2_xf_t v, int e)
@@ -492,7 +504,7 @@ static inline int32_t sat_i32(int64_t v)
 
 /* A convolution's geometry, for a GEMM whose A matrix is the im2col of an
  * image rather than a tensor in memory. */
-typedef struct { int h, w, k, stride, pad; } conv_desc_t;
+typedef struct { int h, w, k, stride, pad, in_relu; } conv_desc_t;
 
 static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
                        const dav2_qw_t *wt, const dav2_tensor_t *res, int relu,
@@ -544,6 +556,23 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
 #endif
 
     const size_t mark = dav2_arena_mark();
+    /* the operands as given, for a redo after a failure (a and cv may be
+     * replaced below by a rectified copy in the arena) */
+    const dav2_tensor_t *const a_in = a;
+    const conv_desc_t *const cv_in = cv;
+    /* ReLU on a convolution's input: the block applies it while gathering
+     * (CTRL.grelu); otherwise a rectified copy of the input is used */
+    dav2_tensor_t a_relu;
+    conv_desc_t cv_plain;
+    if (cv && cv->in_relu && !dav2_accel_grelu_ok()) {
+        a_relu = dav2_tensor_new(a->n, a->c);
+        if (!a_relu.v) { dav2_arena_release(mark); return; }
+        dav2_copy_relu(&a_relu, a);
+        a = &a_relu;
+        cv_plain = *cv;
+        cv_plain.in_relu = 0;
+        cv = &cv_plain;
+    }
     int32_t *acc    = (int32_t *)dav2_arena_alloc((size_t)N * M * sizeof(int32_t));
     /* per-row requantisation parameters, {mult, shift, bias} interleaved:
      * the layout the accelerator's requantisation job reads */
@@ -578,11 +607,11 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
     int run = 0;
     if (cv && use_onchip)
         run = dav2_accel_conv_onchip_async(a->v, cv->h, cv->w, a->c, cv->k, cv->stride,
-                                           cv->pad, wt->w, M, &st);
+                                           cv->pad, wt->w, M, &st, cv->in_relu);
     if (cv && !run) {
         use_onchip = 0;
         run = dav2_accel_conv_async(a->v, cv->h, cv->w, a->c, cv->k, cv->stride,
-                                    cv->pad, wt->w, M, acc, &st);
+                                    cv->pad, wt->w, M, acc, &st, cv->in_relu);
     }
     if (cv && run) {
         /* the block gathers the patches itself: no im2col matrix */
@@ -590,9 +619,16 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
         dav2_tensor_t cols = *a;
         if (cv) {
             use_onchip = 0;                   /* the im2col GEMM keeps acc in DDR3 */
+            const dav2_tensor_t *src = a;
+            if (cv->in_relu) {                /* the block declined the gather */
+                a_relu = dav2_tensor_new(a->n, a->c);
+                if (!a_relu.v) { dav2_arena_release(mark); return; }
+                dav2_copy_relu(&a_relu, a);
+                src = &a_relu;
+            }
             cols = dav2_tensor_new(N, K);
             if (!cols.v) { dav2_arena_release(mark); return; }
-            dav2_im2col(a, cv->h, cv->w, cv->k, cv->k, cv->stride, cv->pad, &cols);
+            dav2_im2col(src, cv->h, cv->w, cv->k, cv->k, cv->stride, cv->pad, &cols);
             t_start = dav2_cycles();          /* im2col counted in its own bucket */
         }
         /* keep the int32 result on chip when it fits and the whole
@@ -989,7 +1025,7 @@ redo_on_cpu:
      * CPU's. */
     dav2_arena_release(mark);
     qgemm_no_onchip++;                    /* the redo keeps its result in DDR3 */
-    qgemm_impl(a, cv, wt, res, relu, gelu, out);
+    qgemm_impl(a_in, cv_in, wt, res, relu, gelu, out);
     qgemm_no_onchip--;
 }
 
@@ -1077,8 +1113,6 @@ static void layernorm_affine_cpu(const dav2_tensor_t *in, const int32_t *gq,
         dav2_xf_t v = xf_add(xf_mul(xf_from_int(num), inv_c2), eps_s2);
         int32_t am; int ash;
         xf_to_mult(xf_rsqrt(v), &am, &ash);                   /* r */
-        /* mean in Q16, rounded half away from zero */
-        int64_t s16 = (int64_t)sum * 65536;
         /* z = round(d16 * am / 2^ash) as one mulh: (mulh(d16 << up, am) +
          * rnd) >> (sh - 32) with sh = max(ash, 33), up = sh - ash. A row with
          * ash < 33 has a small spread: r ~ 1/std = am 2^-ash gives std <
@@ -1087,7 +1121,7 @@ static void layernorm_affine_cpu(const dav2_tensor_t *in, const int32_t *gq,
          * so this is exactly apply_multiplier's result. */
         const int shz = ash > 33 ? ash : 33;
         int32_t *p = rowp + (size_t)n * 5;
-        p[0] = (int32_t)(s16 >= 0 ? (s16 + C / 2) / C : -((-s16 + C / 2) / C));
+        p[0] = mean_q16(sum, C);            /* mean in Q16, halves away from zero */
         p[1] = am;
         p[2] = shz - 32;
         p[3] = 1 << (shz - 33);
@@ -1346,8 +1380,7 @@ static void layernorm_affine(const dav2_tensor_t *in, const int32_t *gq,
         int64_t num = (int64_t)C * (int64_t)sq - (int64_t)sum * sum;  /* C^2 * var_q, exact */
         if (num < 0) num = 0;
         dav2_xf_t r = xf_rsqrt(xf_add(xf_mul(xf_from_int(num), inv_c2), eps_s2));
-        int64_t s16 = (int64_t)sum * 65536;
-        int32_t mean16 = (int32_t)(s16 >= 0 ? (s16 + C / 2) / C : -((-s16 + C / 2) / C));
+        int32_t mean16 = mean_q16(sum, C);
         int32_t dmax = (xmax << 16) - mean16, dmin = (xmin << 16) - mean16;
         int32_t dev = dmax > -dmin ? dmax : -dmin;
         dav2_xf_t zmax = xf_mul(xf_norm(dev, 16), r);
@@ -1484,8 +1517,7 @@ static void layernorm_plain(const dav2_tensor_t *in, dav2_tensor_t *out)
         dav2_xf_t r = xf_rsqrt(xf_add(xf_mul(xf_from_int(num), inv_c2), eps_s2));
 
         /* mean in Q16, rounded half away from zero */
-        int64_t s16 = (int64_t)sum * 65536;
-        int32_t mean16 = (int32_t)(s16 >= 0 ? (s16 + C / 2) / C : -((-s16 + C / 2) / C));
+        int32_t mean16 = mean_q16(sum, C);
         int32_t dmax = (xmax << 16) - mean16, dmin = (xmin << 16) - mean16;
         int32_t dev = dmax > -dmin ? dmax : -dmin;
         dav2_xf_t zmax = xf_mul(xf_norm(dev, 16), r);
@@ -1596,7 +1628,33 @@ void dav2_add(const dav2_tensor_t *a, const dav2_tensor_t *b, dav2_tensor_t *out
     add_params(amax_a, a->scale, amax_b, b->scale, &out_scale, &ma, &sa, &mb, &sb);
 
     int32_t omax = 0;
-    if (wide && sa >= 17 && sb >= 17) {
+    if (wide && sa >= 17 && sa <= 47 && sb >= 17 && sb <= 47
+        && amax_a <= 16383 && amax_b <= 16383) {
+        /* round(v m / 2^s) with m = mh 2^16 + ml, all in 32 bits and with
+         * two 1-cycle multiplies instead of a 6-cycle mulh:
+         *   (v mh + ((v ml) >> 16) + 2^(s-17)) >> (s-16),
+         * since 2^(s-1) is a multiple of 2^16 and floor shifts compose.
+         * |v| < 2^14: |v mh| < 2^29, |v ml| < 2^30, 2^(s-17) <= 2^30. */
+        const int32_t mah = ma >> 16, mal = ma & 0xffff, mbh = mb >> 16, mbl = mb & 0xffff;
+        const int32_t ra = 1 << (sa - 17), rb = 1 << (sb - 17);
+        const int ka = sa - 16, kb = sb - 16;
+        const uint32_t *aw = (const uint32_t *)a->v, *bw = (const uint32_t *)b->v;
+        uint32_t *ow = (uint32_t *)out->v;
+        #pragma GCC unroll 2
+        for (int i = 0; i < total / 2; i++) {
+            uint32_t x = aw[i], y = bw[i];
+            int32_t x0 = lo16(x), x1 = hi16(x), y0 = lo16(y), y1 = hi16(y);
+            int32_t r0 = sat_act(((x0 * mah + ((x0 * mal) >> 16) + ra) >> ka)
+                               + ((y0 * mbh + ((y0 * mbl) >> 16) + rb) >> kb));
+            int32_t r1 = sat_act(((x1 * mah + ((x1 * mal) >> 16) + ra) >> ka)
+                               + ((y1 * mbh + ((y1 * mbl) >> 16) + rb) >> kb));
+            ow[i] = pack16(r0, r1);
+            if (r0 < 0) r0 = -r0;
+            if (r1 < 0) r1 = -r1;
+            if (r0 > omax) omax = r0;
+            if (r1 > omax) omax = r1;
+        }
+    } else if (wide && sa >= 17 && sb >= 17) {
         /* The factors are near 1, so the shifts are about 31 and
          * apply_multiplier takes its slower branch (shift <= 32). With the
          * int16 input moved up by 16 bits the shift becomes >= 33 and one
@@ -1771,15 +1829,13 @@ static int16_t *gelu_table(dav2_xf_t in_scale, dav2_xf_t *out_scale_ret)
         return 0;
     for (int i = 0; i < 256; i++) {
         const int32_t lo = lut[i], step = lut[i + 1] - lut[i];
-        uint32_t *tw = (uint32_t *)(tab + 64 * i);
+        int16_t *t = tab + 64 * i;
         int32_t acc = 0;
-        #pragma GCC unroll 4
-        for (int f = 0; f < 64; f += 2) {
-            int32_t v0 = lo + (acc >> 6);
+        /* one halfword store per entry: cheaper than packing pairs */
+        #pragma GCC unroll 8
+        for (int f = 0; f < 64; f++) {
+            t[f] = (int16_t)(lo + (acc >> 6));
             acc += step;
-            int32_t v1 = lo + (acc >> 6);
-            acc += step;
-            tw[f >> 1] = pack16(v0, v1);
         }
     }
     *out_scale_ret = out_scale;
@@ -1830,7 +1886,23 @@ static void interp_row_h(const int16_t *src, int C, int ow, const int *x0a,
         const int16_t *b = src + (size_t)x1a[j] * C;
         const int wx = wxa[j];
         int16_t *o = dst + (size_t)j * C;
-        if (wx == 0) {                          /* (a * 256) >> 8 == a */
+        if (wide && wx != 0 && j + 1 < ow && wxa[j + 1] != 0
+            && x0a[j + 1] == x0a[j] && x1a[j + 1] == x1a[j]) {
+            /* two output pixels between the same source pixels: shared
+             * loads, a + ((d wx) >> 8) with d = b - a (see below) */
+            const uint32_t *ap = (const uint32_t *)a, *bp = (const uint32_t *)b;
+            const uint32_t *const aend = ap + C / 2;
+            uint32_t *o1 = (uint32_t *)o, *o2 = (uint32_t *)(o + C);
+            const int32_t w1 = wx, w2 = wxa[j + 1];
+            while (ap < aend) {
+                uint32_t x = *ap++, y = *bp++;
+                int32_t xl = lo16(x), xh = hi16(x);
+                int32_t dl = lo16(y) - xl, dh = hi16(y) - xh;
+                *o1++ = pack16(xl + ((dl * w1) >> 8), xh + ((dh * w1) >> 8));
+                *o2++ = pack16(xl + ((dl * w2) >> 8), xh + ((dh * w2) >> 8));
+            }
+            j++;
+        } else if (wx == 0) {                   /* (a * 256) >> 8 == a */
             dav2_copy16(o, a, (size_t)C);
         } else if (wide) {
             const uint32_t *aw = (const uint32_t *)a, *bw = (const uint32_t *)b;
@@ -1926,7 +1998,25 @@ void dav2_interpolate(const dav2_tensor_t *in, int h, int w,
         }
         const int wy = wya[i];
         int16_t *orow = out->v + (size_t)i * rowlen;
-        if (wy == 0) {                          /* (top * 256) >> 8 == top */
+        if (wide && wy != 0 && i + 1 < oh && wya[i + 1] != 0
+            && y0a[i + 1] == need[0] && y1a[i + 1] == need[1]) {
+            /* Two output rows between the same source rows (upsampling):
+             * one load and one unpacking of top and bottom for both. With
+             * d = bot - top, (top (256 - wy) + bot wy) >> 8 is
+             * top + ((d wy) >> 8), since 256 top is a multiple of 256. */
+            const uint32_t *tp = (const uint32_t *)hr[0], *bp = (const uint32_t *)hr[1];
+            const uint32_t *const tend = tp + rowlen / 2;
+            uint32_t *o1 = (uint32_t *)orow, *o2 = (uint32_t *)(orow + rowlen);
+            const int32_t w1 = wy, w2 = wya[i + 1];
+            while (tp < tend) {
+                uint32_t t = *tp++, b = *bp++;
+                int32_t tl = lo16(t), th = hi16(t);
+                int32_t dl = lo16(b) - tl, dh = hi16(b) - th;
+                *o1++ = pack16(tl + ((dl * w1) >> 8), th + ((dh * w1) >> 8));
+                *o2++ = pack16(tl + ((dl * w2) >> 8), th + ((dh * w2) >> 8));
+            }
+            i++;
+        } else if (wy == 0) {                   /* (top * 256) >> 8 == top */
             dav2_copy16(orow, hr[0], rowlen);
         } else if (wide) {
             const uint32_t *tw = (const uint32_t *)hr[0], *bw = (const uint32_t *)hr[1];
@@ -2002,22 +2092,29 @@ dav2_tensor_t dav2_conv2d_ex(const dav2_tensor_t *in, int h, int w,
     const int ow = (w + 2 * pad - k) / stride + 1;
 
     dav2_tensor_t out = dav2_tensor_new(oh * ow, wt->m);
-    const size_t mark = dav2_arena_mark();
-    if (k == 1 && stride == 1 && pad == 0) {
-        /* A 1x1 convolution is a GEMM over the pixels as they are; im2col
-         * would only copy the tensor. */
-        qgemm_impl(in, 0, wt, res, relu, 0, &out);
-    } else {
-        /* Gathered in hardware when the accelerator can (no patch matrix is
-         * ever built); otherwise im2col in software, inside qgemm_impl. */
-        conv_desc_t cv = { h, w, k, stride, pad };
-        qgemm_impl(in, &cv, wt, res, relu, 0, &out);
-    }
-    dav2_arena_release(mark);
-
+    dav2_conv2d_into(in, h, w, wt, k, stride, pad, res, relu, 0, &out);
     if (oh_out) *oh_out = oh;
     if (ow_out) *ow_out = ow;
     return out;
+}
+
+void dav2_conv2d_into(const dav2_tensor_t *in, int h, int w,
+                      const dav2_qw_t *wt, int k, int stride, int pad,
+                      const dav2_tensor_t *res, int relu, int in_relu,
+                      dav2_tensor_t *out)
+{
+    const size_t mark = dav2_arena_mark();
+    if (k == 1 && stride == 1 && pad == 0 && !in_relu) {
+        /* A 1x1 convolution is a GEMM over the pixels as they are; im2col
+         * would only copy the tensor. */
+        qgemm_impl(in, 0, wt, res, relu, 0, out);
+    } else {
+        /* Gathered in hardware when the accelerator can (no patch matrix is
+         * ever built); otherwise im2col in software, inside qgemm_impl. */
+        conv_desc_t cv = { h, w, k, stride, pad, in_relu };
+        qgemm_impl(in, &cv, wt, res, relu, 0, out);
+    }
+    dav2_arena_release(mark);
 }
 
 dav2_tensor_t dav2_conv_transpose(const dav2_tensor_t *in, int h, int w,

@@ -1,4 +1,4 @@
-# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 2.22 s (estimated)
+# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 2.0 s (estimated)
 
 This is the record of the speed-up work: what was measured, what each change
 did, and what is left. Every step kept the FPGA output **bit-exact with the
@@ -975,6 +975,35 @@ output at once. PASSED, 656,177 words. Bitstream: timing met, WNS +0.395 ns (DDR
 
 Model: 122.2 → 115.5 Mcycles per frame, **about 2.22 s** (2.31 s, less
 the model's 4 %).
+
+### Round nineteen — the DPT head's elementwise work, and CPU arithmetic (hardware; estimated, not yet measured)
+
+After round eighteen the block was busy for 47 of 115.5 Mcycles; the frame
+was limited by CPU work done while the block waited.
+
+| Change | Where | Model (Mcycles) |
+|---|---|---|
+| **ReLU while gathering** (`CTRL.grelu`, CAPS bit 31): a gather job clears the negative int16 halves of every image word it reads from the bus. A residual conv unit's first convolution now reads relu(x) this way, and the CPU copy `dav2_copy_relu` is gone. Without the bit (an older bitstream) `qgemm_impl` makes the copy as before. | `student_gemm.sv`, `dav2_accel.c`, `dav2_ops.c` | add/relu 6.8 → 3.8 |
+| `dav2_conv2d_into`: a convolution writes into a tensor the caller allocated. The residual conv units and the fusion blocks' output convolutions no longer copy their result. | `dav2_ops.c`, `dav2_engine.c` | copies 2.1 → 0.75 |
+| The fusion blocks' `dav2_add` on the CPU: round(v m / 2^s) as (v mh + ((v ml) >> 16) + 2^(s−17)) >> (s−16) with m = mh 2^16 + ml, two 1-cycle multiplies instead of a 6-cycle mulh. On the block it is not possible: the requantisation job reads its input transposed (in[m][n]) but the residual in output order. | `dav2_ops.c` | add 3.9 → 3.6 |
+| `xf_norm` counts leading zeros inline instead of calling `__clzdi2`; the rows' means in LayerNorm take two 32-bit divisions instead of a 64-bit one (`mean_q16`; both checked against the old code on all sums a row can have); the GELU table is built with one halfword store per entry. | `dav2_xf.h`, `dav2_ops.c` | `__clzdi2` 1.05 → 0, `__divdi3` 0.97 → 0.49, GELU table 2.97 → 2.69 |
+| Interpolation: two output rows (and two output pixels) between the same two source rows (pixels) share one load and one unpacking, as top + ((d w) >> 8) with d = bottom − top. This covers 106 of the 126 rows of 72 → 126 and all but the copied rows of the 2× steps. | `dav2_ops.c` | interpolate 16.8 → 15.4 |
+
+All of these give the same output as before, bit for bit (11 images, host
+and emulator; also an emulator without CAPS bit 31, which takes the copy
+path). Bus errors injected into 13 jobs from 20 to 1290 all end with the
+correct output. The boot self-test runs the gather test a third time with
+ReLU ("gather-ReLU self-test ok"). `student_gemm_tb`: convolutions with
+ReLU, with and without reuse, split and stride 2. PASSED, 661,075 words.
+Bitstream: timing met, WNS +0.282 ns (DDR3 controller), worst `sys_clk`
+path +1.43 ns, WHS +0.033 ns; LUT 26.3 %, BRAM 91.6 %, DSP 37.8 %; the
+warnings are those of round eighteen.
+
+The model had counted its own loop in `gemm_core` (2.6 Mcycles) as CPU
+time since round seventeen; it now counts the tile rows with a formula.
+
+Model: 115.5 → 107.6 Mcycles per frame, and 105.1 without the model's own
+loop: **about 2.0 s** (2.10 s, less the model's 4 %).
 
 ## 7. What is left, in order of expected gain
 

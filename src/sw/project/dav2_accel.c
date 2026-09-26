@@ -89,6 +89,7 @@
 #define CTRL_ONCHIP   0x400u
 #define CTRL_GREUSE   0x800u
 #define CTRL_OSUMS    0x1000u
+#define CTRL_GRELU    0x2000u
 
 #define STATUS_BUSY 0x1u
 #define STATUS_DONE 0x2u
@@ -122,6 +123,8 @@ static int      accel_ostats_ok;       /* CAPS bit 27, cleared if its self-test 
 static int      accel_onchip_ok;       /* CAPS bit 28, cleared if its self-test fails */
 static int      accel_greuse_ok;       /* CAPS bit 29, cleared if its self-test fails */
 static int      accel_osums_ok;        /* CAPS bit 30, cleared if its self-test fails */
+static int      accel_grelu_ok;        /* CAPS bit 31, cleared if its self-test fails */
+static int      accel_conv_relu;       /* dav2_accel_conv: ReLU on the image (CTRL.grelu) */
 static int      accel_conv_onchip;     /* dav2_accel_conv: result into the result RAM */
 static uint32_t accel_gemm_ctrl;       /* extra CTRL bits for accel_run (CTRL.w16) */
 static int      accel_out_stride;      /* requant output row length in int16, 0 = M */
@@ -152,6 +155,7 @@ int dav2_accel_init(void)
     accel_onchip_ok = (int)((caps >> 28) & 1u);
     accel_greuse_ok = (int)((caps >> 29) & 1u);
     accel_osums_ok = (int)((caps >> 30) & 1u);
+    accel_grelu_ok = (int)((caps >> 31) & 1u);
 
     /* A missing block reads back as zero (or the bus errors out, which the
      * core reports separately); either way we simply stay on the CPU path. */
@@ -600,8 +604,11 @@ int dav2_accel_conv(const int16_t *img, int h, int w, int C, int k, int stride,
     const int onchip = accel_conv_onchip;
     if (onchip && (!single || !st || !accel_onchip_ok || (long)N * M > DAV2_ACCEL_CR_WORDS))
         return 0;
+    if (accel_conv_relu && !accel_grelu_ok)
+        return 0;
     /* tap reuse (CTRL.greuse): stride 1, all k*k positions in one job */
     const uint32_t ctrl = CTRL_START | CTRL_GATHER | (onchip ? CTRL_ONCHIP : 0u)
+                        | (accel_conv_relu ? CTRL_GRELU : 0u)
                         | ((accel_greuse_ok && stride == 1 && single) ? CTRL_GREUSE : 0u);
     int32_t *stats = 0, *part = 0;
     const size_t mark = dav2_arena_mark();
@@ -727,23 +734,30 @@ int dav2_accel_qgemm_async(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t 
 
 int dav2_accel_conv_async(const int16_t *img, int h, int w, int C, int k, int stride,
                           int pad, const int8_t *wt, int M, int32_t *acc,
-                          dav2_accel_stats_t *st)
+                          dav2_accel_stats_t *st, int in_relu)
 {
     accel_defer = 1;
+    accel_conv_relu = in_relu;
     int r = dav2_accel_conv(img, h, w, C, k, stride, pad, wt, M, acc, st);
+    accel_conv_relu = 0;
     accel_defer = 0;
     return r;
 }
 
+int dav2_accel_grelu_ok(void) { return dav2_accel_init() && accel_gather_ok && accel_grelu_ok; }
+
 int dav2_accel_conv_onchip_async(const int16_t *img, int h, int w, int C, int k, int stride,
-                                 int pad, const int8_t *wt, int M, dav2_accel_stats_t *st)
+                                 int pad, const int8_t *wt, int M, dav2_accel_stats_t *st,
+                                 int in_relu)
 {
     st->v = 0; st->tiles = 0;
     if (!dav2_accel_init() || !accel_onchip_ok)
         return 0;
     accel_defer = 1;
     accel_conv_onchip = 1;
+    accel_conv_relu = in_relu;
     int r = dav2_accel_conv(img, h, w, C, k, stride, pad, wt, M, 0, st);
+    accel_conv_relu = 0;
     accel_conv_onchip = 0;
     accel_defer = 0;
     if (!r) { st->v = 0; st->tiles = 0; }
@@ -999,6 +1013,35 @@ static int accel_check_gather(void)
                 accel_greuse_ok = 0;
             } else {
                 printf("GEMM accelerator: tap-reuse self-test ok\n");
+            }
+        }
+        if (accel_grelu_ok) {
+            /* ReLU on the image while gathering (CTRL.grelu), against
+             * the CPU on the rectified patch matrix */
+            dst = cols;
+            for (int oy = 0; oy < H; oy++)
+                for (int ox = 0; ox < W; ox++)
+                    for (int ky = 0; ky < KS; ky++)
+                        for (int kx = 0; kx < KS; kx++) {
+                            int iy = oy + ky - 1, ix = ox + kx - 1;
+                            for (int c = 0; c < C; c++) {
+                                int16_t v = (iy < 0 || iy >= H || ix < 0 || ix >= W)
+                                          ? 0 : img[(iy * W + ix) * C + c];
+                                *dst++ = v < 0 ? 0 : v;
+                            }
+                        }
+            dav2_qgemm_cpu(cols, chk_w, chk_sw, N, K, M);
+            for (int i = 0; i < M * N; i++) chk_hw[i] = 0x55555555;
+            accel_conv_relu = 1;
+            int gbad = dav2_accel_conv(img, H, W, C, KS, 1, 1, chk_w, M, chk_hw, 0) ? 0 : -1;
+            accel_conv_relu = 0;
+            for (int i = 0; gbad >= 0 && i < M * N; i++)
+                if (chk_hw[i] != chk_sw[i]) gbad++;
+            if (gbad) {
+                printf("GEMM accelerator: GATHER-RELU SELF-TEST FAILED (%d), ReLU on the CPU\n", gbad);
+                accel_grelu_ok = 0;
+            } else {
+                printf("GEMM accelerator: gather-ReLU self-test ok\n");
             }
         }
     }
@@ -1519,8 +1562,9 @@ int  dav2_accel_qgemm_onchip_async(const dav2_tensor_t *a, const dav2_qw_t *wt,
                                    dav2_accel_stats_t *st)
 { (void)a; (void)wt; st->v = 0; st->tiles = 0; return 0; }
 int  dav2_accel_conv_onchip_async(const int16_t *img, int h, int w, int C, int k, int stride,
-                                  int pad, const int8_t *wt, int M, dav2_accel_stats_t *st)
-{ (void)img;(void)h;(void)w;(void)C;(void)k;(void)stride;(void)pad;(void)wt;(void)M;
+                                  int pad, const int8_t *wt, int M, dav2_accel_stats_t *st,
+                                  int in_relu)
+{ (void)img;(void)h;(void)w;(void)C;(void)k;(void)stride;(void)pad;(void)wt;(void)M;(void)in_relu;
   st->v = 0; st->tiles = 0; return 0; }
 
 int dav2_accel_qgemm(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc,
@@ -1566,10 +1610,12 @@ int dav2_accel_qgemm_async(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t 
 
 int dav2_accel_conv_async(const int16_t *img, int h, int w, int C, int k, int stride,
                           int pad, const int8_t *wt, int M, int32_t *acc,
-                          dav2_accel_stats_t *st)
+                          dav2_accel_stats_t *st, int in_relu)
 {
+    if (in_relu) { if (st) { st->v = 0; st->tiles = 0; } return 0; }
     return dav2_accel_conv(img, h, w, C, k, stride, pad, wt, M, acc, st);
 }
+int dav2_accel_grelu_ok(void) { return 0; }
 
 int dav2_accel_gemm_raw_async(const int16_t *a, uint32_t a_stride,
                               const int8_t *w, uint32_t w_stride,

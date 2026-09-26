@@ -154,7 +154,7 @@ module student_gemm #(
   logic [31:0] cycles_q;        // cycle counter, running while busy_q, for CYCLES
 
   assign hw2reg.status.d = {err_q, done_q, busy_q};        // STATUS register readback
-  assign hw2reg.caps.d   = {8'd127, 16'(KMAX), 8'(NROWS)};   // CAPS: what this instance supports
+  assign hw2reg.caps.d   = {8'd255, 16'(KMAX), 8'(NROWS)};   // CAPS: what this instance supports
   assign hw2reg.cycles.d = cycles_q;                       // CYCLES register readback
 
   logic start_strobe, start_requant, start_gather;
@@ -166,7 +166,9 @@ module student_gemm #(
   assign start_requant = reg2hw.ctrl.requant.q;   // sampled with start
   assign start_gather  = reg2hw.ctrl.gather.q;
   logic start_greuse;
-  assign start_greuse  = reg2hw.ctrl.greuse.q;    // gather: reuse the left taps    // GEMM job: A tile via the gather walkers
+  assign start_greuse  = reg2hw.ctrl.greuse.q;    // gather: reuse the left taps
+  logic start_grelu;
+  assign start_grelu   = reg2hw.ctrl.grelu.q;     // gather: ReLU on the image    // GEMM job: A tile via the gather walkers
   logic start_add, start_relu;
   assign start_add     = reg2hw.ctrl.add.q;       // requant job: add a residual
   assign start_relu    = reg2hw.ctrl.relu.q;      // requant job: clamp the output at 0
@@ -224,6 +226,7 @@ module student_gemm #(
   logic [7:0]     g_kpos_q;
   logic [15:0]    g_cwords;                  // beats per kernel position
   logic           greuse_q;                  // CTRL.greuse, sampled at start
+  logic           grelu_q;                   // CTRL.grelu, sampled at start
   logic           g_reuse_ok;                // tap reuse applies to this job
   logic           gw_inb;                    // writer: current position in bounds
   logic           gi_handover;               // issuer: a run is ready for the read engine
@@ -502,7 +505,10 @@ module student_gemm #(
   logic [31:0] gf_data;
   assign gw_bus   = gw_inb & ~gw_reuse;
   assign ld_valid = gather_q ? (gw_bus ? gf_valid : 1'b1) : rd_valid;
-  assign ld_data  = gather_q ? (gw_bus ? gf_data : 32'd0) : rd_data;
+  logic [31:0] gf_relu;   // the bus word, rectified with CTRL.grelu
+  assign gf_relu  = {(grelu_q & gf_data[31]) ? 16'd0 : gf_data[31:16],
+                     (grelu_q & gf_data[15]) ? 16'd0 : gf_data[15:0]};
+  assign ld_data  = gather_q ? (gw_bus ? gf_relu : 32'd0) : rd_data;
 
   // Gather read FIFO: the reorder buffer drains into it whenever it has
   // room, so reads for new taps continue while the writer copies.
@@ -796,6 +802,7 @@ module student_gemm #(
       osums_q  <= 1'b0;
       onchip_q <= 1'b0;
       greuse_q <= 1'b0;
+      grelu_q  <= 1'b0;
       // rq_m_q, rq_p_cnt_q and lut_cnt_q have no reset: they address block
       // RAMs (an asynchronous reset there is DRC REQP-1840), and every job
       // sets them before use.
@@ -915,6 +922,7 @@ module student_gemm #(
             osums_q    <= start_osums & start_ostats & start_requant;
             onchip_q   <= start_onchip;
             greuse_q   <= start_greuse & start_gather & ~start_requant;
+            grelu_q    <= start_grelu & start_gather & ~start_requant;
             p_addr_q   <= reg2hw.p_addr.q;
             lut_cnt_q  <= '0;
             x_addr_q   <= reg2hw.x_addr.q;

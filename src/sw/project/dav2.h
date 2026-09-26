@@ -176,6 +176,13 @@ dav2_tensor_t dav2_conv2d_ex(const dav2_tensor_t *in, int h, int w,
                              const dav2_qw_t *wt, int k, int stride, int pad,
                              const dav2_tensor_t *res, int relu,
                              int *oh_out, int *ow_out);
+/* dav2_conv2d_ex into out, whose data (oh*ow x m int16) the caller has
+ * allocated: no copy of the result. in_relu: the convolution reads relu(in)
+ * (on the accelerator while it gathers, CTRL.grelu). */
+void dav2_conv2d_into(const dav2_tensor_t *in, int h, int w,
+                      const dav2_qw_t *wt, int k, int stride, int pad,
+                      const dav2_tensor_t *res, int relu, int in_relu,
+                      dav2_tensor_t *out);
 
 /* Non-overlapping transposed convolution (kernel == stride). */
 dav2_tensor_t dav2_conv_transpose(const dav2_tensor_t *in, int h, int w,

@@ -130,6 +130,11 @@
           desc: "Requantisation job with CTRL.ostats: 1 - write four words per output row n to S_ADDR + n*16: {max, min} as with ostats, the sum of the row's final values (int32), and the sum of their squares, bits 31:0 then bits 39:32. Present when CAPS bit 30 is set."
         }
         {
+          bits: 13
+          name: "grelu"
+          desc: "Gather GEMM job: 1 - the job reads relu(image): every int16 value read from G_ADDR that is negative enters the tile as 0. Present when CAPS bit 31 is set."
+        }
+        {
           bits: 2
           name: "gather"
           desc: "GEMM job only: 1 - the A tile is gathered from an NHWC int16 image as im2col would lay it out (G_ADDR, G_GEOM, G_CHAN, G_CONV, G_START), instead of read from A_ADDR. K_LEN must equal kpos_count * C. C must be even."
@@ -241,7 +246,7 @@
     }
     {
       name: caps
-      desc: "Hardware capabilities: bits [7:0] = NROWS, bits [23:8] = KMAX, bit 24 = the requantisation lookup table (CTRL.lut) exists, bit 25 = the int16 requantisation input (CTRL.a16) exists, bit 26 = int16 GEMM weights (CTRL.w16) exist, bit 27 = requantisation output row statistics (CTRL.ostats) exist, bit 28 = the result RAM (CTRL.onchip) exists, bit 29 = tap reuse in gather jobs (CTRL.greuse) exists, bit 30 = output row sums (CTRL.osums) exist. Reads 0 when no accelerator is present."
+      desc: "Hardware capabilities: bits [7:0] = NROWS, bits [23:8] = KMAX, bit 24 = the requantisation lookup table (CTRL.lut) exists, bit 25 = the int16 requantisation input (CTRL.a16) exists, bit 26 = int16 GEMM weights (CTRL.w16) exist, bit 27 = requantisation output row statistics (CTRL.ostats) exist, bit 28 = the result RAM (CTRL.onchip) exists, bit 29 = tap reuse in gather jobs (CTRL.greuse) exists, bit 30 = output row sums (CTRL.osums) exist, bit 31 = ReLU on the gathered image (CTRL.grelu) exists. Reads 0 when no accelerator is present."
       swaccess: ro
       hwaccess: hwo
       hwext: "true"

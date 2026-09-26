@@ -5,6 +5,7 @@
 # FRAME_FLAGS="-DMACW=1 -DPIPE=2" models the block before round fifteen.
 # FRAME_FLAGS=-DONCHIP_C=0 models it without the result RAM (before round sixteen).
 # FRAME_FLAGS="-DREUSE_C=0 -DONCHIP_CONV=0" models round sixteen.
+# FRAME_FLAGS=-DGRELU_C=0 models the block without the gather ReLU (round eighteen).
 HERE=$(cd "$(dirname "$0")" && pwd)
 SRC=${1:-$HERE/../..}
 GCC=$(command -v riscv-none-elf-gcc || ls ~/Public/xpack-riscv-none-elf-gcc-*/bin/riscv-none-elf-gcc | tail -1)

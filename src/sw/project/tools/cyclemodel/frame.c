@@ -113,8 +113,13 @@ static uint64_t gemm_core(int N, int K, int M, int w16, int onchip, int rk, int 
     }
     for (int n0 = 0; n0 < N; n0 += 128) {
         int nt = N - n0 < 128 ? N - n0 : 128;
-        for (int t = 0; t < nt; t++)
-            c += (rk > 1 && t > 0 && (n0 + t) % ow != 0) ? reused : full;
+        /* tile rows without a left neighbour in the tile: the first, and
+         * each one that starts an output row (a multiple of ow). Counted
+         * without a loop: the model's own instructions count as CPU time. */
+        uint64_t fresh = (uint64_t)nt;
+        if (rk > 1)
+            fresh = 1u + (uint64_t)((n0 + nt - 1) / ow - n0 / ow);
+        c += fresh * full + ((uint64_t)nt - fresh) * reused;
         c += (uint64_t)M * (row + (onchip ? (uint64_t)nt / 4 + 2 : (uint64_t)(nt + 2) * BEAT / 10));
     }
     return c;
@@ -138,9 +143,14 @@ int dav2_accel_qgemm_async(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t 
                            dav2_accel_stats_t *st)
 { (void)acc; job_kind = K_GEMM_ENC; start_job(gemm_cycles(a->n, a->c, wt->m, 0));
   st->v = stats_buf; st->tiles = 1; return 2; }
+#ifndef GRELU_C
+#define GRELU_C 1                       /* ReLU while gathering, CTRL.grelu (round 19) */
+#endif
+int dav2_accel_grelu_ok(void) { return GRELU_C; }
 int dav2_accel_conv_async(const int16_t *img, int h, int w, int C, int k, int stride,
-                          int pad, const int8_t *wt, int M, int32_t *acc, dav2_accel_stats_t *st)
-{ (void)img;(void)wt;(void)acc;
+                          int pad, const int8_t *wt, int M, int32_t *acc, dav2_accel_stats_t *st,
+                          int in_relu)
+{ (void)img;(void)wt;(void)acc;(void)in_relu;
   int oh = (h + 2 * pad - k) / stride + 1, ow = (w + 2 * pad - k) / stride + 1;
   int single = k * k * C <= 2048;
   onchip_last = 0;
@@ -148,8 +158,9 @@ int dav2_accel_conv_async(const int16_t *img, int h, int w, int C, int k, int st
   start_job(gemm_core(oh * ow, k * k * C, M, 0, 0, (REUSE_C && stride == 1 && single) ? k : 0, ow));
   st->v = stats_buf; st->tiles = 1; return 2; }
 int dav2_accel_conv_onchip_async(const int16_t *img, int h, int w, int C, int k, int stride,
-                                 int pad, const int8_t *wt, int M, dav2_accel_stats_t *st)
-{ (void)img;(void)wt;
+                                 int pad, const int8_t *wt, int M, dav2_accel_stats_t *st,
+                                 int in_relu)
+{ (void)img;(void)wt;(void)in_relu;
   int oh = (h + 2 * pad - k) / stride + 1, ow = (w + 2 * pad - k) / stride + 1;
   int single = k * k * C <= 2048;
   if (!ONCHIP_C || !ONCHIP_CONV || !single || (long)oh * ow * M > CR_WORDS) return 0;

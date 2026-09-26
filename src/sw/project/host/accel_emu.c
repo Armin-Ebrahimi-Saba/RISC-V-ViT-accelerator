@@ -28,7 +28,7 @@ static uint32_t regs[NREGS];
 
 /* the latched job */
 static struct {
-    int      busy, requant, gather, add, relu, lut, lut_load, a16, w16, ostats, onchip, osums;
+    int      busy, requant, gather, add, relu, lut, lut_load, a16, w16, ostats, onchip, osums, grelu;
     uint32_t lut_addr;
     uint32_t x_addr, add_mx, add_mh, add_shift;
     uint32_t a_addr, a_stride, w_addr, w_stride, c_addr, c_stride, s_addr, p_addr;
@@ -72,7 +72,8 @@ static int32_t a_elem(uint32_t t, uint32_t kk)
     int32_t ix = (int32_t)(ox * st) + kx - (int32_t)pad;
     if (iy < 0 || iy >= (int32_t)h || ix < 0 || ix >= (int32_t)w)
         return 0;
-    return ((const int16_t *)ptr(job.g_addr))[((uint32_t)iy * w + (uint32_t)ix) * C + c];
+    int32_t v = ((const int16_t *)ptr(job.g_addr))[((uint32_t)iy * w + (uint32_t)ix) * C + c];
+    return (job.grelu && v < 0) ? 0 : v;          /* CTRL.grelu */
 }
 
 static void gemm_row(uint32_t m)
@@ -191,6 +192,8 @@ static void latch(void)
     job.ostats   = ((ctrl >> 9) & 1u) && job.requant;
     job.onchip   = (ctrl >> 10) & 1u;
     job.osums    = ((ctrl >> 12) & 1u) && job.ostats;
+    job.grelu    = ((ctrl >> 13) & 1u) && job.gather;
+    if (((ctrl >> 13) & 1u) && !job.gather) fail("CTRL.grelu without CTRL.gather");
     if (job.a16 && (job.n & 1u)) fail("requant A16: N_ROWS odd");
     if (job.lut_load && (job.lut_addr & 3u)) fail("LUT_ADDR unaligned");
     job.x_addr   = R(X_ADDR);   job.add_mx = R(ADD_MULT_X);
@@ -268,7 +271,7 @@ volatile uint32_t *dav2_emu_reg(uint32_t addr)
     static int init;
     if (!init) {
         init = 1;
-        R(CAPS) = (127u << 24) | ((uint32_t)KMAX << 8) | NROWS;   /* bits 24-30: table, int16 input and weights, row statistics, result RAM, tap reuse, row sums */
+        R(CAPS) = (255u << 24) | ((uint32_t)KMAX << 8) | NROWS;   /* bits 24-31: table, int16 input and weights, row statistics, result RAM, tap reuse, row sums, gather ReLU */
     }
     if (addr < STUDENT_GEMM0_BASE_ADDR || addr >= STUDENT_GEMM0_BASE_ADDR + NREGS * 4u)
         fail("register access outside the block");

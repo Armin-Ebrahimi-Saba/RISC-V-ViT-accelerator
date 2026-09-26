@@ -98,9 +98,11 @@ int dav2_accel_check(void);
  * pending job first, so at most one is ever outstanding. */
 int dav2_accel_qgemm_async(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc,
                            dav2_accel_stats_t *st);
+/* in_relu: the block applies ReLU to the image while it gathers it
+ * (CTRL.grelu); 0 (declined) when it cannot. */
 int dav2_accel_conv_async(const int16_t *img, int h, int w, int C, int k, int stride,
                           int pad, const int8_t *wt, int M, int32_t *acc,
-                          dav2_accel_stats_t *st);
+                          dav2_accel_stats_t *st, int in_relu);
 int dav2_accel_gemm_raw_async(const int16_t *a, uint32_t a_stride,
                               const int8_t *w, uint32_t w_stride,
                               int32_t *acc, int N, int K, int M);
@@ -146,7 +148,10 @@ int dav2_accel_qgemm_onchip_async(const dav2_tensor_t *a, const dav2_qw_t *wt,
  * job and N*M <= DAV2_ACCEL_CR_WORDS; the statistics come back in st.
  * 0 when not possible. */
 int dav2_accel_conv_onchip_async(const int16_t *img, int h, int w, int C, int k, int stride,
-                                 int pad, const int8_t *wt, int M, dav2_accel_stats_t *st);
+                                 int pad, const int8_t *wt, int M, dav2_accel_stats_t *st,
+                                 int in_relu);
+/* Non-zero if gather jobs can apply ReLU to the image (CAPS bit 31). */
+int dav2_accel_grelu_ok(void);
 /* Non-zero if the block writes output row statistics (CAPS bit 27). */
 int dav2_accel_ostats_ok(void);
 int dav2_accel_osums_ok(void);

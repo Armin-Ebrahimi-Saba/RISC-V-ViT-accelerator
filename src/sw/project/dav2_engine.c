@@ -761,15 +761,11 @@ static dav2_tensor_t res_conv_unit(const dav2_tensor_t *x, int h, int w,
     dav2_tensor_t out = dav2_tensor_new(h * w, DAV2_FEATURES);
     size_t mark = dav2_arena_mark();
 
-    dav2_tensor_t t = dav2_tensor_new(h * w, x->c);
-    dav2_copy_relu(&t, x);
-
-    /* relu(conv1) and x + conv2 each fused into the conv's requantisation */
-    dav2_tensor_t a = dav2_conv2d_ex(&t, h, w, &c1, 3, 1, 1, 0, 1, 0, 0);
-    dav2_tensor_t b = dav2_conv2d_ex(&a, h, w, &c2, 3, 1, 1, x, 0, 0, 0);
-    dav2_copy16(out.v, b.v, (size_t)h * w * DAV2_FEATURES);
-    out.scale = b.scale;
-    out.amax_q = b.amax_q;
+    /* relu(x) read by the first conv's gather, relu(conv1) and x + conv2
+     * fused into the convs' requantisation, conv2 written straight into out */
+    dav2_tensor_t a = dav2_tensor_new(h * w, c1.m);
+    dav2_conv2d_into(x, h, w, &c1, 3, 1, 1, 0, 1, 1, &a);
+    dav2_conv2d_into(&a, h, w, &c2, 3, 1, 1, x, 0, 0, &out);
 
     dav2_arena_release(mark);
     return out;
@@ -803,10 +799,7 @@ static dav2_tensor_t fusion(int idx, const dav2_tensor_t *a,
 
     dav2_qw_t oc;
     sprintf(nm, "%sout", prefix); dav2_qw(&oc, nm, DAV2_FEATURES);
-    dav2_tensor_t o = dav2_conv2d(&up, oh, ow, &oc, 1, 1, 0, 0, 0);
-    dav2_copy16(out.v, o.v, (size_t)oh * ow * DAV2_FEATURES);
-    out.scale = o.scale;
-    out.amax_q = o.amax_q;
+    dav2_conv2d_into(&up, oh, ow, &oc, 1, 1, 0, 0, 0, 0, &out);
 
     dav2_arena_release(mark);
     return out;

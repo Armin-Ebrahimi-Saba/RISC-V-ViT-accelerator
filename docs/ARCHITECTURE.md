@@ -229,8 +229,13 @@ With **`CTRL.osums`** the statistics phase also writes each output row's
 sum and sum of squares. The residual updates ask for them, so LayerNorm
 gets its mean and variance without reading x.
 
-`CAPS` bits 24 to 30 announce the lookup table, the int16 input, the int16
-weights, the row statistics, the result RAM, tap reuse and the row sums. The
+With **`CTRL.grelu`** a gather job reads relu(image): negative values
+enter the tile as 0. The DPT head's residual conv units use it instead of
+a ReLU copy of their input.
+
+`CAPS` bits 24 to 31 announce the lookup table, the int16 input, the int16
+weights, the row statistics, the result RAM, tap reuse, the row sums and
+the gather ReLU. The
 driver uses them only when the bit is set and its boot self-test passes;
 otherwise the same arithmetic runs on the CPU.
 
