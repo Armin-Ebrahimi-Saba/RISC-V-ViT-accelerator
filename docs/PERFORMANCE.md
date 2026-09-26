@@ -1,4 +1,4 @@
-# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 1.46 s (estimated)
+# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 1.44 s (estimated)
 
 This is the record of the speed-up work: what was measured, what each change
 did, and what is left. Every step kept the FPGA output **bit-exact with the
@@ -1289,6 +1289,31 @@ reference (1 − r).
 Model: accelerator busy in the attention 6.6 → 3.2 Mcycles; the attention
 is now limited by the CPU (softmax sums and normalisation 6.1 Mcycles,
 v^T 2.2), so the frame gains less: 76.7 → 76.1 Mcycles, **about 1.46 s**.
+
+### Round twenty-nine — v^T by a transposition job (software; estimated, not yet measured)
+
+The context GEMM needs v^T of each head (64 rows of the tokens). The CPU
+made it from qkv, 2.2 Mcycles per frame, while the attention was waiting
+for the CPU. The int16-input requantisation job already transposes: it
+reads in[m][n] and writes out[n][m]. With identity parameters (mult
+2^30, shift 30, bias 0: round(v · 2^30 / 2^30) = v, and |v| ≤ 8191 is not
+saturated) it is a transposition. A new driver pitch, `accel_in_pitch`,
+lets the job read rows of qkv (A_STRIDE = qkv row in bytes), so the job
+reads head h's 64 v columns of each token and writes v^T rows Kp apart
+(`dav2_accel_transpose16_async`). No hardware change. The padding columns
+n..Kp−1 are zeroed once per attention call. The job is collected before
+the next one starts; a failure leaves v^T to the CPU. A boot self-test
+("transposition self-test ok") checks 12 rows of 16 int16 with a pitch of
+40 into rows 14 apart.
+
+Checks: same output, bit for bit (11 images, emulator; also with emulators
+of a block without int16 input and without the result RAM). Bus errors
+injected into each of the first 240 jobs, with AddressSanitizer and UBSan:
+no errors, every output within 1.3·10⁻⁴ of the reference (1 − r).
+
+Model: v^T on the CPU 2.2 → 0 Mcycles (1.0 now waits for the job), block
++0.8 (transpose), block idle before attention GEMMs 5.1 → 2.6; frame
+76.1 → 75.0 Mcycles, **about 1.44 s**. About 2021 jobs per frame.
 
 ## 7. What is left, in order of expected gain
 

@@ -219,7 +219,9 @@ tokens); this removes two of the two and a half bus words per output.
 Single-chunk convolutions with N·M ≤ 131,072 use it as well. In the
 attention, the score matrix S of a head (at word 0) and its context C (at
 word 16384) stay there too: the exponential job and the context
-requantisation read them from there.
+requantisation read them from there. An int16-input requantisation with
+identity parameters and a row pitch (A_STRIDE) is a transposition; the
+attention makes each head's v^T this way.
 
 **Tap reuse** (**`CTRL.greuse`**) shortens a gather's A load. With stride 1
 and all k·k kernel positions in one job, a pixel's taps kx = 0..k−2 are

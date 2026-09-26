@@ -200,6 +200,12 @@ int dav2_accel_requant_lut_cr_async(uint32_t cr_base, int N, int M, const int32_
                                     int lut_load);
 int dav2_accel_requant_stride_cr_async(uint32_t cr_base, int N, int M, const int32_t *params,
                                        int16_t *out, int out_stride);
+/* out[n][m] = in[m][n] for int16 activations (|v| <= 8191): an int16-input
+ * requantisation with identity parameters. M rows of N int16, in_pitch
+ * bytes apart; output rows out_stride int16 apart. N, M even, M <= 256.
+ * Left running (dav2_accel_finish); 0 when declined. */
+int dav2_accel_transpose16_async(const int16_t *in, uint32_t in_pitch, int N, int M,
+                                 int16_t *out, int out_stride);
 int dav2_accel_lerp_async(const int16_t *t, uint32_t row_stride, int16_t *out, int n, int w);
 /* dav2_accel_requant with output rows out_stride int16 apart (instead of
  * M): writes into a slice of a wider tensor. */

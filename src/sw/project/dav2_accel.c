@@ -137,7 +137,9 @@ static uint32_t accel_gemm_wsh;        /* CTRL.wsh for the next int16-weight GEM
 static uint32_t accel_cr_base;         /* result RAM: word offset of the next job's data */
 static int      accel_rq_onchip;       /* the next requantisation reads the result RAM */
 static int      accel_attcr_ok = 1;    /* its int16-weight use, cleared by its self-test */
+static int      accel_tp_ok = 1;       /* the transposition job, cleared by its self-test */
 static int      accel_out_stride;      /* requant output row length in int16, 0 = M */
+static uint32_t accel_in_pitch;        /* requant input row pitch in bytes, 0 = N elements */
 static int      accel_ok;
 static unsigned accel_nrows;
 static unsigned accel_kmax;
@@ -499,7 +501,8 @@ static int accel_requant_rows(const void *acc, int N, int M, int m0, int mc,
     if (onchip)
         ctrl |= CTRL_ONCHIP;
     const size_t orow = accel_out_stride ? (size_t)accel_out_stride : (size_t)M;
-    REG32(GEMM_A_STRIDE) = onchip ? (uint32_t)N : (uint32_t)N * esz;
+    const size_t ipitch = accel_in_pitch ? (size_t)accel_in_pitch : (size_t)N * esz;
+    REG32(GEMM_A_STRIDE) = onchip ? (uint32_t)N : (uint32_t)ipitch;
     REG32(GEMM_C_STRIDE) = (uint32_t)orow * 2u;
     REG32(GEMM_S_ADDR)   = 0u;
     REG32(GEMM_P_ADDR)   = (uint32_t)(uintptr_t)(params + (size_t)m0 * 3);
@@ -512,7 +515,8 @@ static int accel_requant_rows(const void *acc, int N, int M, int m0, int mc,
                             + (lut_load ? ((epi && epi->lut_int) ? 256u : 8192u) : 0u);
         REG32(GEMM_A_ADDR) = onchip ? accel_cr_base + (uint32_t)((size_t)m0 * N + n0)
                                     : (uint32_t)(uintptr_t)((const uint8_t *)acc
-                                                            + ((size_t)m0 * N + n0) * esz);
+                                                            + (size_t)m0 * ipitch
+                                                            + (size_t)n0 * esz);
         REG32(GEMM_C_ADDR) = (uint32_t)(uintptr_t)(out + (size_t)n0 * orow + m0);
         if (epi && epi->add)
             REG32(GEMM_X_ADDR) = (uint32_t)(uintptr_t)(epi->x + (size_t)n0 * M + m0);
@@ -894,6 +898,37 @@ int dav2_accel_requant_stride_async(const int32_t *acc, int N, int M, const int3
                                epi.onchip ? &epi : 0, 0);
     accel_defer = 0;
     accel_out_stride = 0;
+    return r;
+}
+
+/* out[n][m] = in[m][n] for int16: an int16-input requantisation with
+ * identity parameters (round(v 2^30 / 2^30) + 0, saturated at 14 bits: v
+ * itself for activations). Input rows in_pitch bytes apart, output rows
+ * out_stride int16 apart. Left running; 0 when declined. */
+int dav2_accel_transpose16_async(const int16_t *in, uint32_t in_pitch, int N, int M,
+                                 int16_t *out, int out_stride)
+{
+    enum { TP_MAX = 256 };
+    static int32_t par[3 * TP_MAX] __attribute__((aligned(4)));
+    static int32_t amax_sink;
+    if (!dav2_accel_init() || !accel_a16_ok || !accel_tp_ok || N < 2 || M < 2 || (N & 1)
+        || (M & 1) || M > TP_MAX || M > (int)(accel_kmax / 2u) || (out_stride & 1) || out_stride < M
+        || in_pitch < (uint32_t)N * 2u
+        || ((((uintptr_t)in) | ((uintptr_t)out) | in_pitch) & 3u))
+        return 0;
+    if (par[0] == 0)
+        for (int m = 0; m < TP_MAX; m++) {
+            par[3 * m] = 1 << 30;
+            par[3 * m + 1] = 30;
+            par[3 * m + 2] = 0;
+        }
+    accel_in_pitch = in_pitch;
+    accel_out_stride = out_stride;
+    accel_defer = 1;
+    int r = accel_requant_rows(in, N, M, 0, M, par, out, &amax_sink, 0, 1);
+    accel_defer = 0;
+    accel_out_stride = 0;
+    accel_in_pitch = 0;
     return r;
 }
 
@@ -1486,6 +1521,37 @@ static int accel_check_attcr(void)
     return 0;
 }
 
+/* The transposition job: 12 rows of 16 int16, 40 apart, into rows 14
+ * apart; the gaps stay untouched. */
+static int accel_check_tp(void)
+{
+    if (!accel_a16_ok)
+        return 0;
+    enum { N = 16, M = 12, IP = 40, OS = 14 };
+    int16_t *in  = chk_a;              /* M x IP */
+    int16_t *out = chk_a + M * IP;     /* N x OS */
+    uint32_t seed = 0x61c88647u;
+    for (int i = 0; i < M * IP; i++)
+        in[i] = (int16_t)((int32_t)(chk_rand(&seed) % 16383u) - 8191);
+    for (int i = 0; i < N * OS; i++)
+        out[i] = 0x5a5a;
+    int ok = dav2_accel_transpose16_async(in, IP * 2u, N, M, out, OS) && dav2_accel_finish();
+    int bad = 0;
+    for (int n = 0; ok && n < N; n++)
+        for (int m = 0; m < OS; m++)
+            if (out[n * OS + m] != (m < M ? in[m * IP + n] : 0x5a5a)) bad++;
+    if (!ok) {
+        printf("GEMM accelerator: transposition self-test could not run\n");
+        accel_tp_ok = 0;
+    } else if (bad) {
+        printf("GEMM accelerator: TRANSPOSITION SELF-TEST FAILED (%d), on the CPU\n", bad);
+        accel_tp_ok = 0;
+    } else {
+        printf("GEMM accelerator: transposition self-test ok\n");
+    }
+    return 0;
+}
+
 /* The result RAM (CTRL.onchip): a 20 x 64 x 8 GEMM left on chip, then its
  * requantisation read from there, against the CPU. */
 static int accel_check_onchip(void)
@@ -1877,6 +1943,8 @@ int dav2_accel_check(void)
         bad = accel_check_lerp();
     if (!bad)
         bad = accel_check_onchip();
+    if (!bad)
+        bad = accel_check_tp();
     return bad;
 }
 
@@ -1968,6 +2036,9 @@ int dav2_accel_conv_async(const int16_t *img, int h, int w, int C, int k, int st
 }
 int dav2_accel_grelu_ok(void) { return 0; }
 int dav2_accel_wsh_ok(void) { return 0; }
+int dav2_accel_transpose16_async(const int16_t *in, uint32_t in_pitch, int N, int M,
+                                 int16_t *out, int out_stride)
+{ (void)in;(void)in_pitch;(void)N;(void)M;(void)out;(void)out_stride; return 0; }
 int dav2_accel_gemm16_cr_async(const int16_t *a, uint32_t a_stride, const int16_t *w,
                                uint32_t w_stride, int wsh, uint32_t cr_base,
                                int N, int K, int M, int32_t *stats)

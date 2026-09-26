@@ -619,6 +619,22 @@ static void attn_prep_vt16(const dav2_tensor_t *qkv, int head, int n, attn_bufs_
     }
 }
 
+/* v^T of a head into b->vt16 by a transposition job (the padding columns
+ * n..Kp-1 are zero from the start and the job does not write them), or on
+ * the CPU. The job is collected here: a failure then leaves the work to
+ * the CPU. */
+static void attn_vt16(const dav2_tensor_t *qkv, int head, int n, attn_bufs_t *b)
+{
+    const int HD = DAV2_HEAD_DIM, ED = DAV2_EMBED_DIM;
+    const int Kp = (n + 3) & ~3;
+    gemm_i32_finish();
+    if (dav2_accel_transpose16_async(qkv->v + 2 * ED + head * HD, (uint32_t)qkv->c * 2u,
+                                     HD, n, b->vt16, Kp)
+        && dav2_accel_finish())
+        return;
+    attn_prep_vt16(qkv, head, n, b);
+}
+
 /* acc[m][n] = sum_k a[n][k] w[m][k] with int16 weights, strides in
  * elements, and optionally each row's {max, min}: on the block (left
  * running, see gemm_i32_start) or computed here. */
@@ -769,12 +785,18 @@ static void attention_all16(const dav2_tensor_t *qkv, int n, dav2_tensor_t *ctx)
     /* C of head h in DDR3 (b.c) from P (b.p16) and v^T, computed again */
 #define C_DDR(vt) do { gemm16_start(b.p16, Kp, (vt), Kp, b.c, n, Kp, HD, 0, 0);     \
         gemm16_finish(b.p16, Kp, (vt), Kp, b.c, n, Kp, HD, 0, 0); } while (0)
-    /* head 0: scores, v^T while they run, the exponential job */
+    /* the v^T padding columns n..Kp-1 stay zero (attn_vt16's job does not
+     * write them) */
+    for (int k = 0; k < 2; k++)
+        for (int d = 0; d < HD; d++)
+            for (int m = n; m < Kp; m++)
+                vt2[k][(size_t)d * Kp + m] = 0;
+    /* head 0: v^T, the scores, the exponential job */
+    b.vt16 = vt2[0];
+    attn_vt16(qkv, 0, n, &b);
+    LAP(DAV2_SUB_ATT_PREP_V);
     S_START(0);
     LAP(DAV2_SUB_ATT_PREP_QK);
-    b.vt16 = vt2[0];
-    attn_prep_vt16(qkv, 0, n, &b);
-    LAP(DAV2_SUB_ATT_PREP_V);
     S_FINISH(0);
     b.s = s2[0]; b.sst = st2[0]; b.pt = pt2[0];
     int exp_ok = attn_softmax_accel_start(qkv, n, &b, !lut_loaded, s_cr);
@@ -788,7 +810,8 @@ static void attention_all16(const dav2_tensor_t *qkv, int n, dav2_tensor_t *ctx)
 #define HEAD_BUFS(h) do { b.s = s2[(h) & 1]; b.sst = st2[(h) & 1]; b.pt = pt2[(h) & 1]; } while (0)
     /* Per head h, with head h's sums made and head h+1 prepared in turn:
      *   CPU                           block
-     *   v^T of head h+1               context requantisation of head h-1
+     *   --                            context requantisation of head h-1
+     *   --                            v^T of head h+1 (a transposition)
      *   first half of head h's P      scores of head h+1
      *   second half of head h's P     exponential job of head h+1
      *   head h+1's sums               context GEMM of head h
@@ -798,24 +821,21 @@ static void attention_all16(const dav2_tensor_t *qkv, int n, dav2_tensor_t *ctx)
     const int half = (n / 2) & ~1;
     for (int h = 0; h < DAV2_N_HEADS; h++) {
         const int nx = h + 1 < DAV2_N_HEADS;
-        if (nx) {
-            b.vt16 = vt2[(h + 1) & 1];
-            attn_prep_vt16(qkv, h + 1, n, &b);
-        }
-        LAP(DAV2_SUB_ATT_PREP_V);
         if (ctx_pending && !dav2_accel_finish()) {
             if (c_cr) {
-                /* C of head h-1 was on chip; its v^T slot may already hold
-                 * head h+1's, so it is made again (and head h+1's after) */
+                /* C of head h-1 was on chip: made again from P and v^T */
                 b.vt16 = vt2[(h - 1) & 1];
-                attn_prep_vt16(qkv, h - 1, n, &b);
                 C_DDR(b.vt16);
-                if (nx) attn_prep_vt16(qkv, h + 1, n, &b);
             }
             attn_context16_cpu(h - 1, n, &b, ctx);   /* b.c is head h-1's */
         }
         ctx_pending = 0;
         LAP(DAV2_SUB_ATT_NORM);
+        if (nx) {
+            b.vt16 = vt2[(h + 1) & 1];
+            attn_vt16(qkv, h + 1, n, &b);
+        }
+        LAP(DAV2_SUB_ATT_PREP_V);
         if (nx) S_START(h + 1);
         HEAD_BUFS(h);
         if (exp_ok)

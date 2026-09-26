@@ -124,6 +124,9 @@ int dav2_accel_requant_lut_cr_async(uint32_t cr_base, int N, int M, const int32_
 int dav2_accel_requant_stride_cr_async(uint32_t cr_base, int N, int M, const int32_t *params,
                                        int16_t *out, int out_stride)
 { (void)cr_base;(void)N;(void)M;(void)params;(void)out;(void)out_stride; return 0; }
+int dav2_accel_transpose16_async(const int16_t *in, uint32_t in_pitch, int N, int M,
+                                 int16_t *out, int out_stride)
+{ (void)in;(void)in_pitch;(void)N;(void)M;(void)out;(void)out_stride; return 0; }
 int dav2_accel_busy(void) { return 0; }
 
 static uint32_t rs = 12345;
