@@ -164,6 +164,38 @@ void dav2_gelu(dav2_tensor_t *t);
 void dav2_interpolate(const dav2_tensor_t *in, int h, int w,
                       int oh, int ow, dav2_tensor_t *out);
 
+/* A producer of the input of the next GEMM or convolution (the DPT head's
+ * interpolations): made row by row while the accelerator already works on
+ * the first tiles. The driver calls dav2_producer_need before a tile that
+ * reads input pixels up to npix, and dav2_producer_idle while it waits for
+ * a job; qgemm_impl completes it before anything else reads the input. */
+typedef struct dav2_producer {
+    int (*step)(struct dav2_producer *p);   /* make the next part; 0 when all is made */
+    int done_pix;                           /* input pixels (tensor rows) made so far */
+    int total_pix;
+} dav2_producer_t;
+void dav2_producer_set(dav2_producer_t *p);     /* NULL: none */
+void dav2_producer_need(int npix);
+int  dav2_producer_idle(void);                  /* one step, if any is left: 1 */
+void dav2_producer_complete(void);
+extern uint64_t dav2_producer_cycles;           /* CPU cycles spent in steps */
+
+/* dav2_interpolate as a producer: begin (index arrays and row buffers in
+ * the arena; out's n, c and scale are set at once), then its steps. */
+typedef struct {
+    dav2_producer_t base;
+    const dav2_tensor_t *in;
+    dav2_tensor_t *out;
+    int h, w, oh, ow, C, wide;
+    int *y0a, *y1a, *wya, *x0a, *x1a, *wxa;
+    int16_t *hbuf[2];
+    int hrow[2];
+    size_t rowlen;
+    int i;                                      /* next output row */
+} dav2_interp_t;
+int dav2_interp_begin(dav2_interp_t *s, const dav2_tensor_t *in, int h, int w,
+                      int oh, int ow, dav2_tensor_t *out);
+
 /* im2col for an NHWC feature map; produces (oh*ow) rows of (kh*kw*c). */
 void dav2_im2col(const dav2_tensor_t *in, int h, int w,
                  int kh, int kw, int stride, int pad, dav2_tensor_t *cols);

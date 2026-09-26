@@ -52,7 +52,7 @@ static void fail(const char *what)
 }
 
 /* A-tile element (row t, column k) of the current GEMM job. */
-static int32_t a_elem(uint32_t t, uint32_t kk)
+static int32_t a_elem_mem(uint32_t t, uint32_t kk)
 {
     if (!job.gather) {
         uint32_t stride = job.a_stride ? job.a_stride : job.k * 2u;
@@ -75,6 +75,18 @@ static int32_t a_elem(uint32_t t, uint32_t kk)
     int32_t v = ((const int16_t *)ptr(job.g_addr))[((uint32_t)iy * w + (uint32_t)ix) * C + c];
     return (job.grelu && v < 0) ? 0 : v;          /* CTRL.grelu */
 }
+
+/* The A tile, read when the job starts, as the block loads it before its
+ * first MAC: a caller that writes A later (a producer that is late) gives
+ * a wrong result here too. */
+static int32_t a_snap[NROWS * KMAX];
+static void a_snapshot(void)
+{
+    for (uint32_t t = 0; t < job.n; t++)
+        for (uint32_t kk = 0; kk < job.k; kk++)
+            a_snap[t * job.k + kk] = a_elem_mem(t, kk);
+}
+static inline int32_t a_elem(uint32_t t, uint32_t kk) { return a_snap[t * job.k + kk]; }
 
 static void gemm_row(uint32_t m)
 {
@@ -225,6 +237,8 @@ static void latch(void)
          | job.s_addr | job.p_addr | job.g_addr) & 3u)
         fail("unaligned address");
     if (job.onchip && job.requant && job.a16) fail("requant: CTRL.onchip with CTRL.a16");
+    if (!job.requant)
+        a_snapshot();
     /* the result RAM's words used by the job must exist */
     if (job.onchip && !job.requant
         && (uint64_t)job.c_addr + (uint64_t)(job.m - 1) * job.c_stride + job.n > 131072u)

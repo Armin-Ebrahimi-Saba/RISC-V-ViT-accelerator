@@ -502,6 +502,40 @@ static inline int32_t sat_i32(int64_t v)
     return v > 2147483647 ? 2147483647 : v < -2147483647 ? -2147483647 : (int32_t)v;
 }
 
+/* ---- producers (dav2.h) */
+static dav2_producer_t *g_producer;
+uint64_t dav2_producer_cycles;
+
+void dav2_producer_set(dav2_producer_t *p) { g_producer = p; }
+
+void dav2_producer_need(int npix)
+{
+    dav2_producer_t *p = g_producer;
+    if (!p)
+        return;
+    if (npix > p->total_pix)
+        npix = p->total_pix;
+    while (p->done_pix < npix && p->step(p))
+        ;
+}
+
+int dav2_producer_idle(void)
+{
+#ifdef DAV2_PRODUCER_NO_IDLE
+    return 0;                     /* test: rows only through dav2_producer_need */
+#endif
+    dav2_producer_t *p = g_producer;
+    return p && p->done_pix < p->total_pix && (p->step(p), 1);
+}
+
+void dav2_producer_complete(void)
+{
+    dav2_producer_t *p = g_producer;
+    if (p)
+        while (p->done_pix < p->total_pix && p->step(p))
+            ;
+}
+
 /* A convolution's geometry, for a GEMM whose A matrix is the im2col of an
  * image rather than a tensor in memory. */
 typedef struct { int h, w, k, stride, pad, in_relu; } conv_desc_t;
@@ -564,7 +598,9 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
      * (CTRL.grelu); otherwise a rectified copy of the input is used */
     dav2_tensor_t a_relu;
     conv_desc_t cv_plain;
+    const uint64_t prod_c0 = dav2_producer_cycles;
     if (cv && cv->in_relu && !dav2_accel_grelu_ok()) {
+        dav2_producer_complete();              /* the copy reads all of a */
         a_relu = dav2_tensor_new(a->n, a->c);
         if (!a_relu.v) { dav2_arena_release(mark); return; }
         dav2_copy_relu(&a_relu, a);
@@ -615,9 +651,11 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
     }
     if (cv && run) {
         /* the block gathers the patches itself: no im2col matrix */
+        dav2_producer_complete();
     } else {
         dav2_tensor_t cols = *a;
         if (cv) {
+            dav2_producer_complete();         /* im2col reads all of a */
             use_onchip = 0;                   /* the im2col GEMM keeps acc in DDR3 */
             const dav2_tensor_t *src = a;
             if (cv->in_relu) {                /* the block declined the gather */
@@ -639,6 +677,9 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
             use_onchip = 0;
             run = dav2_accel_qgemm_async(&cols, wt, acc, &st);
         }
+        /* the accelerator took its tiles' rows as they were made; the
+         * rest (and everything, for the CPU) now */
+        dav2_producer_complete();
         if (!run) {
             dav2_qgemm_cpu(cols.v, wt->w, acc, N, K, M);
             dav2_prof_add(DAV2_PROF_GEMM_CPU, dav2_cycles() - t_start);
@@ -892,9 +933,13 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
             dav2_copy16(out->v, dst, (size_t)N * M);
         if (ok) {
             uint64_t now = dav2_cycles();
+            /* a producer's steps (dav2_producer_t) are in their own bucket */
+            uint64_t own = (now - t_start) - waited - gelu_cycles;
+            const uint64_t prod = dav2_producer_cycles - prod_c0;
+            own = own > prod ? own - prod : 0;
             dav2_prof_add(DAV2_PROF_GEMM_ACCEL, waited);
             dav2_prof_add(DAV2_PROF_GELU, gelu_cycles);
-            dav2_prof_add(DAV2_PROF_REQUANT, (now - t_start) - waited - gelu_cycles);
+            dav2_prof_add(DAV2_PROF_REQUANT, own);
             out->n = N;
             out->c = M;
             out->scale = fin_scale;
@@ -940,7 +985,7 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
     PAR_UPTO(M);
 #undef PAR_UPTO
     dav2_prof_add(DAV2_PROF_GEMM_ACCEL, waited);
-    uint64_t prof_t0 = t_start + waited;
+    uint64_t prof_t0 = t_start + waited + (dav2_producer_cycles - prod_c0);
 
     /* with an epilogue, the plain result goes to a temporary first */
     dav2_tensor_t htmp, *hdst = out;
@@ -1921,19 +1966,114 @@ static void interp_row_h(const int16_t *src, int C, int ow, const int *x0a,
     }
 }
 
-void dav2_interpolate(const dav2_tensor_t *in, int h, int w,
+/* The interpolation as a producer (dav2_producer_t): dav2_interp_begin
+ * sets up the index arrays and row buffers (in the arena, released by the
+ * caller), each step makes the next output row, or two that share their
+ * source rows. Run to the end it is dav2_interpolate. */
+static int interp_step(dav2_producer_t *pr)
+{
+    dav2_interp_t *s = (dav2_interp_t *)pr;
+    if (s->i >= s->oh)
+        return 0;
+    const uint64_t t0 = dav2_cycles();
+    const dav2_tensor_t *in = s->in;
+    dav2_tensor_t *out = s->out;
+    const int w = s->w, oh = s->oh, ow = s->ow, C = s->C, wide = s->wide;
+    const int *y0a = s->y0a, *y1a = s->y1a, *wya = s->wya;
+    const int *x0a = s->x0a, *x1a = s->x1a, *wxa = s->wxa;
+    int16_t **hbuf = s->hbuf;
+    int *hrow = s->hrow;
+    const size_t rowlen = s->rowlen;
+    const int i = s->i;
+    const int need[2] = { y0a[i], y1a[i] };
+    int16_t *hr[2];
+    for (int k = 0; k < 2; k++) {
+        int slot = hrow[0] == need[k] ? 0 : hrow[1] == need[k] ? 1 : -1;
+        if (slot < 0) {
+            /* compute into the slot the other needed row does not use */
+            slot = (k == 1 && hrow[0] == need[0]) ? 1
+                 : (k == 1 && hrow[1] == need[0]) ? 0
+                 : (hrow[0] == need[1 - k]) ? 1 : 0;
+            interp_row_h(in->v + (size_t)need[k] * w * C, C, ow, x0a, x1a, wxa,
+                         hbuf[slot], wide);
+            hrow[slot] = need[k];
+        }
+        hr[k] = hbuf[slot];
+    }
+    const int wy = wya[i];
+    int16_t *orow = out->v + (size_t)i * rowlen;
+    if (wide && wy != 0 && i + 1 < oh && wya[i + 1] != 0
+        && y0a[i + 1] == need[0] && y1a[i + 1] == need[1]) {
+        /* Two output rows between the same source rows (upsampling):
+         * one load and one unpacking of top and bottom for both. With
+         * d = bot - top, (top (256 - wy) + bot wy) >> 8 is
+         * top + ((d wy) >> 8), since 256 top is a multiple of 256. */
+        const uint32_t *tp = (const uint32_t *)hr[0], *bp = (const uint32_t *)hr[1];
+        const uint32_t *const tend = tp + rowlen / 2;
+        uint32_t *o1 = (uint32_t *)orow, *o2 = (uint32_t *)(orow + rowlen);
+        const int32_t w1 = wy, w2 = wya[i + 1];
+        while (tp < tend) {
+            uint32_t t = *tp++, b = *bp++;
+            int32_t tl = lo16(t), th = hi16(t);
+            int32_t dl = lo16(b) - tl, dh = hi16(b) - th;
+            *o1++ = pack16(tl + ((dl * w1) >> 8), th + ((dh * w1) >> 8));
+            *o2++ = pack16(tl + ((dl * w2) >> 8), th + ((dh * w2) >> 8));
+        }
+        s->i++;
+    } else if (wy == 0) {                   /* (top * 256) >> 8 == top */
+        dav2_copy16(orow, hr[0], rowlen);
+    } else if (wide) {
+        const uint32_t *tw = (const uint32_t *)hr[0], *bw = (const uint32_t *)hr[1];
+        uint32_t *ow32 = (uint32_t *)orow;
+        const int32_t wt = 256 - wy;
+        #pragma GCC unroll 4
+        for (size_t e = 0; e < rowlen / 2; e++) {
+            uint32_t t = tw[e], b = bw[e];
+            ow32[e] = pack16((lo16(t) * wt + lo16(b) * wy) >> 8,
+                             (hi16(t) * wt + hi16(b) * wy) >> 8);
+        }
+    } else {
+        for (size_t e = 0; e < rowlen; e++)
+            orow[e] = (int16_t)((hr[0][e] * (256 - wy) + hr[1][e] * wy) >> 8);
+    }
+    s->i++;
+    pr->done_pix = s->i * ow;
+    dav2_prof_add(DAV2_PROF_INTERP, dav2_cycles() - t0);
+    dav2_producer_cycles += dav2_cycles() - t0;
+    return s->i < oh;
+}
+
+int dav2_interp_begin(dav2_interp_t *s, const dav2_tensor_t *in, int h, int w,
                       int oh, int ow, dav2_tensor_t *out)
 {
     const int C = in->c;
-    const size_t mark = dav2_arena_mark();
-    PROF_START();
-    int *y0a = (int *)dav2_arena_alloc((size_t)oh * sizeof(int));
-    int *y1a = (int *)dav2_arena_alloc((size_t)oh * sizeof(int));
-    int *wya = (int *)dav2_arena_alloc((size_t)oh * sizeof(int));
-    int *x0a = (int *)dav2_arena_alloc((size_t)ow * sizeof(int));
-    int *x1a = (int *)dav2_arena_alloc((size_t)ow * sizeof(int));
-    int *wxa = (int *)dav2_arena_alloc((size_t)ow * sizeof(int));
-
+    memset(s, 0, sizeof *s);
+    s->base.step = interp_step;
+    s->base.total_pix = oh * ow;
+    s->in = in; s->out = out;
+    s->h = h; s->w = w; s->oh = oh; s->ow = ow; s->C = C;
+    out->n = oh * ow;
+    out->c = C;
+    out->scale = in->scale;
+    out->amax_q = -1;
+    out->rst = 0;
+    out->rsum = 0;
+    int *y0a = s->y0a = (int *)dav2_arena_alloc((size_t)oh * sizeof(int));
+    int *y1a = s->y1a = (int *)dav2_arena_alloc((size_t)oh * sizeof(int));
+    int *wya = s->wya = (int *)dav2_arena_alloc((size_t)oh * sizeof(int));
+    int *x0a = s->x0a = (int *)dav2_arena_alloc((size_t)ow * sizeof(int));
+    int *x1a = s->x1a = (int *)dav2_arena_alloc((size_t)ow * sizeof(int));
+    int *wxa = s->wxa = (int *)dav2_arena_alloc((size_t)ow * sizeof(int));
+    s->rowlen = (size_t)ow * C;
+    s->hbuf[0] = (int16_t *)dav2_arena_alloc(s->rowlen * sizeof(int16_t));
+    s->hbuf[1] = (int16_t *)dav2_arena_alloc(s->rowlen * sizeof(int16_t));
+    s->hrow[0] = s->hrow[1] = -1;
+    if (!y0a || !y1a || !wya || !x0a || !x1a || !wxa || !s->hbuf[0] || !s->hbuf[1]) {
+        s->i = oh;                              /* nothing to make */
+        s->base.done_pix = s->base.total_pix;
+        return 0;
+    }
+    s->wide = (C & 1) == 0 && ((((uintptr_t)in->v | (uintptr_t)out->v) & 3u) == 0);
     /* align_corners=true, matching F.interpolate. Weights in Q8. The
      * source position of output row i is i*(h-1)/(oh-1): its integer part
      * and its fraction, as an exact ratio of integers, rounded to Q8. */
@@ -1972,71 +2112,17 @@ void dav2_interpolate(const dav2_tensor_t *in, int h, int w,
      * result as computing all four terms per output element; about half
      * the work for the 2x upsamplings of the DPT head. Two channels per
      * 32-bit word where C and the buffers allow it. */
-    const size_t rowlen = (size_t)ow * C;
-    int16_t *hbuf[2];
-    hbuf[0] = (int16_t *)dav2_arena_alloc(rowlen * sizeof(int16_t));
-    hbuf[1] = (int16_t *)dav2_arena_alloc(rowlen * sizeof(int16_t));
-    int hrow[2] = { -1, -1 };
-    if (!hbuf[0] || !hbuf[1]) { dav2_arena_release(mark); return; }
-    const int wide = (C & 1) == 0 && ((((uintptr_t)in->v | (uintptr_t)out->v) & 3u) == 0);
+    return 1;
+}
 
-    for (int i = 0; i < oh; i++) {
-        const int need[2] = { y0a[i], y1a[i] };
-        int16_t *hr[2];
-        for (int k = 0; k < 2; k++) {
-            int slot = hrow[0] == need[k] ? 0 : hrow[1] == need[k] ? 1 : -1;
-            if (slot < 0) {
-                /* compute into the slot the other needed row does not use */
-                slot = (k == 1 && hrow[0] == need[0]) ? 1
-                     : (k == 1 && hrow[1] == need[0]) ? 0
-                     : (hrow[0] == need[1 - k]) ? 1 : 0;
-                interp_row_h(in->v + (size_t)need[k] * w * C, C, ow, x0a, x1a, wxa,
-                             hbuf[slot], wide);
-                hrow[slot] = need[k];
-            }
-            hr[k] = hbuf[slot];
-        }
-        const int wy = wya[i];
-        int16_t *orow = out->v + (size_t)i * rowlen;
-        if (wide && wy != 0 && i + 1 < oh && wya[i + 1] != 0
-            && y0a[i + 1] == need[0] && y1a[i + 1] == need[1]) {
-            /* Two output rows between the same source rows (upsampling):
-             * one load and one unpacking of top and bottom for both. With
-             * d = bot - top, (top (256 - wy) + bot wy) >> 8 is
-             * top + ((d wy) >> 8), since 256 top is a multiple of 256. */
-            const uint32_t *tp = (const uint32_t *)hr[0], *bp = (const uint32_t *)hr[1];
-            const uint32_t *const tend = tp + rowlen / 2;
-            uint32_t *o1 = (uint32_t *)orow, *o2 = (uint32_t *)(orow + rowlen);
-            const int32_t w1 = wy, w2 = wya[i + 1];
-            while (tp < tend) {
-                uint32_t t = *tp++, b = *bp++;
-                int32_t tl = lo16(t), th = hi16(t);
-                int32_t dl = lo16(b) - tl, dh = hi16(b) - th;
-                *o1++ = pack16(tl + ((dl * w1) >> 8), th + ((dh * w1) >> 8));
-                *o2++ = pack16(tl + ((dl * w2) >> 8), th + ((dh * w2) >> 8));
-            }
-            i++;
-        } else if (wy == 0) {                   /* (top * 256) >> 8 == top */
-            dav2_copy16(orow, hr[0], rowlen);
-        } else if (wide) {
-            const uint32_t *tw = (const uint32_t *)hr[0], *bw = (const uint32_t *)hr[1];
-            uint32_t *ow32 = (uint32_t *)orow;
-            const int32_t wt = 256 - wy;
-            #pragma GCC unroll 4
-            for (size_t e = 0; e < rowlen / 2; e++) {
-                uint32_t t = tw[e], b = bw[e];
-                ow32[e] = pack16((lo16(t) * wt + lo16(b) * wy) >> 8,
-                                 (hi16(t) * wt + hi16(b) * wy) >> 8);
-            }
-        } else {
-            for (size_t e = 0; e < rowlen; e++)
-                orow[e] = (int16_t)((hr[0][e] * (256 - wy) + hr[1][e] * wy) >> 8);
-        }
-    }
-    out->n = oh * ow;
-    out->c = C;
-    out->scale = in->scale;
-    PROF_STOP(DAV2_PROF_INTERP);
+void dav2_interpolate(const dav2_tensor_t *in, int h, int w,
+                      int oh, int ow, dav2_tensor_t *out)
+{
+    const size_t mark = dav2_arena_mark();
+    dav2_interp_t s;
+    if (dav2_interp_begin(&s, in, h, w, oh, ow, out))
+        while (interp_step(&s.base))
+            ;
     dav2_arena_release(mark);
 }
 

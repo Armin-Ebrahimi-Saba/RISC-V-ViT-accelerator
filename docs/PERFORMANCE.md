@@ -1,4 +1,4 @@
-# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 1.9 s (estimated)
+# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 1.8 s (estimated)
 
 This is the record of the speed-up work: what was measured, what each change
 did, and what is left. Every step kept the FPGA output **bit-exact with the
@@ -1058,6 +1058,40 @@ boot self-test hash does not involve attention and stays `c1bf94c1`.
 
 Model: 105.1 → 97.5 Mcycles per frame, **about 1.9 s** (1.95 s, less the
 model's 4 %).
+
+### Round twenty-one — the DPT head's interpolations while the block works (software; estimated, not yet measured)
+
+The head's two large upsamplings (36 → 72 in the last fusion block, 72 →
+126 before the head's 3 × 3 convolution) ran on the CPU while the block
+waited, and then the block ran the next convolution while the CPU waited.
+The convolution's tiles (128 pixels each) only need the input rows up to
+their last output row, plus the kernel's reach.
+
+A **producer** (`dav2_producer_t`, `dav2.h`) now makes such an input row by
+row. The interpolation is one (`dav2_interp_begin`, one step per output
+row, or two that share their source rows). The driver asks for the rows a
+tile reads before it starts the tile (`dav2_producer_need`: pixels
+`n0 + nt` for a GEMM, rows up to `oy·stride − pad + k − 1` for a gather),
+and lets the producer make the next rows while it waits for a job
+(`dav2_producer_idle`). `qgemm_impl` completes the producer after the
+accelerator call and before every path that reads the whole input (the
+ReLU copy, im2col, the CPU GEMM). The result is the same, bit for bit:
+the same jobs, the same order, the same data.
+
+The emulator now reads a GEMM's A tile when the job starts, as the block
+does, instead of row by row during the job; a producer that is late would
+give a wrong result there. Checks: the 11 images and the demo are
+bit-identical to round twenty (emulator and host), also with a build in
+which the waits make no rows (`-DDAV2_PRODUCER_NO_IDLE`, only
+`dav2_producer_need`). With one input row too few for a gather, or only
+the earlier tiles' rows for a GEMM, the output differs, so the check
+works. Bus errors injected into 17 jobs, 12 of them in the head, all end
+with a valid result.
+
+Model: 97.5 → 92.0 Mcycles per frame, **about 1.77 s** (1.84 s, less the
+model's 4 %). The model starts each job at once and lets the CPU produce
+while it runs, which is the ideal overlap; on the board a tile may wait
+for its rows, and the CPU makes a row (about 40,000 cycles) at a time.
 
 ## 7. What is left, in order of expected gain
 

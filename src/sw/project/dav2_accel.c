@@ -280,6 +280,8 @@ static int accel_run(const int16_t *av, uint32_t a_stride,
         if (nt > nrows)
             nt = nrows;
 
+        /* a producer of A (dav2_producer_t) makes the tile's rows first */
+        dav2_producer_need(n0 + nt);
         REG32(GEMM_A_ADDR) = (uint32_t)(uintptr_t)(av + (size_t)n0 * a_row);
         REG32(GEMM_C_ADDR) = onchip ? (uint32_t)n0 : (uint32_t)(uintptr_t)(acc + n0);
         REG32(GEMM_N_ROWS) = (uint32_t)nt;
@@ -302,6 +304,8 @@ static int accel_run(const int16_t *av, uint32_t a_stride,
         {
             uint32_t t0 = accel_mcycle();
             while (REG32(GEMM_STATUS) & STATUS_BUSY) {
+                if (dav2_producer_idle())
+                    continue;              /* make the next tiles' input */
                 if ((accel_mcycle() - t0) > ACCEL_TIMEOUT_CYCLES) {
                     uint32_t d0 = REG32(GEMM_DBG);
                     uint32_t c0 = REG32(GEMM_CYCLES);
@@ -425,6 +429,8 @@ static int accel_wait_simple(const char *what)
 {
     uint32_t t0 = accel_mcycle();
     while (REG32(GEMM_STATUS) & STATUS_BUSY) {
+        if (dav2_producer_idle())
+            continue;                      /* make the next tiles' input */
         if ((accel_mcycle() - t0) > ACCEL_TIMEOUT_CYCLES) {
             printf("GEMM accelerator: TIMEOUT in %s, status=0x%08lx dbg=%08lx; disabled\n",
                    what, (unsigned long)REG32(GEMM_STATUS), (unsigned long)REG32(GEMM_DBG));
@@ -642,6 +648,13 @@ int dav2_accel_conv(const int16_t *img, int h, int w, int C, int k, int stride,
         for (int n0 = 0, t = 0; n0 < N; n0 += nrows, t++) {
             int nt = N - n0;
             if (nt > nrows) nt = nrows;
+            {
+                /* a producer of the image makes the input rows this tile
+                 * reads: up to the last output row's lowest kernel row */
+                int iy = ((n0 + nt - 1) / ow) * stride - pad + k - 1;
+                if (iy > h - 1) iy = h - 1;
+                dav2_producer_need((iy + 1) * w);
+            }
             REG32(GEMM_G_START) = ((uint32_t)(n0 / ow) << 16) | (uint32_t)(n0 % ow);
             REG32(GEMM_C_ADDR)  = onchip ? (uint32_t)n0 : (uint32_t)(uintptr_t)(dst + n0);
             REG32(GEMM_N_ROWS)  = (uint32_t)nt;

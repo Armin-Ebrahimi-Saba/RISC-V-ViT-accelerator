@@ -925,11 +925,18 @@ static dav2_tensor_t fusion(int idx, const dav2_tensor_t *a,
 
     dav2_tensor_t u2 = res_conv_unit(&cur, h, w, prefix, 2);
     dav2_tensor_t up = dav2_tensor_new(oh * ow, DAV2_FEATURES);
-    dav2_interpolate(&u2, h, w, oh, ow, &up);
-
     dav2_qw_t oc;
     sprintf(nm, "%sout", prefix); dav2_qw(&oc, nm, DAV2_FEATURES);
+
+    /* the upsampling as a producer: the output convolution's tiles start
+     * as soon as their rows exist, and the CPU makes the next rows while
+     * the block works (same result as interpolating first) */
+    dav2_interp_t ip;
+    dav2_interp_begin(&ip, &u2, h, w, oh, ow, &up);
+    dav2_producer_set(&ip.base);
     dav2_conv2d_into(&up, oh, ow, &oc, 1, 1, 0, 0, 0, 0, &out);
+    dav2_producer_complete();
+    dav2_producer_set(0);
 
     dav2_arena_release(mark);
     return out;
@@ -1129,9 +1136,13 @@ void dav2_infer(const dav2_cfg_t *cfg, int16_t *depth_q, dav2_xf_t *depth_scale)
 
     const int out_size = grid * DAV2_PATCH;
     dav2_tensor_t up = dav2_tensor_new(out_size * out_size, c1.c);
-    dav2_interpolate(&c1, oh, ow, out_size, out_size, &up);
-
+    /* the upsampling made while the next convolution's first tiles run */
+    dav2_interp_t ip;
+    dav2_interp_begin(&ip, &c1, oh, ow, out_size, out_size, &up);
+    dav2_producer_set(&ip.base);
     dav2_tensor_t c2 = dav2_conv2d_ex(&up, out_size, out_size, &o2a, 3, 1, 1, 0, 1, &oh, &ow);
+    dav2_producer_complete();
+    dav2_producer_set(0);
     dav2_tensor_t c3 = dav2_conv2d_ex(&c2, out_size, out_size, &o2b, 1, 1, 0, 0, 1, &oh, &ow);
 
     /* int16 depth and its scale; converting to float is the caller's
