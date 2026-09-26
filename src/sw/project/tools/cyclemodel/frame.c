@@ -66,7 +66,11 @@ enum { K_GEMM_ENC, K_GEMM_CONV, K_ATT, K_RQ, K_RQ_ADD, K_RQ16, K_RQ_CTX, K_RQ_EX
 static uint64_t acc_time[K_N];          /* modelled job time by kind, reported at the end */
 static void wait_done(void)
 {
+    /* as the driver's wait loops: background and producer steps while the
+     * job runs (dav2_producer_idle), then the rest of the job's time */
     uint64_t now = dav2_cycles();
+    while (busy_until > now && dav2_producer_idle())
+        now = dav2_cycles();
     if (busy_until > now) MMIO[6] = (uint32_t)(busy_until - now);
 }
 static int job_kind;

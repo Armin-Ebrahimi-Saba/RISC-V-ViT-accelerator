@@ -184,6 +184,28 @@ int  dav2_producer_idle(void);                  /* one step, if any is left: 1 *
 void dav2_producer_complete(void);
 extern uint64_t dav2_producer_cycles;           /* CPU cycles spent in steps */
 
+/* Background work: a producer whose steps run in the accelerator waits
+ * when the foreground producer has none. dav2_background_complete finishes
+ * it (before its input changes or its output is read) and clears it. */
+void dav2_background_set(dav2_producer_t *p);
+void dav2_background_complete(void);
+
+/* The plain LayerNorm (no gamma, beta) in parts: begin makes the row
+ * statistics and the output scale (rp in the arena), each step one output
+ * row into out_v; rows below skip are not written (out row n - skip is
+ * input row n). */
+typedef struct {
+    dav2_producer_t base;
+    dav2_tensor_t in_t;                         /* the input's header, as at begin */
+    const dav2_tensor_t *in;
+    int16_t *out_v;
+    int skip, N, C, wide, n, bg;
+    int32_t *rp;
+    dav2_xf_t inv16, out_scale;
+    int32_t omax;
+} dav2_lnplain_t;
+int dav2_lnplain_begin(dav2_lnplain_t *s, const dav2_tensor_t *in, int16_t *out_v, int skip);
+
 /* dav2_interpolate as a producer: begin (index arrays and row buffers in
  * the arena; out's n, c and scale are set at once), then its steps. */
 typedef struct {

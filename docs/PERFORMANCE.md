@@ -1,4 +1,4 @@
-# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 1.7 s (estimated)
+# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 1.64 s (estimated)
 
 This is the record of the speed-up work: what was measured, what each change
 did, and what is left. Every step kept the FPGA output **bit-exact with the
@@ -1119,6 +1119,25 @@ Bitstream: timing met, WNS +0.395 ns (DDR3 controller), worst `sys_clk` path +0.
 The model now also counts the table loads (it had left out the 8192 words
 per GELU before, about 0.2 Mcycles). Model: 92.0 → 88.0 Mcycles per frame,
 **about 1.7 s** (1.76 s, less the model's 4 %).
+
+### Round twenty-three — attention heads in a pipeline, the DPT taps in the background (software; estimated, not yet measured)
+
+| Change | Where | Model (Mcycles) |
+|---|---|---|
+| **Attention in a pipeline.** The CPU's softmax pass of head h (about 90,000 cycles) now runs while the block computes head h+1's scores, and head h+1's v^T is made while the block computes head h's context. The score matrix, its statistics and v^T have two buffers each. Per head: collect the exponential job, start the next head's scores, the softmax pass, the context GEMM and the next v^T, the context requantisation, the next head's exponential job. | `dav2_engine.c` | attention 13.8 → 12.5; frame 88.0 → 86.7 |
+| **The DPT taps in the background.** After blocks 3, 6, 9 and 12 the final LayerNorm of x (without the class token) was a CPU pass with the block idle. `dav2_lnplain_t` splits it: the row statistics and the output scale at once, the rows as background work (`dav2_background_set`), written straight into `feats[j]` (no copy). The steps run in the accelerator waits, also in `qgemm_impl`'s wait for row statistics; `residual_update` completes them before x changes, and the encoder before the head. | `dav2_ops.c`, `dav2_engine.c` | layernorm 11.3 → 10.9; frame 86.7 → 85.3 |
+
+The model's wait (`wait_done`) now makes producer and background steps
+while a job runs, as the driver's wait loops do.
+
+Both keep the output the same, bit for bit (11 images, host and emulator;
+also the emulator of the older block, and a build in which the waits make
+no steps, `-DDAV2_PRODUCER_NO_IDLE`). Bus errors injected into 26 jobs,
+most of them in the attention of the first blocks, all end with a valid
+result.
+
+Model: 88.0 → 85.3 Mcycles per frame, **about 1.64 s** (1.71 s, less the
+model's 4 %).
 
 ## 7. What is left, in order of expected gain
 

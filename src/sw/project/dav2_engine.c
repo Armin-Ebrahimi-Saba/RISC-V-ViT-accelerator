@@ -413,8 +413,10 @@ static inline int32_t job_round(int32_t v, int32_t mult, int sh)
     return (int32_t)(((int64_t)v * mult + ((int64_t)1 << (sh - 1))) >> sh);
 }
 
-/* 1 when P (b->p16) was made this way, 0 to use attn_softmax */
-static int attn_softmax_accel(const dav2_tensor_t *qkv, int n, attn_bufs_t *b, int lut_load)
+/* Start the exponential job for the head whose scores are b->s, b->sst:
+ * 1 when started (then attn_softmax_accel_finish), 0 to use attn_softmax */
+static int attn_softmax_accel_start(const dav2_tensor_t *qkv, int n, attn_bufs_t *b,
+                                    int lut_load)
 {
     const int Kp = (n + 3) & ~3;
     if (!g_exp_lut || (n & 1))
@@ -432,10 +434,14 @@ static int attn_softmax_accel(const dav2_tensor_t *qkv, int n, attn_bufs_t *b, i
         b->epar[3 * q + 1] = sh;
         b->epar[3 * q + 2] = -job_round(b->sst[2 * q], mult, sh);
     }
-    if (!dav2_accel_requant_lut_async(b->s, n, n, b->epar, b->pt, Kp, g_exp_lut, lut_load))
-        return 0;
-    if (!dav2_accel_finish())
-        return 0;                  /* the block failed: S is intact in DDR3 */
+    return dav2_accel_requant_lut_async(b->s, n, n, b->epar, b->pt, Kp, g_exp_lut, lut_load) != 0;
+}
+
+/* P (b->p16) from the exponential job's P^T, which the caller has
+ * collected (dav2_accel_finish) */
+static void attn_softmax_accel_finish(int n, attn_bufs_t *b)
+{
+    const int Kp = (n + 3) & ~3;
 
     /* Each query's sum: the columns of P^T, eight queries (four words) at
      * a time in registers. Per word w = p(q) + 2^16 p(q+1): T adds w and H
@@ -492,7 +498,6 @@ static int attn_softmax_accel(const dav2_tensor_t *qkv, int n, attn_bufs_t *b, i
             b->p16[(size_t)(q + 1) * Kp + m] = 0;
         }
     }
-    return 1;
 }
 
 /* context -> ctx columns of this head. Uses dav2_scratch. */
@@ -689,43 +694,82 @@ static void attention_all16(const dav2_tensor_t *qkv, int n, dav2_tensor_t *ctx)
         b.cpar[3 * d + 2] = 0;
     }
 
+    /* two score matrices and two v^T, so that the next head's score GEMM
+     * and v^T are made while this head's softmax and context are */
+    int32_t *s2[2] = { b.s, (int32_t *)dav2_arena_alloc((size_t)n * n * sizeof(int32_t)) };
+    int32_t *st2[2] = { b.sst, (int32_t *)dav2_arena_alloc((size_t)n * 2 * sizeof(int32_t)) };
+    int16_t *vt2[2] = { b.vt16, (int16_t *)dav2_arena_alloc((size_t)HD * Kp * sizeof(int16_t)) };
+    int qsh2[2] = { 0, 0 };
+    if (dav2_arena_failed) { dav2_arena_release(mark); return; }
+
     uint64_t t0 = dav2_cycles(), t1;
     int lut_loaded = 0;
 #define LAP(d) do { t1 = dav2_cycles(); dav2_sub_add((d), t1 - t0); t0 = t1; } while (0)
-    attn_prep_q16(qkv, 0, n, &b);
+    /* S[t][m] = q_t . k_m: k in place (A, rows qkv->c apart), q as the
+     * weights -- straight from qkv, shifted by the block as it reads it
+     * (CTRL.wsh), or the shifted copy made by attn_prep_q16 -- so the
+     * statistics are per query */
+#define Q_W(h)   (b.q_direct ? qkv->v + (h) * HD : b.q16)
+#define Q_WS     (b.q_direct ? qkv->c : HD)
+#define K_A(h)   (qkv->v + ED + (h) * HD)
+#define S_START(h) do { attn_prep_q16(qkv, (h), n, &b);                          \
+        qsh2[(h) & 1] = b.q_direct ? b.q_sh : 0;                                  \
+        gemm16_start(K_A(h), qkv->c, Q_W(h), Q_WS, s2[(h) & 1], n, HD, n,         \
+                     st2[(h) & 1], qsh2[(h) & 1]); } while (0)
+#define S_FINISH(h) gemm16_finish(K_A(h), qkv->c, Q_W(h), Q_WS, s2[(h) & 1], n, HD, n, \
+                                  st2[(h) & 1], qsh2[(h) & 1])
+    /* head 0: scores, v^T while they run, the exponential job */
+    S_START(0);
     LAP(DAV2_SUB_ATT_PREP_QK);
+    b.vt16 = vt2[0];
+    attn_prep_vt16(qkv, 0, n, &b);
+    LAP(DAV2_SUB_ATT_PREP_V);
+    S_FINISH(0);
+    b.s = s2[0]; b.sst = st2[0];
+    int exp_on = attn_softmax_accel_start(qkv, n, &b, !lut_loaded);
+    if (exp_on) lut_loaded = 1;
+    LAP(DAV2_SUB_ATT_WAIT);
     for (int h = 0; h < DAV2_N_HEADS; h++) {
-        /* S[t][m] = q_t . k_m: k in place (A, rows qkv->c apart), q16 as
-         * the weights, so the statistics are per query */
-        const int16_t *k = qkv->v + ED + h * HD;
-        /* q straight from qkv, shifted by the block as it reads it
-         * (CTRL.wsh), or the shifted copy made by attn_prep_q16 */
-        const int16_t *qw = b.q_direct ? qkv->v + h * HD : b.q16;
-        const int qws = b.q_direct ? qkv->c : HD, qsh = b.q_direct ? b.q_sh : 0;
-        gemm16_start(k, qkv->c, qw, qws, b.s, n, HD, n, b.sst, qsh);
-        LAP(DAV2_SUB_ATT_WAIT);
-        attn_prep_vt16(qkv, h, n, &b);
-        LAP(DAV2_SUB_ATT_PREP_V);
-        gemm16_finish(k, qkv->c, qw, qws, b.s, n, HD, n, b.sst, qsh);
-        LAP(DAV2_SUB_ATT_WAIT);
-        /* the exponential on the block; its table is loaded with the
-         * first job of this call (fc1's GELU table replaces it) */
-        if (attn_softmax_accel(qkv, n, &b, !lut_loaded))
-            lut_loaded = 1;
-        else
+        const int nx = h + 1 < DAV2_N_HEADS;
+        /* this head's P: from the exponential job, collected here, or on
+         * the CPU; meanwhile the block computes the next head's scores */
+        b.s = s2[h & 1]; b.sst = st2[h & 1];
+        const int exp_ok = exp_on && dav2_accel_finish();
+        if (nx) S_START(h + 1);
+        if (exp_ok) {
+            attn_softmax_accel_finish(n, &b);
+        } else {
+            /* no exponential job, or it failed (S is intact in DDR3) */
+            b.s = s2[h & 1]; b.sst = st2[h & 1];
             attn_softmax(qkv, n, &b);
+        }
         LAP(DAV2_SUB_ATT_SOFTMAX);
-        /* C[d][t] = sum_m P[t][m] v[m][d] */
-        gemm16_start(b.p16, Kp, b.vt16, Kp, b.c, n, Kp, HD, 0, 0);
+        if (nx) S_FINISH(h + 1);
         LAP(DAV2_SUB_ATT_WAIT);
-        if (h + 1 < DAV2_N_HEADS)
-            attn_prep_q16(qkv, h + 1, n, &b);
-        LAP(DAV2_SUB_ATT_PREP_QK);
-        gemm16_finish(b.p16, Kp, b.vt16, Kp, b.c, n, Kp, HD, 0, 0);
+        /* C[d][t] = sum_m P[t][m] v[m][d]; the next head's v^T meanwhile */
+        gemm16_start(b.p16, Kp, vt2[h & 1], Kp, b.c, n, Kp, HD, 0, 0);
+        LAP(DAV2_SUB_ATT_WAIT);
+        if (nx) {
+            b.vt16 = vt2[(h + 1) & 1];
+            attn_prep_vt16(qkv, h + 1, n, &b);
+        }
+        LAP(DAV2_SUB_ATT_PREP_V);
+        gemm16_finish(b.p16, Kp, vt2[h & 1], Kp, b.c, n, Kp, HD, 0, 0);
         LAP(DAV2_SUB_ATT_WAIT);
         attn_context16(h, n, &b, ctx);
         LAP(DAV2_SUB_ATT_NORM);
+        if (nx) {
+            b.s = s2[(h + 1) & 1]; b.sst = st2[(h + 1) & 1];
+            exp_on = attn_softmax_accel_start(qkv, n, &b, !lut_loaded);
+            if (exp_on) lut_loaded = 1;
+        }
+        LAP(DAV2_SUB_ATT_WAIT);
     }
+#undef S_START
+#undef S_FINISH
+#undef Q_W
+#undef Q_WS
+#undef K_A
 #undef LAP
     dav2_arena_release(mark);
 }
@@ -837,6 +881,7 @@ static void residual_update(const dav2_tensor_t *a, const dav2_qw_t *w,
                             dav2_tensor_t *x, int16_t **spare, uint32_t *rst,
                             uint32_t *rsum)
 {
+    dav2_background_complete();   /* a tap's LayerNorm reads the old x */
     dav2_tensor_t y = *x;
     y.v = *spare;
     y.rst = rst;           /* ask for the new x's row ranges (for LayerNorm) */
@@ -1071,6 +1116,7 @@ void dav2_infer(const dav2_cfg_t *cfg, int16_t *depth_q, dav2_xf_t *depth_scale)
 
     /* ---- transformer blocks, capturing the four DPT taps --------------- */
     dav2_tensor_t feats[4];
+    dav2_lnplain_t tap_ln[4];
     for (int i = 0; i < 4; i++)
         feats[i] = dav2_tensor_new(n_patch, ED);
 
@@ -1085,20 +1131,25 @@ void dav2_infer(const dav2_cfg_t *cfg, int16_t *depth_q, dav2_xf_t *depth_scale)
 
         for (int j = 0; j < 4; j++) {
             if (INTERMEDIATE[j] != i) continue;
-            /* final LayerNorm (gamma, beta folded into proj0..3), then
-             * drop the class token */
-            size_t mark = dav2_arena_mark();
-            dav2_tensor_t nrm = dav2_tensor_new(n_tokens, ED);
-            dav2_layernorm(&x, 0, 0, &nrm);
-            dav2_copy16(feats[j].v, nrm.v + ED, (size_t)n_patch * ED);
-            feats[j].scale = nrm.scale;
+            /* final LayerNorm (gamma, beta folded into proj0..3) without the
+             * class token's row, straight into feats[j]: the statistics
+             * now, the rows as background work in the next block's waits
+             * (completed before x changes, see residual_update) */
+            tap_ln[j].bg = 0;
+            if (dav2_lnplain_begin(&tap_ln[j], &x, feats[j].v, 1)) {
+                tap_ln[j].bg = 1;
+                dav2_background_set(&tap_ln[j].base);
+            }
+            feats[j].scale = tap_ln[j].out_scale;
 #ifdef DAV2_TRACE
+            dav2_background_complete();
             { char fn[64]; sprintf(fn, "/tmp/dav2_feat%d.bin", j);
               dav2_dump(fn, &feats[j]); }
 #endif
-            dav2_arena_release(mark);
         }
     }
+
+    dav2_background_complete();   /* the last tap's LayerNorm */
 
     /* ---- DPT head ------------------------------------------------------ */
     dav2_progress("dpt head: projections");
