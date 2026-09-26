@@ -1538,9 +1538,19 @@ static void layernorm_affine(const dav2_tensor_t *in, const int32_t *gq,
                 if (zr[n] > hi) hi = zr[n];
             }
         }
-        const int64_t g = gq[c], b = bq[c];
-        int64_t y0 = (((int64_t)lo * g * ZS) >> 31) + b;   /* Q15 * 2^32 >> 31 = Q16 */
-        int64_t y1 = (((int64_t)hi * g * ZS) >> 31) + b;
+        const int64_t b = bq[c];
+        /* lo g ZS and hi g ZS with G = g ZS once per channel, each as two
+         * 32-bit partial products in wrap-around 64-bit arithmetic: exact,
+         * since the true value is below 2^57 (see above) */
+        const int64_t G = (int64_t)gq[c] * ZS;
+        const int32_t Gh = (int32_t)(G >> 32);
+        const uint32_t Gl = (uint32_t)G;
+        const int64_t p0 = (int64_t)(((uint64_t)((int64_t)lo * Gh) << 32)
+                                     + (uint64_t)((int64_t)lo * (int64_t)Gl));
+        const int64_t p1 = (int64_t)(((uint64_t)((int64_t)hi * Gh) << 32)
+                                     + (uint64_t)((int64_t)hi * (int64_t)Gl));
+        int64_t y0 = (p0 >> 31) + b;                        /* Q15 * 2^32 >> 31 = Q16 */
+        int64_t y1 = (p1 >> 31) + b;
         if (y0 < 0) y0 = -y0;
         if (y1 < 0) y1 = -y1;
         if (y0 > ymax_all) ymax_all = y0;
@@ -1558,6 +1568,11 @@ static void layernorm_affine(const dav2_tensor_t *in, const int32_t *gq,
     int shift = F.sh - 20, rr = 0;
     if (shift > 62) { rr = shift - 62; shift = 62; }
     if (rr > 31) rr = 31;
+    /* B = round(b inv.m / 2^s), s = inv.sh + 16: for s >= 33 the rounding
+     * constant is a multiple of 2^32, so it is (mulh(b, inv.m) +
+     * 2^(s-33)) >> (s-32), which fits 32 bits */
+    const int bs = inv.sh + 16;
+    const int b_fast = bs >= 33 && bs <= 62;
     for (int c = 0; c < C; c++) {
         if (shift >= 1) {
             parn[3 * c] = mulh32(gq[c] << 12, F.m) >> rr;
@@ -1567,7 +1582,9 @@ static void layernorm_affine(const dav2_tensor_t *in, const int32_t *gq,
             xf_to_mult(xf_mul(xf_norm(gq[c], 15), F), &parn[3 * c], &sh);
             parn[3 * c + 1] = sh;
         }
-        parn[3 * c + 2] = sat_i32(shr_round64((int64_t)bq[c] * inv.m, inv.sh + 16));
+        parn[3 * c + 2] = b_fast
+            ? (int32_t)(((int64_t)mulh32(bq[c], inv.m) + ((int64_t)1 << (bs - 33))) >> (bs - 32))
+            : sat_i32(shr_round64((int64_t)bq[c] * inv.m, bs));
     }
     int32_t omax = requant16(zq, N, C, parn, out->v, 0);   /* rows c, N columns -> out[n][c] */
     SUB_LAP(DAV2_SUB_LN_OUT);

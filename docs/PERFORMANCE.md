@@ -1,4 +1,4 @@
-# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 1.61 s (estimated)
+# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 1.59 s (estimated)
 
 This is the record of the speed-up work: what was measured, what each change
 did, and what is left. Every step kept the FPGA output **bit-exact with the
@@ -1167,6 +1167,39 @@ block's attention) all end with a valid result.
 
 Model: attention 13.8 (round twenty-two) → 10.5 Mcycles; frame 85.3 →
 83.7 Mcycles, **about 1.61 s** (1.67 s, less the model's 4 %).
+
+### Round twenty-five — where the block waits, and LayerNorm's arithmetic (software; estimated, not yet measured)
+
+`tools/cyclemodel/frame.c` now also reports how long the block is idle
+before each kind of job (the CPU works, the block waits). For round
+twenty-four, in Mcycles:
+
+| Block idle before | Mcycles | The CPU meanwhile |
+|---|---|---|
+| requantisation | 12.1 | mostly the part of the head's interpolations that the convolutions do not cover |
+| int16 requantisation (LayerNorm's jobs) | 9.3 | LayerNorm's row statistics and channel pass; the token embedding before the first |
+| convolution GEMMs | 4.2 | mostly the fusion blocks' adds |
+| attention GEMMs | 3.7 | the softmax pass |
+
+LayerNorm's per-row arithmetic, the same values as before:
+
+- `xf_rsqrt` with 32-bit operands and 64-bit products. X < 2^32; y
+  starts in [2^29, 2^30] and stays below 2^30; x·y² ≤ 1.41 at the start and
+  ≤ 1 after the first Newton step. The start value's division (X − 2^30) / 6
+  was a 64-bit division, a library call (`__divdi3`); it is now 32-bit.
+  Checked against the old code on 31.7 million inputs (121 exponents):
+  identical.
+- The channel pass: lo·g·ZS as lo·G with G = g·ZS per channel, in two 32-bit
+  partial products (exact, the value is below 2^57); the bias parameter
+  with the mulh form of the rounding shift when the shift is ≥ 33 (exact,
+  the rounding constant is then a multiple of 2^32). Checked on 20 million
+  random values: identical.
+
+Same output, bit for bit (11 images, host and emulator); the boot
+self-test hash stays `c1bf94c1`.
+
+Model: ln stats 3.5 → 2.9 Mcycles; frame 83.7 → 82.8 Mcycles, **about
+1.59 s** (1.66 s, less the model's 4 %).
 
 ## 7. What is left, in order of expected gain
 

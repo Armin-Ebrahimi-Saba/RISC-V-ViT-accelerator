@@ -74,8 +74,11 @@ static void wait_done(void)
     if (busy_until > now) MMIO[6] = (uint32_t)(busy_until - now);
 }
 static int job_kind;
+static uint64_t idle_before[K_N];       /* block idle before a job, by the job's kind */
 static void start_job(uint64_t cyc)
 {
+    const uint64_t now0 = dav2_cycles();
+    if (busy_until && now0 > busy_until) idle_before[job_kind] += now0 - busy_until;
     acc_time[job_kind] += cyc;
     wait_done();
     busy_until = dav2_cycles() + cyc;
@@ -275,6 +278,7 @@ int main(void)
     wait_done();
     for (int b = 0; b < DAV2_PROF_N; b++) { MMIO[3] = (uint32_t)b; MMIO[4] = (uint32_t)dav2_prof_get(b); }
     for (int k = 0; k < K_N; k++) { MMIO[3] = (uint32_t)(100 + k); MMIO[4] = (uint32_t)acc_time[k]; }
+    for (int k = 0; k < K_N; k++) { MMIO[3] = (uint32_t)(300 + k); MMIO[4] = (uint32_t)idle_before[k]; }
     for (int d = 0; d < DAV2_SUB_N; d++) { MMIO[3] = (uint32_t)(200 + d); MMIO[4] = (uint32_t)dav2_sub_get(d); }
     mark(0xdead);
     for (;;) ;

@@ -156,17 +156,21 @@ static inline int64_t xf_round(dav2_xf_t a, int k)
  * moves down towards the root; five steps reach the Q30 resolution. */
 static inline dav2_xf_t xf_rsqrt(dav2_xf_t a)
 {
-    int64_t X = a.m;                        /* a = X/2^30 * 2^E, X/2^30 in [1,2) */
+    /* All in 32-bit operands with 64-bit products (no 64-bit division or
+     * 64 x 64 multiply, which are library calls on this core): X < 2^32;
+     * y starts in [2^29, 2^30] and stays below 2^30; x y^2 <= 1.41 at the
+     * start and <= 1 after the first step, so 3 - x y^2 is in (0, 3). */
+    uint32_t X = (uint32_t)a.m;             /* a = X/2^30 * 2^E, X/2^30 in [1,2) */
     int32_t E = 30 - a.sh;
     if (E & 1) { X <<= 1; E -= 1; }         /* X/2^30 in [1,4), E even */
-    const int64_t one = (int64_t)1 << 30;
-    int64_t y = one - (X - one) / 6;
+    const uint32_t one = 1u << 30;
+    uint32_t y = one - (X - one) / 6u;
     for (int i = 0; i < 5; i++) {
-        int64_t y2  = (y * y) >> 30;
-        int64_t xy2 = (X * y2) >> 30;
-        y = (y * (3 * one - xy2)) >> 31;
+        uint32_t y2  = (uint32_t)(((uint64_t)y * y) >> 30);
+        uint32_t xy2 = (uint32_t)(((uint64_t)X * y2) >> 30);
+        y = (uint32_t)(((uint64_t)y * (3u * one - xy2)) >> 31);
     }
-    return xf_norm(y, 30 + E / 2);          /* y/2^30 * 2^(-E/2) */
+    return xf_norm((int64_t)y, 30 + E / 2); /* y/2^30 * 2^(-E/2) */
 }
 
 /* The (multiplier, shift) pair for apply_multiplier, for a > 0. A factor

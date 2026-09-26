@@ -189,7 +189,9 @@ if __name__ == "__main__":
         kn = ["GEMM (encoder)", "GEMM (convolutions)", "GEMM (attention)", "requant",
               "requant + add", "requant int16 in", "requant context", "requant exp"]
         for d, v in sub:
-            if d >= 200:
+            if d >= 300:
+                print("  block idle before %-17s %8.1f Mcycles" % (kn[d - 300], v / 1e6))
+            elif d >= 200:
                 print("    %-18s %8.1f Mcycles" % (subn[d - 200], v / 1e6))
             elif d >= 100:
                 print("  accelerator %-20s %8.1f Mcycles busy" % (kn[d - 100], v / 1e6))
