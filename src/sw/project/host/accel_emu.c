@@ -29,7 +29,7 @@ static uint32_t regs[NREGS];
 /* the latched job */
 static struct {
     int      busy, requant, gather, add, relu, lut, lut_load, a16, w16, ostats, onchip, osums, grelu;
-    int      lutint, wsh;
+    int      lutint, wsh, lerp;
     uint32_t lut_addr;
     uint32_t x_addr, add_mx, add_mh, add_shift;
     uint32_t a_addr, a_stride, w_addr, w_stride, c_addr, c_stride, s_addr, p_addr;
@@ -214,6 +214,7 @@ static void latch(void)
     job.onchip   = (ctrl >> 10) & 1u;
     job.osums    = ((ctrl >> 12) & 1u) && job.ostats;
     job.grelu    = ((ctrl >> 13) & 1u) && job.gather;
+    job.lerp     = ((ctrl >> 19) & 1u) && !job.requant && !job.gather;
     job.wsh      = job.w16 ? (int)((ctrl >> 14) & 15u) : 0;
     job.lutint   = ((ctrl >> 18) & 1u) && job.lut;
     if (((ctrl >> 13) & 1u) && !job.gather) fail("CTRL.grelu without CTRL.gather");
@@ -229,6 +230,7 @@ static void latch(void)
     job.g_addr   = R(G_ADDR);   job.g_geom   = R(G_GEOM);  job.g_chan = R(G_CHAN);
     job.g_conv   = R(G_CONV);   job.g_start  = R(G_START);
 
+    if (job.lerp && job.n != 2) fail("CTRL.lerp: N_ROWS must be 2");
     /* the contract, as student_gemm.hjson states it */
     if (job.n < 1 || job.n > NROWS) fail("N_ROWS out of range");
     if (job.requant) {
@@ -269,6 +271,16 @@ static void step(void)
     if (job.requant) {
         requant_all();
         job.writes = job.n * job.m / 2u;
+        job.busy = 0;
+    } else if (job.lerp) {
+        /* CTRL.lerp: the two A rows (read at the start), interpolated */
+        int16_t *o = (int16_t *)ptr(job.c_addr);
+        const int32_t w = (int32_t)(job.add_mx & 511u);
+        for (uint32_t e = 0; e < job.k; e++) {
+            const int32_t t = a_elem(0, e), b = a_elem(1, e);
+            o[e] = (int16_t)(t + (((b - t) * w) >> 8));
+        }
+        job.writes = job.k / 2u;
         job.busy = 0;
     } else {
         for (int i = 0; i < ROWS_PER_POLL && job.m_done < job.m; i++)

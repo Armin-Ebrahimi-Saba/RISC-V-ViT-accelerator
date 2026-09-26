@@ -106,6 +106,9 @@ int dav2_accel_conv_onchip_async(const int16_t *img, int h, int w, int C, int k,
   st->v = 0; st->tiles = 0; return 0; }
 int dav2_accel_grelu_ok(void) { return 0; }
 int dav2_accel_wsh_ok(void) { return 0; }
+int dav2_accel_lerp_ok(void) { return 0; }
+int dav2_accel_lerp_async(const int16_t *t, uint32_t row_stride, int16_t *out, int n, int w)
+{ (void)t;(void)row_stride;(void)out;(void)n;(void)w; return 0; }
 int dav2_accel_lutint_ok(void) { return 0; }
 int dav2_accel_gemm16_shift_async(const int16_t *a, uint32_t as, const int16_t *w, uint32_t ws,
                                   int wsh, int32_t *acc, int N, int K, int M, int32_t *st)

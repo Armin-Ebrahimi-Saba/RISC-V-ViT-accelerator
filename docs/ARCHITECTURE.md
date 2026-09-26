@@ -239,7 +239,10 @@ the gather ReLU. Two later options have no CAPS bit and are found by the
 boot self-tests: **`CTRL.wsh`** shifts int16 weights right as they enter
 the multipliers (the score GEMM reads q from qkv this way), and
 **`CTRL.lutint`** makes the lookup table a 257-point interpolating one
-(GELU's table is then 256 words, and the block interpolates). The
+(GELU's table is then 256 words, and the block interpolates). A
+**LERP job** (**`CTRL.lerp`**) interpolates two rows loaded as an A tile,
+t + (((b − t) · w) >> 8) per int16: the vertical step of the DPT head's
+upsamplings. The
 driver uses them only when the bit is set and its boot self-test passes;
 otherwise the same arithmetic runs on the CPU.
 

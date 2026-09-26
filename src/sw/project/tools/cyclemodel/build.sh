@@ -8,6 +8,7 @@
 # FRAME_FLAGS=-DGRELU_C=0 models the block without the gather ReLU (round eighteen).
 # FRAME_FLAGS=-DEXP_C=0 models the softmax on the CPU (round nineteen).
 # FRAME_FLAGS=-DWSH_C=0 models the block without CTRL.wsh and CTRL.lutint (round twenty-one).
+# FRAME_FLAGS=-DLERP_C=0 models the block without the LERP job (round twenty-six).
 HERE=$(cd "$(dirname "$0")" && pwd)
 SRC=${1:-$HERE/../..}
 GCC=$(command -v riscv-none-elf-gcc || ls ~/Public/xpack-riscv-none-elf-gcc-*/bin/riscv-none-elf-gcc | tail -1)

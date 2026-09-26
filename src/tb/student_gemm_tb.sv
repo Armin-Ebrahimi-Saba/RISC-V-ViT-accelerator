@@ -567,6 +567,68 @@ module student_gemm_tb;
       $display("  ok, %0d outputs, loaded and reused", 2 * ndim * mdim);
   endtask
 
+  // LERP job (CTRL.lerp): two rows of K int16, stride_words apart, out
+  // word j = per lane t + (((b - t) * w) >>> 8)
+  task automatic run_lerp(input int kdim, input int stride_words, input int w);
+    int mismatches = 0;
+    logic [31:0] st;
+    int guard;
+    $display("--- LERP K=%0d stride=%0d words w=%0d", kdim, stride_words, w);
+    for (int i = 0; i < kdim / 2 + stride_words; i++)
+      memory.mem[mem_word(A_BASE) + i] = {16'($signed($urandom % 16383) - 8191),
+                                          16'($signed($urandom % 16383) - 8191)};
+    for (int i = 0; i < kdim / 2 + 4; i++)
+      memory.mem[mem_word(C_BASE) + i] = 32'hdead_beef;
+    bus.put_word(R_A_ADDR,   A_BASE);
+    bus.put_word(R_A_STRIDE, stride_words * 4);
+    bus.put_word(R_W_ADDR,   A_BASE);        // an older block would run a small GEMM
+    bus.put_word(R_W_STRIDE, 0);
+    bus.put_word(R_C_ADDR,   C_BASE);
+    bus.put_word(R_C_STRIDE, 0);
+    bus.put_word(R_S_ADDR,   0);
+    bus.put_word(R_K_LEN,    kdim);
+    bus.put_word(R_M_LEN,    1);
+    bus.put_word(R_N_ROWS,   2);
+    bus.put_word(R_ADD_MX,   w);
+    bus.put_word(R_CTRL,     32'h1 | 32'h8_0000);
+    guard = 0;
+    forever begin
+      bus.get_word(R_STATUS, st);
+      if (!(st & 32'h1)) break;
+      if (++guard > 200000) begin
+        $display("FAIL: LERP job did not finish (status=0x%08x)", st);
+        errors++;
+        return;
+      end
+    end
+    for (int j = 0; j < kdim / 2; j++) begin
+      logic [31:0] tw = memory.mem[mem_word(A_BASE) + j];
+      logic [31:0] bw = memory.mem[mem_word(A_BASE) + j + stride_words];
+      logic [31:0] ow = memory.mem[mem_word(C_BASE) + j];
+      for (int l = 0; l < 2; l++) begin
+        int t = l ? int'($signed(tw[31:16])) : int'($signed(tw[15:0]));
+        int b = l ? int'($signed(bw[31:16])) : int'($signed(bw[15:0]));
+        int got = l ? int'($signed(ow[31:16])) : int'($signed(ow[15:0]));
+        int e = (t * (256 - w) + b * w) >>> 8;
+        checks++;
+        if (got !== e) begin
+          if (mismatches < 5)
+            $display("  FAIL word %0d lane %0d: got %0d expected %0d (t=%0d b=%0d)", j, l, got, e, t, b);
+          mismatches++;
+        end
+      end
+    end
+    if (memory.mem[mem_word(C_BASE) + kdim / 2] !== 32'hdead_beef) begin
+      $display("  FAIL: a word past the end was written");
+      mismatches++;
+    end
+    if (mismatches) begin
+      $display("  %0d wrong", mismatches);
+      errors += mismatches;
+    end else
+      $display("  ok, %0d outputs", kdim);
+  endtask
+
   task automatic run_requant_epi(input int ndim, input int mdim, input int mode);
     int mismatches = 0;
     logic [31:0] st;
@@ -1174,6 +1236,13 @@ module student_gemm_tb;
     run_gemm_w16(82, 64, 82, 1, 2);
     run_gemm_w16(20, 64, 30, 0, 5);
     run_gemm_w16(20, 64, 30, 0, 0);            // and without again
+    // LERP jobs (CTRL.lerp), then a plain GEMM again
+    run_lerp(2016, 2016, 147);                 // the head's row chunk, rows adjacent
+    run_lerp(64, 40, 0);
+    run_lerp(64, 40, 255);
+    run_lerp(8, 4, 128);                       // short rows, adjacent (A_STRIDE 0 would mean packed)
+    run_lerp(2048, 1100, 1);                   // KMAX
+    run_gemm(20, 64, 30);
     // the interpolating lookup table (CTRL.lutint), then the direct one again
     run_gemm(82, 64, 30);   run_requant_lutint(82, 30, 0);
     run_gemm(130, 64, 8);   run_requant_lutint(130, 8, 1);

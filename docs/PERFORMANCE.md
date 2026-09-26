@@ -1,4 +1,4 @@
-# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 1.57 s (estimated)
+# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 1.47 s (estimated)
 
 This is the record of the speed-up work: what was measured, what each change
 did, and what is left. Every step kept the FPGA output **bit-exact with the
@@ -1216,6 +1216,42 @@ five jobs of the head end with a valid result.
 
 Model: block idle before convolution GEMMs 4.2 → 0.5 Mcycles; frame 82.8
 → 82.0 Mcycles, **about 1.57 s** (1.64 s, less the model's 4 %).
+
+### Round twenty-seven — the interpolation's vertical step on the block (hardware; estimated, not yet measured)
+
+The DPT head's bilinear upsamplings were the largest CPU item left
+(15.1 Mcycles, of which the convolutions hid about 5.5). Their vertical
+step is now a small job of the block.
+
+**LERP job** (`CTRL.lerp`): the A-load brings two tile rows (N_ROWS = 2,
+A_STRIDE apart, K_LEN int16 each); then word j of the output is, per int16
+lane, t + (((b − t) · w) >>> 8) with w = `ADD_MULT_X`[8:0] — exactly the
+CPU's (t (256 − w) + b w) >> 8, since 256 t is a multiple of 256. A new
+state `ST_LERP` reads word j of both rows and writes its interpolation a
+cycle later, two cycles per word at most, the bus's rate anyway. The two
+17 × 9 multiplies are in logic. No CAPS bit: the boot self-test finds it
+("LERP self-test ok"); an older block reads the registers as a GEMM of two
+rows and one weight row that writes two words into the test buffer, and
+the self-test then reports it as not present.
+
+**The interpolation producer** (round twenty-one) has a second mode: the
+CPU makes the horizontal rows, all of them into one buffer (plus a spare
+row) in the waits; before a convolution tile the producer's new `need`
+callback runs the LERP jobs for the output rows the tile reads (in chunks
+of at most 2048 int16), while the waits for them make more horizontal rows.
+The tile loops write their registers again after each producer call. A job
+that fails leaves its chunk to the CPU.
+
+Checks: same output, bit for bit (11 images, host and emulator; with
+`-DDAV2_PRODUCER_NO_IDLE`; with an emulator of a block without the job,
+which falls back to the CPU). With one output row too few made, the output
+differs. Bus errors injected into 8 of the head's jobs end with the same
+output. `student_gemm_tb`: rows of 2016, 64, 8 and 2048 int16, weights 0,
+1, 128, 147, 255. PASSED, 685,695 words. Bitstream: timing met, WNS +0.395 ns (DDR3 controller), worst `sys_clk` path +0.837 ns, WHS +0.012 ns; LUT 27.1 %, BRAM 91.6 %, DSP 37.8 %; the warnings are those of round twenty-two.
+
+Model: interpolation (CPU) 15.1 → 5.7 Mcycles, block +3.0 (LERP);
+frame 82.0 → 76.7 Mcycles, **about 1.47 s** (1.53 s, less the model's
+4 %). The accelerator now runs about 1946 jobs per frame.
 
 ## 7. What is left, in order of expected gain
 

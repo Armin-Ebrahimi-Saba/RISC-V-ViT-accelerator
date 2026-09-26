@@ -187,7 +187,7 @@ if __name__ == "__main__":
         subn = ["ln stats", "ln gamma/beta", "ln requant", "rq range", "rq params", "att prep q,k",
                 "att prep v", "att softmax", "att normalise", "att wait", "gelu table"]
         kn = ["GEMM (encoder)", "GEMM (convolutions)", "GEMM (attention)", "requant",
-              "requant + add", "requant int16 in", "requant context", "requant exp"]
+              "requant + add", "requant int16 in", "requant context", "requant exp", "lerp"]
         for d, v in sub:
             if d >= 300:
                 print("  block idle before %-17s %8.1f Mcycles" % (kn[d - 300], v / 1e6))

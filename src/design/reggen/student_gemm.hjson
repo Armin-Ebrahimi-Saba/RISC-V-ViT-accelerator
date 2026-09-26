@@ -145,6 +145,11 @@
           desc: "Requantisation job with CTRL.lut: the table holds 257 points L[0..256], word i = {L[i+1], L[i]} (256 words, so a table load reads 256 words); a value v maps to L[i] + (((L[i+1] - L[i]) * f) >> 6) with u = v + 8192, i = u >> 6, f = u & 63 (arithmetic shift). No CAPS bit: the driver's self-test finds out whether it exists."
         }
         {
+          bits: 19
+          name: "lerp"
+          desc: "LERP job (not requant, not gather): N_ROWS = 2 rows of K_LEN int16 are loaded as an A tile (A_ADDR, A_STRIDE); word j of the output at C_ADDR + 4j is, per int16 lane, t + (((b - t) * w) >> 8) (arithmetic) with t from row 0, b from row 1 and w = ADD_MULT_X[8:0]. No CAPS bit: the driver's self-test finds out whether it exists."
+        }
+        {
           bits: 2
           name: "gather"
           desc: "GEMM job only: 1 - the A tile is gathered from an NHWC int16 image as im2col would lay it out (G_ADDR, G_GEOM, G_CHAN, G_CONV, G_START), instead of read from A_ADDR. K_LEN must equal kpos_count * C. C must be even."

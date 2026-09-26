@@ -183,6 +183,12 @@ int dav2_accel_gemm16_shift_async(const int16_t *a, uint32_t a_stride,
  * boot self-tests. */
 int dav2_accel_wsh_ok(void);
 int dav2_accel_lutint_ok(void);
+/* LERP job (CTRL.lerp, found by a self-test): out[e] = t[e] + (((b[e] -
+ * t[e]) * w) >> 8) for e < n (n a multiple of 4, at most CAPS.KMAX), with
+ * b = t + row_stride bytes; row_stride a non-zero multiple of 4. Left
+ * running (collect with dav2_accel_finish); 0 when declined. */
+int dav2_accel_lerp_ok(void);
+int dav2_accel_lerp_async(const int16_t *t, uint32_t row_stride, int16_t *out, int n, int w);
 /* dav2_accel_requant with output rows out_stride int16 apart (instead of
  * M): writes into a slice of a wider tensor. */
 int dav2_accel_requant_stride(const int32_t *acc, int N, int M, const int32_t *params,

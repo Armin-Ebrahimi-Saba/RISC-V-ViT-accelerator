@@ -92,6 +92,7 @@
 #define CTRL_GRELU    0x2000u
 #define CTRL_WSH(s)   ((uint32_t)(s) << 14)
 #define CTRL_LUTINT   0x40000u
+#define CTRL_LERP     0x80000u
 
 #define STATUS_BUSY 0x1u
 #define STATUS_DONE 0x2u
@@ -129,6 +130,7 @@ static int      accel_grelu_ok;        /* CAPS bit 31, cleared if its self-test 
 static int      accel_conv_relu;       /* dav2_accel_conv: ReLU on the image (CTRL.grelu) */
 static int      accel_wsh_ok;          /* CTRL.wsh: found by its self-test (no CAPS bit) */
 static int      accel_lutint_ok;       /* CTRL.lutint: likewise */
+static int      accel_lerp_ok;         /* CTRL.lerp: likewise */
 static int      accel_conv_onchip;     /* dav2_accel_conv: result into the result RAM */
 static uint32_t accel_gemm_ctrl;       /* extra CTRL bits for accel_run (CTRL.w16) */
 static uint32_t accel_gemm_wsh;        /* CTRL.wsh for the next int16-weight GEMM */
@@ -285,8 +287,16 @@ static int accel_run(const int16_t *av, uint32_t a_stride,
         if (nt > nrows)
             nt = nrows;
 
-        /* a producer of A (dav2_producer_t) makes the tile's rows first */
+        /* a producer of A (dav2_producer_t) makes the tile's rows first;
+         * it may run jobs of its own (LERP), so the job's registers are
+         * written again */
         dav2_producer_need(n0 + nt);
+        REG32(GEMM_W_ADDR)   = (uint32_t)(uintptr_t)w;
+        REG32(GEMM_A_STRIDE) = a_stride;
+        REG32(GEMM_W_STRIDE) = w_stride;
+        REG32(GEMM_C_STRIDE) = onchip ? (uint32_t)N : (uint32_t)N * 4u;
+        REG32(GEMM_K_LEN)    = (uint32_t)K;
+        REG32(GEMM_M_LEN)    = (uint32_t)M;
         REG32(GEMM_A_ADDR) = (uint32_t)(uintptr_t)(av + (size_t)n0 * a_row);
         REG32(GEMM_C_ADDR) = onchip ? (uint32_t)n0 : (uint32_t)(uintptr_t)(acc + n0);
         REG32(GEMM_N_ROWS) = (uint32_t)nt;
@@ -662,6 +672,19 @@ int dav2_accel_conv(const int16_t *img, int h, int w, int C, int k, int stride,
                 int iy = ((n0 + nt - 1) / ow) * stride - pad + k - 1;
                 if (iy > h - 1) iy = h - 1;
                 dav2_producer_need((iy + 1) * w);
+                /* the producer may have run jobs of its own (LERP) */
+                REG32(GEMM_G_ADDR)   = (uint32_t)(uintptr_t)img;
+                REG32(GEMM_G_GEOM)   = ((uint32_t)h << 16) | (uint32_t)w;
+                REG32(GEMM_G_CHAN)   = ((uint32_t)ow << 16) | (uint32_t)C;
+                REG32(GEMM_W_STRIDE) = (uint32_t)K;
+                REG32(GEMM_A_STRIDE) = 0u;
+                REG32(GEMM_C_STRIDE) = onchip ? (uint32_t)N : (uint32_t)N * 4u;
+                REG32(GEMM_M_LEN)    = (uint32_t)M;
+                REG32(GEMM_G_CONV)   = (uint32_t)k | ((uint32_t)stride << 4) | ((uint32_t)pad << 8)
+                                     | ((uint32_t)(p0 / k) << 12) | ((uint32_t)(p0 % k) << 16)
+                                     | ((uint32_t)pc << 20);
+                REG32(GEMM_W_ADDR)   = (uint32_t)(uintptr_t)(wt + (size_t)p0 * C);
+                REG32(GEMM_K_LEN)    = (uint32_t)(pc * C);
             }
             REG32(GEMM_G_START) = ((uint32_t)(n0 / ow) << 16) | (uint32_t)(n0 % ow);
             REG32(GEMM_C_ADDR)  = onchip ? (uint32_t)n0 : (uint32_t)(uintptr_t)(dst + n0);
@@ -703,6 +726,39 @@ int dav2_accel_conv(const int16_t *img, int h, int w, int C, int k, int stride,
 
 int dav2_accel_w16_ok(void) { return dav2_accel_init() && accel_w16_ok; }
 int dav2_accel_wsh_ok(void) { return dav2_accel_init() && accel_w16_ok && accel_wsh_ok; }
+int dav2_accel_lerp_ok(void) { return dav2_accel_init() && accel_lerp_ok; }
+
+int dav2_accel_lerp_async(const int16_t *t, uint32_t row_stride, int16_t *out, int n, int w)
+{
+    if (!dav2_accel_init() || !accel_lerp_ok)
+        return 0;
+    if (n < 4 || (n & 3) || (unsigned)n > accel_kmax || w < 0 || w > 255
+        || row_stride == 0 || (row_stride & 3u)
+        || ((((uintptr_t)t) | ((uintptr_t)out)) & 3u))
+        return 0;
+    if (!dav2_accel_finish())
+        return 0;
+    /* an older block would read this as a GEMM of two rows and one weight
+     * row read from t, writing two words to out: harmless */
+    REG32(GEMM_A_ADDR)   = (uint32_t)(uintptr_t)t;
+    REG32(GEMM_A_STRIDE) = row_stride;
+    REG32(GEMM_W_ADDR)   = (uint32_t)(uintptr_t)t;
+    REG32(GEMM_W_STRIDE) = 0u;
+    REG32(GEMM_C_ADDR)   = (uint32_t)(uintptr_t)out;
+    REG32(GEMM_C_STRIDE) = 0u;
+    REG32(GEMM_S_ADDR)   = 0u;
+    REG32(GEMM_K_LEN)    = (uint32_t)n;
+    REG32(GEMM_M_LEN)    = 1u;
+    REG32(GEMM_N_ROWS)   = 2u;
+    REG32(GEMM_ADD_MX)   = (uint32_t)w;
+    REG32(GEMM_CTRL)     = CTRL_START | CTRL_LERP;
+    accel_defer = 1;
+    const int r = accel_maybe_defer(1, (unsigned long)n + (unsigned long)n / 2u, 0) ? 2 : 1;
+    accel_defer = 0;
+    if (r == 1 && !accel_wait_simple("lerp"))
+        return 0;
+    return r;
+}
 int dav2_accel_lutint_ok(void) { return dav2_accel_init() && accel_lut_ok && accel_lutint_ok; }
 
 int dav2_accel_gemm16_shift_async(const int16_t *a, uint32_t a_stride,
@@ -1411,6 +1467,35 @@ static int accel_check_ostats(void)
     return 0;
 }
 
+/* LERP job (CTRL.lerp): two rows of 64 int16, w = 77, against the CPU. An
+ * older block runs a harmless two-row GEMM instead, and this finds out. */
+static int accel_check_lerp(void)
+{
+    enum { K = 64 };
+    int16_t *t = chk_a, *bt = chk_a + K, *out = chk_a + 4 * K;
+    uint32_t seed = 0x3c6ef372u;
+    for (int i = 0; i < 2 * K; i++)
+        t[i] = (int16_t)((int32_t)(chk_rand(&seed) % 16383u) - 8191);
+    for (int i = 0; i < K; i++)
+        out[i] = 0x5555;
+    accel_lerp_ok = 1;
+    if (!dav2_accel_lerp_async(t, K * 2u, out, K, 77) || !dav2_accel_finish()) {
+        accel_lerp_ok = 0;
+        return 0;
+    }
+    int bad = 0;
+    for (int i = 0; i < K; i++)
+        if (out[i] != (int16_t)(((int32_t)t[i] * (256 - 77) + (int32_t)bt[i] * 77) >> 8))
+            bad++;
+    if (bad) {
+        accel_lerp_ok = 0;
+        printf("GEMM accelerator: LERP job not present (%d), interpolation on the CPU\n", bad);
+    } else {
+        printf("GEMM accelerator: LERP self-test ok\n");
+    }
+    return 0;
+}
+
 /* Output row sums (CTRL.osums): an int32 20 x 8 requantisation, each row's
  * {max, min}, sum and sum of squares against the output itself. */
 static int accel_check_osums(void)
@@ -1667,6 +1752,8 @@ int dav2_accel_check(void)
     if (!bad)
         bad = accel_check_osums();
     if (!bad)
+        bad = accel_check_lerp();
+    if (!bad)
         bad = accel_check_onchip();
     return bad;
 }
@@ -1759,6 +1846,9 @@ int dav2_accel_conv_async(const int16_t *img, int h, int w, int C, int k, int st
 }
 int dav2_accel_grelu_ok(void) { return 0; }
 int dav2_accel_wsh_ok(void) { return 0; }
+int dav2_accel_lerp_ok(void) { return 0; }
+int dav2_accel_lerp_async(const int16_t *t, uint32_t row_stride, int16_t *out, int n, int w)
+{ (void)t;(void)row_stride;(void)out;(void)n;(void)w; return 0; }
 int dav2_accel_lutint_ok(void) { return 0; }
 int dav2_accel_gemm16_shift_async(const int16_t *a, uint32_t a_stride,
                                   const int16_t *w, uint32_t w_stride, int wsh,

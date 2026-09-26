@@ -62,7 +62,7 @@ int putchar(int c) { return c; }
  *        output one element per cycle, N*M/2 words written. */
 #define BEAT 21                         /* tenths of a cycle per bus word */
 static uint64_t busy_until;
-enum { K_GEMM_ENC, K_GEMM_CONV, K_ATT, K_RQ, K_RQ_ADD, K_RQ16, K_RQ_CTX, K_RQ_EXP, K_N };
+enum { K_GEMM_ENC, K_GEMM_CONV, K_ATT, K_RQ, K_RQ_ADD, K_RQ16, K_RQ_CTX, K_RQ_EXP, K_LERP, K_N };
 static uint64_t acc_time[K_N];          /* modelled job time by kind, reported at the end */
 static void wait_done(void)
 {
@@ -158,6 +158,15 @@ int dav2_accel_grelu_ok(void) { return GRELU_C; }
 #define WSH_C 1                         /* CTRL.wsh and CTRL.lutint (round 22) */
 #endif
 int dav2_accel_wsh_ok(void) { return WSH_C; }
+#ifndef LERP_C
+#define LERP_C 1                        /* the LERP job, CTRL.lerp (round 27) */
+#endif
+int dav2_accel_lerp_ok(void) { return LERP_C; }
+/* two rows of n int16 read (n words), n/2 words written, at the bus rate */
+int dav2_accel_lerp_async(const int16_t *t, uint32_t row_stride, int16_t *out, int n, int w)
+{ (void)t;(void)row_stride;(void)out;(void)w;
+  if (!LERP_C) return 0;
+  job_kind = K_LERP; start_job((uint64_t)(n + n / 2) * BEAT / 10 + 20); return 2; }
 int dav2_accel_lutint_ok(void) { return WSH_C; }
 int dav2_accel_gemm16_shift_async(const int16_t *a, uint32_t as, const int16_t *w, uint32_t ws,
                                   int wsh, int32_t *acc, int N, int K, int M, int32_t *st)

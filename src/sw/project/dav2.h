@@ -175,6 +175,9 @@ void dav2_interpolate(const dav2_tensor_t *in, int h, int w,
  * a job; qgemm_impl completes it before anything else reads the input. */
 typedef struct dav2_producer {
     int (*step)(struct dav2_producer *p);   /* make the next part; 0 when all is made */
+    /* optional: make at least npix, where the producer may run jobs of its
+     * own on the accelerator (then step does only CPU work in the waits) */
+    void (*need)(struct dav2_producer *p, int npix);
     int done_pix;                           /* input pixels (tensor rows) made so far */
     int total_pix;
 } dav2_producer_t;
@@ -233,6 +236,10 @@ typedef struct {
     int hrow[2];
     size_t rowlen;
     int i;                                      /* next output row */
+    /* with the LERP job: all horizontal rows (h + 1, the last one spare),
+     * the next one to make, and the job's chunk of a row */
+    int16_t *H;
+    int hs, chunk;
 } dav2_interp_t;
 int dav2_interp_begin(dav2_interp_t *s, const dav2_tensor_t *in, int h, int w,
                       int oh, int ow, dav2_tensor_t *out);

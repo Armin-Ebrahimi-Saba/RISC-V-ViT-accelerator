@@ -168,6 +168,8 @@ module student_gemm #(
   logic start_greuse;
   assign start_greuse  = reg2hw.ctrl.greuse.q;    // gather: reuse the left taps
   logic start_grelu;
+  logic start_lerp;
+  assign start_lerp    = reg2hw.ctrl.lerp.q;      // GEMM-type job: LERP instead
   assign start_grelu   = reg2hw.ctrl.grelu.q;     // gather: ReLU on the image    // GEMM job: A tile via the gather walkers
   logic start_add, start_relu;
   assign start_add     = reg2hw.ctrl.add.q;       // requant job: add a residual
@@ -233,6 +235,7 @@ module student_gemm #(
   logic [15:0]    g_cwords;                  // beats per kernel position
   logic           greuse_q;                  // CTRL.greuse, sampled at start
   logic           grelu_q;                   // CTRL.grelu, sampled at start
+  logic           lerp_q;                    // CTRL.lerp: a LERP job
   logic           g_reuse_ok;                // tap reuse applies to this job
   logic           gw_inb;                    // writer: current position in bounds
   logic           gi_handover;               // issuer: a run is ready for the read engine
@@ -253,7 +256,8 @@ module student_gemm #(
     RQ_LOAD_X,     // residual chunk -> upper half of tile RAM (CTRL.add)
     RQ_OUT,         // stream int16 pairs out
     RQ_LOAD_L,     // lookup table -> LUT RAM (CTRL.lut_load)
-    RQ_STATS      // output row statistics -> S_ADDR (CTRL.ostats)
+    RQ_STATS,     // output row statistics -> S_ADDR (CTRL.ostats)
+    ST_LERP       // LERP job: the two tile rows, interpolated, out (CTRL.lerp)
   } state_e;
 
   state_e state_q, state_d;  // state_q: current state (registered); state_d: next state
@@ -315,12 +319,17 @@ module student_gemm #(
   logic         drain_wr_req, rq_wr_req;
   logic [31:0]  drain_wr_addr, drain_wr_data, rq_wr_addr, rq_wr_data;
   logic         os_wr_req;
+  logic         lp_wr_req, lp_done;    // ST_LERP: a word to write, the last one issued
+  logic [31:0]  lp_wr_addr, lp_wr_data;
   logic [31:0]  os_wr_addr, os_wr_data;   // RQ_STATS: one word per output row
   logic [NRW+1:0] os_t_q, os_nw;         // RQ_STATS: word written, words owed
   logic           os_busy;               // row sums still in their pipeline
-  assign wr_req  = (state_q == RQ_OUT) ? rq_wr_req : (state_q == RQ_STATS) ? os_wr_req : drain_wr_req;
-  assign wr_addr = (state_q == RQ_OUT) ? rq_wr_addr : (state_q == RQ_STATS) ? os_wr_addr : drain_wr_addr;
-  assign wr_data = (state_q == RQ_OUT) ? rq_wr_data : (state_q == RQ_STATS) ? os_wr_data : drain_wr_data;
+  assign wr_req  = (state_q == RQ_OUT) ? rq_wr_req : (state_q == RQ_STATS) ? os_wr_req
+                 : (state_q == ST_LERP) ? lp_wr_req : drain_wr_req;
+  assign wr_addr = (state_q == RQ_OUT) ? rq_wr_addr : (state_q == RQ_STATS) ? os_wr_addr
+                 : (state_q == ST_LERP) ? lp_wr_addr : drain_wr_addr;
+  assign wr_data = (state_q == RQ_OUT) ? rq_wr_data : (state_q == RQ_STATS) ? os_wr_data
+                 : (state_q == ST_LERP) ? lp_wr_data : drain_wr_data;
   logic [CW-1:0] wr_out_q;      // writes issued without an ack yet
   logic [SW-1:0] wr_src_q;      // a_source to tag the next write with (cycles through OUTSTANDING slots)
 
@@ -607,7 +616,9 @@ module student_gemm #(
   // cycle after (rq_xcyc_q); no element enters on that second cycle.
   logic          rq_xcyc_q;
   logic [AW-1:0] rq_xaddr_q;
+  logic [AW:0]   lp_j_q;           // ST_LERP: the output word
   assign a_rd_addr = (state_q == RQ_OUT)    ? (rq_xcyc_q ? rq_xaddr_q : rq_m_q)
+                   : (state_q == ST_LERP)   ? lp_j_q[AW-1:0]                // LERP: word j of both rows
                    : (state_q == ST_LOAD_A) ? a_ld_word_q + AW'(g_cwords)   // gather copy source
                                             : AW'(kcnt_q >> 1);
 
@@ -759,7 +770,8 @@ module student_gemm #(
                      state_d = !start_requant ? ST_LOAD_A
                              : start_lut_load ? RQ_LOAD_L : RQ_LOAD_P;
       RQ_LOAD_L:   if (lut_ld_done)      state_d = RQ_LOAD_P;
-      ST_LOAD_A:   if (a_load_done)              state_d = ST_MAC;       // tile fully loaded
+      ST_LOAD_A:   if (a_load_done)              state_d = lerp_q ? ST_LERP : ST_MAC;       // tile fully loaded
+      ST_LERP:     if (lp_done)                  state_d = ST_FINISH;   // LERP: last word issued
       ST_MAC:      if (klast)                    state_d = ST_MAC_TAIL; // W row fully streamed
       ST_MAC_TAIL: if (pipe_idle)                state_d = ST_DRAIN;    // pipeline flushed
       ST_DRAIN:    if (t_q == n_wr)                                     // row's outputs all issued
@@ -809,6 +821,7 @@ module student_gemm #(
       onchip_q <= 1'b0;
       greuse_q <= 1'b0;
       grelu_q  <= 1'b0;
+      lerp_q   <= 1'b0;
       // rq_m_q, rq_p_cnt_q and lut_cnt_q have no reset: they address block
       // RAMs (an asynchronous reset there is DRC REQP-1840), and every job
       // sets them before use.
@@ -931,6 +944,7 @@ module student_gemm #(
             onchip_q   <= start_onchip;
             greuse_q   <= start_greuse & start_gather & ~start_requant;
             grelu_q    <= start_grelu & start_gather & ~start_requant;
+            lerp_q     <= start_lerp & ~start_gather & ~start_requant;
             p_addr_q   <= reg2hw.p_addr.q;
             lut_cnt_q  <= '0;
             x_addr_q   <= reg2hw.x_addr.q;
@@ -1016,7 +1030,7 @@ module student_gemm #(
             rd_stride_q    <= 32'(g_cwords) * 32'd4;
             rd_left_q      <= 32'(g_cwords);
           end
-          if (a_load_done) begin
+          if (a_load_done && !lerp_q) begin   // a LERP job reads no weights
             // Reprogram the read engine for the weight stream: M rows of
             // K/4 beats, read exactly once for the whole tile.
             rd_addr_q      <= w_addr_q;
@@ -1697,6 +1711,39 @@ module student_gemm #(
         default: os_wr_data = {24'd0, os_sqh_ram[os_row]};
       endcase
   end
+  // LERP job (CTRL.lerp): word j of tile rows 0 (top) and 1 (bottom) is
+  // read (phase 0) and, a cycle later, its interpolation written (phase
+  // 1); the next word follows the write's acceptance. Two words per bus
+  // word at most, the bus's rate anyway. Per int16 lane
+  // t + (((b - t) * w) >>> 8), which is (t (256 - w) + b w) >> 8 exactly
+  // since 256 t is a multiple of 256. The small multiplies are in logic.
+  logic               lp_ph_q;
+  logic signed [16:0] lp_d0, lp_d1;
+  (* use_dsp = "no" *) logic signed [26:0] lp_p0, lp_p1;
+  assign lp_d0 = 17'($signed(a_q[1][15:0]))  - 17'($signed(a_q[0][15:0]));
+  assign lp_d1 = 17'($signed(a_q[1][31:16])) - 17'($signed(a_q[0][31:16]));
+  assign lp_p0 = lp_d0 * $signed({1'b0, add_mx_q[8:0]});
+  assign lp_p1 = lp_d1 * $signed({1'b0, add_mx_q[8:0]});
+  assign lp_wr_data = {16'($signed(a_q[0][31:16]) + 16'(lp_p1 >>> 8)),
+                       16'($signed(a_q[0][15:0])  + 16'(lp_p0 >>> 8))};
+  assign lp_wr_req  = (state_q == ST_LERP) & lp_ph_q;
+  assign lp_wr_addr = c_ptr_q + {lp_j_q[AW-1:0], 2'b00};
+  assign lp_done    = lp_wr_req & issue_wr & (lp_j_q == {1'b0, k_words - 1'b1});
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      lp_j_q  <= '0;
+      lp_ph_q <= 1'b0;
+    end else if (state_q != ST_LERP) begin
+      lp_j_q  <= '0;
+      lp_ph_q <= 1'b0;
+    end else if (!lp_ph_q) begin
+      lp_ph_q <= 1'b1;
+    end else if (issue_wr) begin
+      lp_j_q  <= lp_j_q + 1'b1;
+      lp_ph_q <= 1'b0;
+    end
+  end
+
   // Result RAM (CTRL.onchip). The drain writes accumulator t of weight row
   // m at C_ADDR + m*C_STRIDE + t (words); a requantisation job reads its
   // chunk at A_ADDR + m*A_STRIDE + n, one word per cycle, into the tile

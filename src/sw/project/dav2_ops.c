@@ -515,6 +515,10 @@ void dav2_producer_need(int npix)
         return;
     if (npix > p->total_pix)
         npix = p->total_pix;
+    if (p->need) {
+        p->need(p, npix);
+        return;
+    }
     while (p->done_pix < npix && p->step(p))
         ;
 }
@@ -529,8 +533,8 @@ int dav2_producer_idle(void)
     return 0;                     /* test: rows only through dav2_producer_need */
 #endif
     dav2_producer_t *p = g_producer;
-    if (p && p->done_pix < p->total_pix)
-        return p->step(p), 1;
+    if (p && p->done_pix < p->total_pix && p->step(p))
+        return 1;
     p = g_background;
     return p && p->done_pix < p->total_pix && (p->step(p), 1);
 }
@@ -553,7 +557,9 @@ void dav2_background_complete(void)
 void dav2_producer_complete(void)
 {
     dav2_producer_t *p = g_producer;
-    if (p)
+    if (p && p->need)
+        p->need(p, p->total_pix);
+    else if (p)
         while (p->done_pix < p->total_pix && p->step(p))
             ;
 }
@@ -2214,6 +2220,54 @@ static int interp_step(dav2_producer_t *pr)
     return s->i < oh;
 }
 
+/* ---- the interpolation with the LERP job (CTRL.lerp)
+ *
+ * The CPU makes the horizontal rows, all of them into H, in the waits
+ * (interp_lerp_step); an output row i is the block's LERP of H[y0] and
+ * the row after it with weight wy (interp_lerp_need, run where the driver
+ * may start jobs: before a tile). The same numbers: the job computes
+ * t + ((b - t) wy >> 8), which is (t (256 - wy) + b wy) >> 8. */
+static int interp_lerp_step(dav2_producer_t *pr)
+{
+    dav2_interp_t *s = (dav2_interp_t *)pr;
+    if (s->hs >= s->h)
+        return 0;
+    const uint64_t t0 = dav2_cycles();
+    interp_row_h(s->in->v + (size_t)s->hs * s->w * s->C, s->C, s->ow, s->x0a, s->x1a,
+                 s->wxa, s->H + (size_t)s->hs * s->rowlen, s->wide);
+    s->hs++;
+    dav2_prof_add(DAV2_PROF_INTERP, dav2_cycles() - t0);
+    dav2_producer_cycles += dav2_cycles() - t0;
+    return 1;
+}
+
+static void interp_lerp_need(dav2_producer_t *pr, int npix)
+{
+    dav2_interp_t *s = (dav2_interp_t *)pr;
+    int rows = (npix + s->ow - 1) / s->ow;
+    if (rows > s->oh) rows = s->oh;
+    const size_t rowlen = s->rowlen;
+    while (s->i < rows) {
+        const int i = s->i, y0 = s->y0a[i], y1 = s->y1a[i], wy = s->wya[i];
+        while (s->hs <= y1 && interp_lerp_step(pr))
+            ;
+        const int16_t *t = s->H + (size_t)y0 * rowlen;
+        const int16_t *b = t + rowlen;              /* y0 + 1 (spare row if wy = 0) */
+        int16_t *o = s->out->v + (size_t)i * rowlen;
+        for (size_t off = 0; off < rowlen; off += (size_t)s->chunk) {
+            const int n = rowlen - off < (size_t)s->chunk ? (int)(rowlen - off) : s->chunk;
+            if (dav2_accel_lerp_async(t + off, (uint32_t)rowlen * 2u, o + off, n, wy)
+                && dav2_accel_finish())
+                continue;
+            /* declined or failed: this chunk on the CPU */
+            for (int e = 0; e < n; e++)
+                o[off + e] = (int16_t)((t[off + e] * (256 - wy) + b[off + e] * wy) >> 8);
+        }
+        s->i++;
+        pr->done_pix = s->i * s->ow;
+    }
+}
+
 int dav2_interp_begin(dav2_interp_t *s, const dav2_tensor_t *in, int h, int w,
                       int oh, int ow, dav2_tensor_t *out)
 {
@@ -2283,6 +2337,21 @@ int dav2_interp_begin(dav2_interp_t *s, const dav2_tensor_t *in, int h, int w,
      * result as computing all four terms per output element; about half
      * the work for the 2x upsamplings of the DPT head. Two channels per
      * 32-bit word where C and the buffers allow it. */
+
+    /* With the LERP job: all horizontal rows in H (one spare row), a row
+     * in chunks of at most 2048 int16, multiples of 4 */
+    if (dav2_accel_lerp_ok() && s->wide && (s->rowlen & 3u) == 0) {
+        const size_t mark = dav2_arena_mark();
+        s->H = (int16_t *)dav2_arena_alloc((size_t)(h + 1) * s->rowlen * sizeof(int16_t));
+        if (s->H) {
+            const int nch = (int)((s->rowlen + 2047) / 2048);
+            s->chunk = (int)(((s->rowlen + nch - 1) / nch + 3) & ~(size_t)3);
+            s->base.step = interp_lerp_step;
+            s->base.need = interp_lerp_need;
+        } else {
+            dav2_arena_release(mark);
+        }
+    }
     return 1;
 }
 
@@ -2291,9 +2360,13 @@ void dav2_interpolate(const dav2_tensor_t *in, int h, int w,
 {
     const size_t mark = dav2_arena_mark();
     dav2_interp_t s;
-    if (dav2_interp_begin(&s, in, h, w, oh, ow, out))
-        while (interp_step(&s.base))
-            ;
+    if (dav2_interp_begin(&s, in, h, w, oh, ow, out)) {
+        if (s.base.need)
+            s.base.need(&s.base, s.base.total_pix);
+        else
+            while (interp_step(&s.base))
+                ;
+    }
     dav2_arena_release(mark);
 }
 
