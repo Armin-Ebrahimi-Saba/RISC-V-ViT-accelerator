@@ -232,6 +232,11 @@ int dav2_accel_requant_lut_async(const int32_t *acc, int N, int M, const int32_t
   job_kind = K_RQ_EXP;
   start_job(requant_cycles(N, M, 0, 0) + (lut_load ? 8192u * BEAT / 10 : 0));
   return 2; }
+int dav2_accel_requant_stride_async(const int32_t *acc, int N, int M, const int32_t *params,
+                                    int16_t *out, int out_stride)
+{ (void)acc;(void)params;(void)out;(void)out_stride;
+  onchip_last = 0;
+  job_kind = K_RQ_CTX; start_job(requant_cycles(N, M, 0, 0)); return 2; }
 int dav2_accel_requant_stride(const int32_t *acc, int N, int M, const int32_t *params,
                               int16_t *out, int out_stride, int32_t *amax)
 { (void)acc;(void)params;(void)out;(void)out_stride;

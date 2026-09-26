@@ -80,6 +80,9 @@ int dav2_accel_requant_lut_async(const int32_t *acc, int N, int M, const int32_t
                                  int16_t *out, int out_stride, const int16_t *lut, int lut_load)
 { (void)acc;(void)N;(void)M;(void)params;(void)out;(void)out_stride;(void)lut;(void)lut_load;
   return 0; }
+int dav2_accel_requant_stride_async(const int32_t *acc, int N, int M, const int32_t *params,
+                                    int16_t *out, int out_stride)
+{ (void)acc;(void)N;(void)M;(void)params;(void)out;(void)out_stride; return 0; }
 int dav2_accel_requant_stride(const int32_t *acc, int N, int M, const int32_t *params,
                               int16_t *out, int out_stride, int32_t *amax)
 { (void)acc;(void)params;(void)out;(void)out_stride; MMIO[6] = (uint32_t)(3 * N * M); *amax = 8000; return 1; }

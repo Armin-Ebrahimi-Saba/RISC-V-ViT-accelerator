@@ -437,9 +437,11 @@ static int attn_softmax_accel_start(const dav2_tensor_t *qkv, int n, attn_bufs_t
     return dav2_accel_requant_lut_async(b->s, n, n, b->epar, b->pt, Kp, g_exp_lut, lut_load) != 0;
 }
 
-/* P (b->p16) from the exponential job's P^T, which the caller has
- * collected (dav2_accel_finish) */
-static void attn_softmax_accel_finish(int n, attn_bufs_t *b)
+/* P (b->p16) from the exponential job's P^T (b->pt), which the caller has
+ * collected (dav2_accel_finish), in two parts: each query's sum
+ * (attn_softmax_accel_sums), then P (attn_softmax_accel_norm); the next
+ * head's exponential job can run in between. */
+static void attn_softmax_accel_sums(int n, attn_bufs_t *b)
 {
     const int Kp = (n + 3) & ~3;
 
@@ -473,12 +475,21 @@ static void attn_softmax_accel_finish(int n, attn_bufs_t *b)
             sum[2 * (w0 + i) + 1] = H[i];
         }
     }
+}
+
+/* queries q_lo .. q_hi - 1 (both even) */
+static void attn_softmax_accel_norm(int n, attn_bufs_t *b, int q_lo, int q_hi)
+{
+    const int Kp = (n + 3) & ~3;
+    const int Kw = Kp / 2;                       /* P^T row in words */
+    const uint32_t *sum = b->psum;
+    const uint32_t *ptw = (const uint32_t *)b->pt;
     /* P[q][key] = round(p * 2^15 / sum), two queries and two keys per step
      * (two words of P^T in, one word to each of two rows of P out). With
      * inv = (2^31 - 2^16) / sum, p inv + 2^15 < 2^31 since p <= sum, so
      * q <= 32767 without a clamp; attn_softmax rounds inv to nearest, which
      * differs by at most one unit of q. */
-    for (int q = 0; q < n; q += 2) {
+    for (int q = q_lo; q < q_hi; q += 2) {
         const uint32_t s0 = sum[q] ? sum[q] : 1u, s1 = sum[q + 1] ? sum[q + 1] : 1u;
         const uint32_t i0 = (0x80000000u - 0x10000u) / s0, i1 = (0x80000000u - 0x10000u) / s1;
         const uint32_t *col = ptw + q / 2;
@@ -644,12 +655,9 @@ static void gemm16_finish(const int16_t *a, int a_stride, const int16_t *w, int 
 
 /* ctx[t][head*HD + d] = round(c[d][t] / 2^15), saturated: the requantisation
  * job writes the head's slice of ctx directly (rows ED apart), or the CPU. */
-static void attn_context16(int head, int n, attn_bufs_t *b, dav2_tensor_t *ctx)
+static void attn_context16_cpu(int head, int n, attn_bufs_t *b, dav2_tensor_t *ctx)
 {
     const int HD = DAV2_HEAD_DIM, ED = DAV2_EMBED_DIM;
-    int32_t amax;
-    if (dav2_accel_requant_stride(b->c, n, HD, b->cpar, ctx->v + head * HD, ED, &amax))
-        return;
     for (int t = 0; t < n; t++) {
         int16_t *o = ctx->v + (size_t)t * ED + head * HD;
         for (int d = 0; d < HD; d++) {
@@ -659,6 +667,18 @@ static void attn_context16(int head, int n, attn_bufs_t *b, dav2_tensor_t *ctx)
             o[d] = (int16_t)r;
         }
     }
+}
+
+/* 1 when the requantisation job was started (collect it with
+ * dav2_accel_finish; on failure attn_context16_cpu, b->c is intact), 0
+ * when it was declined and the CPU has done it */
+static int attn_context16_start(int head, int n, attn_bufs_t *b, dav2_tensor_t *ctx)
+{
+    const int HD = DAV2_HEAD_DIM, ED = DAV2_EMBED_DIM;
+    if (dav2_accel_requant_stride_async(b->c, n, HD, b->cpar, ctx->v + head * HD, ED))
+        return 1;
+    attn_context16_cpu(head, n, b, ctx);
+    return 0;
 }
 
 /* The heads with int16 weights: two GEMMs per head instead of four, no
@@ -699,6 +719,7 @@ static void attention_all16(const dav2_tensor_t *qkv, int n, dav2_tensor_t *ctx)
     int32_t *s2[2] = { b.s, (int32_t *)dav2_arena_alloc((size_t)n * n * sizeof(int32_t)) };
     int32_t *st2[2] = { b.sst, (int32_t *)dav2_arena_alloc((size_t)n * 2 * sizeof(int32_t)) };
     int16_t *vt2[2] = { b.vt16, (int16_t *)dav2_arena_alloc((size_t)HD * Kp * sizeof(int16_t)) };
+    int16_t *pt2[2] = { b.pt, (int16_t *)dav2_arena_alloc((size_t)n * Kp * sizeof(int16_t)) };
     int qsh2[2] = { 0, 0 };
     if (dav2_arena_failed) { dav2_arena_release(mark); return; }
 
@@ -725,46 +746,77 @@ static void attention_all16(const dav2_tensor_t *qkv, int n, dav2_tensor_t *ctx)
     attn_prep_vt16(qkv, 0, n, &b);
     LAP(DAV2_SUB_ATT_PREP_V);
     S_FINISH(0);
-    b.s = s2[0]; b.sst = st2[0];
-    int exp_on = attn_softmax_accel_start(qkv, n, &b, !lut_loaded);
-    if (exp_on) lut_loaded = 1;
+    b.s = s2[0]; b.sst = st2[0]; b.pt = pt2[0];
+    int exp_ok = attn_softmax_accel_start(qkv, n, &b, !lut_loaded);
+    if (exp_ok) lut_loaded = 1;
+    exp_ok = exp_ok && dav2_accel_finish();
+    if (exp_ok)
+        attn_softmax_accel_sums(n, &b);
     LAP(DAV2_SUB_ATT_WAIT);
+#define HEAD_BUFS(h) do { b.s = s2[(h) & 1]; b.sst = st2[(h) & 1]; b.pt = pt2[(h) & 1]; } while (0)
+    /* Per head h, with head h's sums made and head h+1 prepared in turn:
+     *   CPU                           block
+     *   v^T of head h+1               context requantisation of head h-1
+     *   first half of head h's P      scores of head h+1
+     *   second half of head h's P     exponential job of head h+1
+     *   head h+1's sums               context GEMM of head h
+     * The context requantisation of head h-1 is collected before head h's
+     * context GEMM overwrites its input (on a failure the CPU does it). */
+    int ctx_pending = 0;
+    const int half = (n / 2) & ~1;
     for (int h = 0; h < DAV2_N_HEADS; h++) {
         const int nx = h + 1 < DAV2_N_HEADS;
-        /* this head's P: from the exponential job, collected here, or on
-         * the CPU; meanwhile the block computes the next head's scores */
-        b.s = s2[h & 1]; b.sst = st2[h & 1];
-        const int exp_ok = exp_on && dav2_accel_finish();
-        if (nx) S_START(h + 1);
-        if (exp_ok) {
-            attn_softmax_accel_finish(n, &b);
-        } else {
-            /* no exponential job, or it failed (S is intact in DDR3) */
-            b.s = s2[h & 1]; b.sst = st2[h & 1];
-            attn_softmax(qkv, n, &b);
-        }
-        LAP(DAV2_SUB_ATT_SOFTMAX);
-        if (nx) S_FINISH(h + 1);
-        LAP(DAV2_SUB_ATT_WAIT);
-        /* C[d][t] = sum_m P[t][m] v[m][d]; the next head's v^T meanwhile */
-        gemm16_start(b.p16, Kp, vt2[h & 1], Kp, b.c, n, Kp, HD, 0, 0);
-        LAP(DAV2_SUB_ATT_WAIT);
         if (nx) {
             b.vt16 = vt2[(h + 1) & 1];
             attn_prep_vt16(qkv, h + 1, n, &b);
         }
         LAP(DAV2_SUB_ATT_PREP_V);
-        gemm16_finish(b.p16, Kp, vt2[h & 1], Kp, b.c, n, Kp, HD, 0, 0);
-        LAP(DAV2_SUB_ATT_WAIT);
-        attn_context16(h, n, &b, ctx);
+        if (ctx_pending && !dav2_accel_finish())
+            attn_context16_cpu(h - 1, n, &b, ctx);   /* b.c is still head h-1's */
+        ctx_pending = 0;
         LAP(DAV2_SUB_ATT_NORM);
+        if (nx) S_START(h + 1);
+        HEAD_BUFS(h);
+        if (exp_ok)
+            attn_softmax_accel_norm(n, &b, 0, half);
+        LAP(DAV2_SUB_ATT_SOFTMAX);
+        int exp_next = 0;
         if (nx) {
-            b.s = s2[(h + 1) & 1]; b.sst = st2[(h + 1) & 1];
-            exp_on = attn_softmax_accel_start(qkv, n, &b, !lut_loaded);
-            if (exp_on) lut_loaded = 1;
+            S_FINISH(h + 1);
+            HEAD_BUFS(h + 1);
+            exp_next = attn_softmax_accel_start(qkv, n, &b, !lut_loaded);
+            if (exp_next) lut_loaded = 1;
         }
         LAP(DAV2_SUB_ATT_WAIT);
+        HEAD_BUFS(h);
+        if (exp_ok)
+            attn_softmax_accel_norm(n, &b, half, n);
+        else
+            attn_softmax(qkv, n, &b);   /* no exponential job, or it failed */
+        LAP(DAV2_SUB_ATT_SOFTMAX);
+        /* the next head's exponential job, collected before the context
+         * GEMM so that a failure is known (then that head's softmax runs
+         * on the CPU; its S is intact in DDR3) */
+        exp_next = exp_next && dav2_accel_finish();
+        LAP(DAV2_SUB_ATT_WAIT);
+        /* C[d][t] = sum_m P[t][m] v[m][d]; the next head's sums meanwhile */
+        gemm16_start(b.p16, Kp, vt2[h & 1], Kp, b.c, n, Kp, HD, 0, 0);
+        LAP(DAV2_SUB_ATT_WAIT);
+        if (exp_next) {
+            HEAD_BUFS(h + 1);
+            attn_softmax_accel_sums(n, &b);
+        }
+        LAP(DAV2_SUB_ATT_SOFTMAX);
+        gemm16_finish(b.p16, Kp, vt2[h & 1], Kp, b.c, n, Kp, HD, 0, 0);
+        LAP(DAV2_SUB_ATT_WAIT);
+        ctx_pending = attn_context16_start(h, n, &b, ctx);
+        LAP(DAV2_SUB_ATT_NORM);
+        exp_ok = exp_next;
     }
+    if (ctx_pending && !dav2_accel_finish())
+        attn_context16_cpu(DAV2_N_HEADS - 1, n, &b, ctx);
+    LAP(DAV2_SUB_ATT_NORM);
+#undef HEAD_BUFS
 #undef S_START
 #undef S_FINISH
 #undef Q_W

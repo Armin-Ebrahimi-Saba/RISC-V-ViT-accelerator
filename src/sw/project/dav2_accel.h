@@ -187,6 +187,10 @@ int dav2_accel_lutint_ok(void);
  * M): writes into a slice of a wider tensor. */
 int dav2_accel_requant_stride(const int32_t *acc, int N, int M, const int32_t *params,
                               int16_t *out, int out_stride, int32_t *amax);
+/* the same, one chunk (M <= CAPS.KMAX/2), left running: collect it with
+ * dav2_accel_finish; 0 when declined */
+int dav2_accel_requant_stride_async(const int32_t *acc, int N, int M, const int32_t *params,
+                                    int16_t *out, int out_stride);
 int dav2_accel_requant16(const int16_t *in, int N, int M, const int32_t *params,
                          int16_t *out, int32_t *amax, uint32_t *ostats);
 /* Requantisation through the lookup table (CTRL.lut, CAPS bit 24):

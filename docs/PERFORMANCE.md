@@ -1,4 +1,4 @@
-# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 1.64 s (estimated)
+# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 1.61 s (estimated)
 
 This is the record of the speed-up work: what was measured, what each change
 did, and what is left. Every step kept the FPGA output **bit-exact with the
@@ -1138,6 +1138,35 @@ result.
 
 Model: 88.0 → 85.3 Mcycles per frame, **about 1.64 s** (1.71 s, less the
 model's 4 %).
+
+### Round twenty-four — a finer attention schedule (software; estimated, not yet measured)
+
+Round twenty-three overlapped the softmax pass of head h with the scores
+of head h+1, but per head the CPU still waited for the exponential job
+and for the context requantisation (synchronous). Now the work of two
+heads is interleaved:
+
+| CPU | block |
+|---|---|
+| v^T of head h+1 | context requantisation of head h−1 (now left running) |
+| first half of head h's P | scores of head h+1 |
+| second half of head h's P | exponential job of head h+1 |
+| column sums of head h+1 | context GEMM of head h |
+
+The softmax pass is split into its column sums and two halves of the
+normalisation (by queries); P^T has two buffers. The context
+requantisation is left running (`dav2_accel_requant_stride_async`) and
+collected before the next context GEMM overwrites its input; if it failed,
+the CPU makes that head's context from the intact input. The exponential
+job of head h+1 is collected before the context GEMM, so that a failure is
+known and that head's softmax runs on the CPU.
+
+Same output, bit for bit (11 images, host, emulator and the emulator of
+the older block). Bus errors injected into 25 jobs (20 of them in the first
+block's attention) all end with a valid result.
+
+Model: attention 13.8 (round twenty-two) → 10.5 Mcycles; frame 85.3 →
+83.7 Mcycles, **about 1.61 s** (1.67 s, less the model's 4 %).
 
 ## 7. What is left, in order of expected gain
 

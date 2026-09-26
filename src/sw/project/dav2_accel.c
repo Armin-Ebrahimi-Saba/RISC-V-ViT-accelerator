@@ -761,6 +761,22 @@ int dav2_accel_requant_lut_async(const int32_t *acc, int N, int M, const int32_t
     return r;
 }
 
+int dav2_accel_requant_stride_async(const int32_t *acc, int N, int M, const int32_t *params,
+                                    int16_t *out, int out_stride)
+{
+    static int32_t amax_sink;
+    if (!dav2_accel_init() || !requant_ok(acc, N, M, params, out))
+        return 0;
+    if (M > (int)(accel_kmax / 2u) || (out_stride & 1) || out_stride < M)
+        return 0;
+    accel_out_stride = out_stride;
+    accel_defer = 1;
+    int r = accel_requant_rows(acc, N, M, 0, M, params, out, &amax_sink, 0, 0);
+    accel_defer = 0;
+    accel_out_stride = 0;
+    return r;
+}
+
 int dav2_accel_requant_stride(const int32_t *acc, int N, int M, const int32_t *params,
                               int16_t *out, int out_stride, int32_t *amax)
 {
@@ -1675,6 +1691,9 @@ int  dav2_accel_requant16(const int16_t *in, int N, int M, const int32_t *params
 { (void)in; (void)N; (void)M; (void)params; (void)out; (void)amax; (void)ostats; return 0; }
 int  dav2_accel_ostats_ok(void) { return 0; }
 int  dav2_accel_osums_ok(void) { return 0; }
+int  dav2_accel_requant_stride_async(const int32_t *acc, int N, int M, const int32_t *params,
+                                     int16_t *out, int out_stride)
+{ (void)acc;(void)N;(void)M;(void)params;(void)out;(void)out_stride; return 0; }
 int  dav2_accel_requant_lut_async(const int32_t *acc, int N, int M, const int32_t *params,
                                   int16_t *out, int out_stride, const int16_t *lut,
                                   int lut_load)
