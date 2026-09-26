@@ -79,6 +79,11 @@ typedef struct {
     int16_t *q16, *vt16;
     int32_t *s, *sst, *c;
     int32_t *cpar;              /* {2^30, 45, 0} per d: (c + 2^14) >> 15 */
+    /* the exponential on the accelerator: P^T from the requantisation job
+     * ([key][query], rows Kp apart), its parameters, each query's sum */
+    int16_t *pt;
+    int32_t *epar;
+    uint32_t *psum;
 } attn_bufs_t;
 
 /* A GEMM that may be left running on the accelerator (see dav2_accel.h):
@@ -373,6 +378,122 @@ static void attn_softmax(const dav2_tensor_t *qkv, int n, attn_bufs_t *b)
 
 }
 
+/* ---- the softmax's exponential on the accelerator
+ *
+ * The score job's requantisation computes v = r(s) - r(smax) per query,
+ * r(x) = round(x kf 512 / 2^0) with the job's own rounding (multiplier and
+ * shift of kf 512, the query's bias -r(smax)), so v = 0 at the query's
+ * largest score and v <= 0 elsewhere; the block's lookup table maps v to
+ * 2^(v/512) in Q15. The job reads S[query][key] and writes P^T[key][query].
+ * The CPU then adds each query's column, and writes P[query][key] divided
+ * by that sum, as attn_softmax does. The table is the CPU's formula,
+ * exp2_tab[k & 1023] >> (k >> 10), at k = -2v: the exponent on a grid of
+ * 2^-9 (rounded) instead of 2^-10 (truncated). */
+static int16_t *g_exp_lut;        /* 16384 entries, E[v + 8192]; per frame */
+
+static void exp_lut_build(int16_t *E)
+{
+    exp2_tab_init();
+    for (int i = 0; i < 16384; i++) {
+        const int v = i - 8192;
+        int32_t p = 32767;
+        if (v <= 0) {
+            const uint32_t k = (uint32_t)(-2 * v);
+            p = k >= (16u << 10) ? 0 : (int32_t)(exp2_tab[k & 1023u] >> (k >> 10));
+            if (p > 32767) p = 32767;
+        }
+        E[i] = (int16_t)p;
+    }
+}
+
+/* round(v mult / 2^sh), half up: the requantisation job's rounding */
+static inline int32_t job_round(int32_t v, int32_t mult, int sh)
+{
+    return (int32_t)(((int64_t)v * mult + ((int64_t)1 << (sh - 1))) >> sh);
+}
+
+/* 1 when P (b->p16) was made this way, 0 to use attn_softmax */
+static int attn_softmax_accel(const dav2_tensor_t *qkv, int n, attn_bufs_t *b, int lut_load)
+{
+    const int Kp = (n + 3) & ~3;
+    if (!g_exp_lut || (n & 1))
+        return 0;
+    dav2_xf_t kf = xf_mul(qkv->scale, qkv->scale);
+    kf.sh -= b->q_sh;
+    kf = xf_mul(kf, xf_from_f32_bits(0x3fb8aa3bu));          /* * log2(e) */
+    kf.sh -= 9;                                               /* * 512 */
+    if (kf.m <= 0 || kf.sh < 1 || kf.sh > 62)
+        return 0;
+    int32_t mult; int sh;
+    xf_to_mult(kf, &mult, &sh);
+    for (int q = 0; q < n; q++) {
+        b->epar[3 * q]     = mult;
+        b->epar[3 * q + 1] = sh;
+        b->epar[3 * q + 2] = -job_round(b->sst[2 * q], mult, sh);
+    }
+    if (!dav2_accel_requant_lut_async(b->s, n, n, b->epar, b->pt, Kp, g_exp_lut, lut_load))
+        return 0;
+    if (!dav2_accel_finish())
+        return 0;                  /* the block failed: S is intact in DDR3 */
+
+    /* Each query's sum: the columns of P^T, eight queries (four words) at
+     * a time in registers. Per word w = p(q) + 2^16 p(q+1): T adds w and H
+     * adds w >> 16, then sum(q+1) = H and sum(q) = T - 2^16 H, exact since
+     * sum(q) < 2^32. */
+    const int Kw = Kp / 2;                       /* P^T row in words */
+    uint32_t *sum = b->psum;
+    const uint32_t *ptw = (const uint32_t *)b->pt;
+    for (int w0 = 0; w0 < n / 2; w0 += 4) {
+        const int nw = n / 2 - w0 < 4 ? n / 2 - w0 : 4;
+        uint32_t T0 = 0, T1 = 0, T2 = 0, T3 = 0, H0 = 0, H1 = 0, H2 = 0, H3 = 0;
+        const uint32_t *r = ptw + w0;
+        if (nw == 4) {
+            for (int key = 0; key < n; key++, r += Kw) {
+                const uint32_t a = r[0], c = r[1], d = r[2], e = r[3];
+                T0 += a; H0 += a >> 16; T1 += c; H1 += c >> 16;
+                T2 += d; H2 += d >> 16; T3 += e; H3 += e >> 16;
+            }
+        } else {
+            for (int key = 0; key < n; key++, r += Kw) {
+                T0 += r[0]; H0 += r[0] >> 16;
+                if (nw > 1) { T1 += r[1]; H1 += r[1] >> 16; }
+                if (nw > 2) { T2 += r[2]; H2 += r[2] >> 16; }
+            }
+        }
+        const uint32_t T[4] = { T0, T1, T2, T3 }, H[4] = { H0, H1, H2, H3 };
+        for (int i = 0; i < nw; i++) {
+            sum[2 * (w0 + i)]     = T[i] - (H[i] << 16);
+            sum[2 * (w0 + i) + 1] = H[i];
+        }
+    }
+    /* P[q][key] = round(p * 2^15 / sum), two queries and two keys per step
+     * (two words of P^T in, one word to each of two rows of P out). With
+     * inv = (2^31 - 2^16) / sum, p inv + 2^15 < 2^31 since p <= sum, so
+     * q <= 32767 without a clamp; attn_softmax rounds inv to nearest, which
+     * differs by at most one unit of q. */
+    for (int q = 0; q < n; q += 2) {
+        const uint32_t s0 = sum[q] ? sum[q] : 1u, s1 = sum[q + 1] ? sum[q + 1] : 1u;
+        const uint32_t i0 = (0x80000000u - 0x10000u) / s0, i1 = (0x80000000u - 0x10000u) / s1;
+        const uint32_t *col = ptw + q / 2;
+        uint32_t *r0 = (uint32_t *)(b->p16 + (size_t)q * Kp);
+        uint32_t *r1 = (uint32_t *)(b->p16 + (size_t)(q + 1) * Kp);
+        for (int key = 0; key < n; key += 2, col += 2 * Kw) {
+            const uint32_t wa = col[0], wb = col[Kw];            /* keys key, key+1 */
+            const uint32_t a0 = ((wa & 0xffffu) * i0 + 32768u) >> 16;
+            const uint32_t b0 = ((wb & 0xffffu) * i0 + 32768u) >> 16;
+            const uint32_t a1 = ((wa >> 16) * i1 + 32768u) >> 16;
+            const uint32_t b1 = ((wb >> 16) * i1 + 32768u) >> 16;
+            *r0++ = a0 | (b0 << 16);
+            *r1++ = a1 | (b1 << 16);
+        }
+        for (int m = n; m < Kp; m++) {
+            b->p16[(size_t)q * Kp + m] = 0;
+            b->p16[(size_t)(q + 1) * Kp + m] = 0;
+        }
+    }
+    return 1;
+}
+
 /* context -> ctx columns of this head. Uses dav2_scratch. */
 static void attn_normalise(int head, int n, attn_bufs_t *b, dav2_tensor_t *ctx)
 {
@@ -539,6 +660,9 @@ static void attention_all16(const dav2_tensor_t *qkv, int n, dav2_tensor_t *ctx)
     b.c    = (int32_t *)dav2_arena_alloc((size_t)HD * n * sizeof(int32_t));
     b.cpar = (int32_t *)dav2_arena_alloc((size_t)HD * 3 * sizeof(int32_t));
     b.exp2 = (uint16_t *)dav2_arena_alloc(1024 * sizeof(uint16_t));
+    b.pt   = (int16_t *)dav2_arena_alloc((size_t)n * Kp * sizeof(int16_t));
+    b.epar = (int32_t *)dav2_arena_alloc((size_t)n * 3 * sizeof(int32_t));
+    b.psum = (uint32_t *)dav2_arena_alloc((size_t)n * sizeof(uint32_t));
     if (dav2_arena_failed) { dav2_arena_release(mark); return; }
     exp2_tab_init();
     dav2_copy16((int16_t *)b.exp2, (const int16_t *)exp2_tab, 1024);
@@ -549,6 +673,7 @@ static void attention_all16(const dav2_tensor_t *qkv, int n, dav2_tensor_t *ctx)
     }
 
     uint64_t t0 = dav2_cycles(), t1;
+    int lut_loaded = 0;
 #define LAP(d) do { t1 = dav2_cycles(); dav2_sub_add((d), t1 - t0); t0 = t1; } while (0)
     attn_prep_q16(qkv, 0, n, &b);
     LAP(DAV2_SUB_ATT_PREP_QK);
@@ -562,7 +687,12 @@ static void attention_all16(const dav2_tensor_t *qkv, int n, dav2_tensor_t *ctx)
         LAP(DAV2_SUB_ATT_PREP_V);
         gemm16_finish(k, qkv->c, b.q16, HD, b.s, n, HD, n, b.sst);
         LAP(DAV2_SUB_ATT_WAIT);
-        attn_softmax(qkv, n, &b);
+        /* the exponential on the block; its table is loaded with the
+         * first job of this call (fc1's GELU table replaces it) */
+        if (attn_softmax_accel(qkv, n, &b, !lut_loaded))
+            lut_loaded = 1;
+        else
+            attn_softmax(qkv, n, &b);
         LAP(DAV2_SUB_ATT_SOFTMAX);
         /* C[d][t] = sum_m P[t][m] v[m][d] */
         gemm16_start(b.p16, Kp, b.vt16, Kp, b.c, n, Kp, HD, 0);
@@ -880,6 +1010,13 @@ void dav2_infer(const dav2_cfg_t *cfg, int16_t *depth_q, dav2_xf_t *depth_scale)
     int16_t *x_spare = dav2_tensor_new(n_tokens, ED).v;   /* see residual_update */
     uint32_t *x_rst = (uint32_t *)dav2_arena_alloc((size_t)n_tokens * sizeof(uint32_t));
     uint32_t *x_rsum = (uint32_t *)dav2_arena_alloc((size_t)n_tokens * 3 * sizeof(uint32_t));
+    /* the softmax's exponential table for the accelerator (fixed; built
+     * once per frame, about 0.1 Mcycles) */
+    g_exp_lut = 0;
+    if (dav2_accel_lut_ok()) {
+        g_exp_lut = (int16_t *)dav2_arena_alloc(16384 * sizeof(int16_t));
+        if (g_exp_lut) exp_lut_build(g_exp_lut);
+    }
     {
         dav2_tensor_t patches = dav2_conv2d(&image, cfg->size, cfg->size,
                                             &pe_w, DAV2_PATCH, DAV2_PATCH, 0,
@@ -1002,6 +1139,7 @@ void dav2_infer(const dav2_cfg_t *cfg, int16_t *depth_q, dav2_xf_t *depth_scale)
     dav2_copy16(depth_q, c3.v, (size_t)out_size * out_size);
     *depth_scale = c3.scale;
 
+    g_exp_lut = 0;                 /* its arena space is not kept after the frame */
     dav2_progress("done");
     dav2_prof_report(dav2_cycles() - t_frame);
 }

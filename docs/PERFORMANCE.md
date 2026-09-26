@@ -1,4 +1,4 @@
-# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 2.0 s (estimated)
+# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 1.9 s (estimated)
 
 This is the record of the speed-up work: what was measured, what each change
 did, and what is left. Every step kept the FPGA output **bit-exact with the
@@ -1004,6 +1004,60 @@ time since round seventeen; it now counts the tile rows with a formula.
 
 Model: 115.5 → 107.6 Mcycles per frame, and 105.1 without the model's own
 loop: **about 2.0 s** (2.10 s, less the model's 4 %).
+
+### Round twenty — the softmax's exponential on the block (software; estimated, not yet measured)
+
+The softmax was the largest CPU item left (16.2 Mcycles, with the block
+idle). Its exponential now runs in a requantisation job through the lookup
+table; no RTL change was needed.
+
+The job reads the score matrix S[query][key] with one parameter row per
+query: multiplier and shift of kf · 512 (kf = the scores' scale times
+log2 e), and the bias −r(smax), where r is the job's own rounding and smax
+the query's largest score from the score GEMM's statistics. So
+v = r(s) − r(smax) is 0 at the largest score and negative elsewhere, and
+the table maps v to 2^(v/512) in Q15. The table is the CPU's formula,
+exp2_tab[k & 1023] >> (k >> 10) at k = −2v; it does not depend on any
+scale, is built once per frame, and is loaded with the first head of each
+block (fc1's GELU table replaces it in between).
+
+The requantisation job transposes: it writes P^T[key][query]. The CPU then
+forms each query's sum from the columns (for a word w = p(q) + 2^16 p(q+1)
+it adds w and w >> 16, eight queries at a time in registers) and writes
+P[query][key] divided by the sum, two queries and two keys per step. With
+inv = (2^31 − 2^16) / sum no clamp is needed. The CPU work per score is
+about 7 cycles instead of 30. A design without this CPU pass would need
+four jobs per head: the per-query division cannot be expressed in a
+requantisation job, whose parameters are per input row.
+
+| | Before | After |
+|---|---|---|
+| softmax (CPU, including the wait for the job) | 16.2 | 8.3 |
+| accelerator, exponential jobs | — | 1.8 |
+| jobs per frame | 1304 | 1376 |
+| frame (model) | 105.1 | 97.5 |
+
+**The output is no longer bit-identical to `dav2_host`.** The exponent is
+now on a grid of 2^−9 (rounded) instead of 2^−10 (truncated), and the
+normalisation rounds inv down instead of to nearest. `dav2_host` has no
+lookup table and keeps the CPU softmax; `dav2_host_emu` and the board use
+the job. Against the float references nothing measurable changes (new /
+old, geometric mean of the per-image ratio, 95 % interval):
+
+| Set | 1 − r | gain-fitted error |
+|---|---|---|
+| 24 photo crops | 0.961 [0.856, 1.079] | 0.998 [0.920, 1.083] |
+| 11 test images | 0.879 [0.768, 1.007] | 0.904 [0.789, 1.035] |
+
+New and old outputs differ by 1 − r ≈ 3e-5, against 1.3e-3 for either
+against float. A job that fails turns the block off for the rest of the
+frame, as before; the remaining heads then use the CPU softmax, so the
+result is valid either way (bus errors injected into 14 jobs from 20 to
+1370: correlation 0.99987 or better with the undisturbed result). The
+boot self-test hash does not involve attention and stays `c1bf94c1`.
+
+Model: 105.1 → 97.5 Mcycles per frame, **about 1.9 s** (1.95 s, less the
+model's 4 %).
 
 ## 7. What is left, in order of expected gain
 

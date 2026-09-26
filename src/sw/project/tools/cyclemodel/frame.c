@@ -62,8 +62,8 @@ int putchar(int c) { return c; }
  *        output one element per cycle, N*M/2 words written. */
 #define BEAT 21                         /* tenths of a cycle per bus word */
 static uint64_t busy_until;
-static uint64_t acc_time[8];            /* modelled job time by kind, reported at the end */
-enum { K_GEMM_ENC, K_GEMM_CONV, K_ATT, K_RQ, K_RQ_ADD, K_RQ16, K_RQ_CTX, K_N };
+enum { K_GEMM_ENC, K_GEMM_CONV, K_ATT, K_RQ, K_RQ_ADD, K_RQ16, K_RQ_CTX, K_RQ_EXP, K_N };
+static uint64_t acc_time[K_N];          /* modelled job time by kind, reported at the end */
 static void wait_done(void)
 {
     uint64_t now = dav2_cycles();
@@ -204,6 +204,17 @@ int dav2_accel_present(void) { return 1; }
 int dav2_accel_gemm16_async(const int16_t *a, uint32_t as, const int16_t *w, uint32_t ws,
                             int32_t *acc, int N, int K, int M, int32_t *st)
 { (void)a;(void)as;(void)w;(void)ws;(void)acc;(void)st; job_kind = K_ATT; start_job(gemm_cycles(N, K, M, 1)); return 2; }
+#ifndef EXP_C
+#define EXP_C 1                         /* the softmax's exponential on the block (round 20) */
+#endif
+int dav2_accel_requant_lut_async(const int32_t *acc, int N, int M, const int32_t *params,
+                                 int16_t *out, int out_stride, const int16_t *lut, int lut_load)
+{ (void)acc;(void)params;(void)out;(void)out_stride;(void)lut;
+  if (!EXP_C) return 0;
+  onchip_last = 0;
+  job_kind = K_RQ_EXP;
+  start_job(requant_cycles(N, M, 0, 0) + (lut_load ? 8192u * BEAT / 10 : 0));
+  return 2; }
 int dav2_accel_requant_stride(const int32_t *acc, int N, int M, const int32_t *params,
                               int16_t *out, int out_stride, int32_t *amax)
 { (void)acc;(void)params;(void)out;(void)out_stride;

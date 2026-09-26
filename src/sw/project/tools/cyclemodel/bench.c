@@ -76,6 +76,10 @@ int dav2_accel_present(void) { return 1; }
 int dav2_accel_gemm16_async(const int16_t *a, uint32_t as, const int16_t *w, uint32_t ws,
                             int32_t *acc, int N, int K, int M, int32_t *st)
 { (void)a;(void)as;(void)w;(void)ws;(void)acc;(void)N;(void)K;(void)M;(void)st; return 1; }
+int dav2_accel_requant_lut_async(const int32_t *acc, int N, int M, const int32_t *params,
+                                 int16_t *out, int out_stride, const int16_t *lut, int lut_load)
+{ (void)acc;(void)N;(void)M;(void)params;(void)out;(void)out_stride;(void)lut;(void)lut_load;
+  return 0; }
 int dav2_accel_requant_stride(const int32_t *acc, int N, int M, const int32_t *params,
                               int16_t *out, int out_stride, int32_t *amax)
 { (void)acc;(void)params;(void)out;(void)out_stride; MMIO[6] = (uint32_t)(3 * N * M); *amax = 8000; return 1; }

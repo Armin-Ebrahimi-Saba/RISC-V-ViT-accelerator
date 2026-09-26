@@ -704,6 +704,28 @@ int dav2_accel_gemm16_async(const int16_t *a, uint32_t a_stride,
     return r;
 }
 
+int dav2_accel_requant_lut_async(const int32_t *acc, int N, int M, const int32_t *params,
+                                 int16_t *out, int out_stride, const int16_t *lut,
+                                 int lut_load)
+{
+    if (!dav2_accel_init() || !accel_lut_ok || !requant_ok(acc, N, M, params, out))
+        return 0;
+    if (M > (int)(accel_kmax / 2u) || (out_stride & 1) || out_stride < M
+        || (((uintptr_t)lut) & 3u))
+        return 0;
+    dav2_rq_epi_t epi;
+    memset(&epi, 0, sizeof epi);
+    epi.lut = lut;
+    epi.lut_load = lut_load;
+    int32_t amax = 0;
+    accel_out_stride = out_stride;
+    accel_defer = 1;
+    int r = accel_requant_rows(acc, N, M, 0, M, params, out, &amax, &epi, 0);
+    accel_defer = 0;
+    accel_out_stride = 0;
+    return r;
+}
+
 int dav2_accel_requant_stride(const int32_t *acc, int N, int M, const int32_t *params,
                               int16_t *out, int out_stride, int32_t *amax)
 {
@@ -1557,6 +1579,11 @@ int  dav2_accel_requant16(const int16_t *in, int N, int M, const int32_t *params
 { (void)in; (void)N; (void)M; (void)params; (void)out; (void)amax; (void)ostats; return 0; }
 int  dav2_accel_ostats_ok(void) { return 0; }
 int  dav2_accel_osums_ok(void) { return 0; }
+int  dav2_accel_requant_lut_async(const int32_t *acc, int N, int M, const int32_t *params,
+                                  int16_t *out, int out_stride, const int16_t *lut,
+                                  int lut_load)
+{ (void)acc;(void)N;(void)M;(void)params;(void)out;(void)out_stride;(void)lut;(void)lut_load;
+  return 0; }
 int  dav2_accel_onchip_ok(void) { return 0; }
 int  dav2_accel_qgemm_onchip_async(const dav2_tensor_t *a, const dav2_qw_t *wt,
                                    dav2_accel_stats_t *st)

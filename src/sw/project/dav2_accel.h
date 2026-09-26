@@ -176,6 +176,15 @@ int dav2_accel_requant_stride(const int32_t *acc, int N, int M, const int32_t *p
                               int16_t *out, int out_stride, int32_t *amax);
 int dav2_accel_requant16(const int16_t *in, int N, int M, const int32_t *params,
                          int16_t *out, int32_t *amax, uint32_t *ostats);
+/* Requantisation through the lookup table (CTRL.lut, CAPS bit 24):
+ * out[n * out_stride + m] = lut[sat14(...)] for acc[m][n] as in
+ * dav2_accel_requant; with lut_load the table (16384 int16, lut[x + 8192]
+ * for x in -8192..8191) is loaded first, otherwise the block's table is
+ * used. M even and at most CAPS.KMAX/2. Left running (collect with
+ * dav2_accel_finish); 0 when declined. */
+int dav2_accel_requant_lut_async(const int32_t *acc, int N, int M, const int32_t *params,
+                                 int16_t *out, int out_stride, const int16_t *lut,
+                                 int lut_load);
 
 int dav2_accel_requant_rows_async(const int32_t *acc, int N, int M, int m0, int mc,
                                   const int32_t *params, int16_t *out, int32_t *amax,

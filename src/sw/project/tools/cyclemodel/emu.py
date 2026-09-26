@@ -187,7 +187,7 @@ if __name__ == "__main__":
         subn = ["ln stats", "ln gamma/beta", "ln requant", "rq range", "rq params", "att prep q,k",
                 "att prep v", "att softmax", "att normalise", "att wait", "gelu table"]
         kn = ["GEMM (encoder)", "GEMM (convolutions)", "GEMM (attention)", "requant",
-              "requant + add", "requant int16 in", "requant context"]
+              "requant + add", "requant int16 in", "requant context", "requant exp"]
         for d, v in sub:
             if d >= 200:
                 print("    %-18s %8.1f Mcycles" % (subn[d - 200], v / 1e6))
