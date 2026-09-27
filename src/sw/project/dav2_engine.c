@@ -422,7 +422,7 @@ static inline int32_t job_round(int32_t v, int32_t mult, int sh)
 #define ATT_CR_C 16384u
 
 static int attn_softmax_accel_start(const dav2_tensor_t *qkv, int n, attn_bufs_t *b,
-                                    int lut_load, int s_cr)
+                                    int lut_load, int s_cr, int32_t *msums)
 {
     const int Kp = (n + 3) & ~3;
     if (!g_exp_lut || (n & 1))
@@ -440,6 +440,9 @@ static int attn_softmax_accel_start(const dav2_tensor_t *qkv, int n, attn_bufs_t
         b->epar[3 * q + 1] = sh;
         b->epar[3 * q + 2] = -job_round(b->sst[2 * q], mult, sh);
     }
+    if (msums)                   /* with each query's column sum (CTRL.msums) */
+        return dav2_accel_exp_async(s_cr ? 0 : b->s, ATT_CR_S, n, n, b->epar, b->pt, Kp,
+                                    g_exp_lut, lut_load, msums) != 0;
     if (s_cr)
         return dav2_accel_requant_lut_cr_async(ATT_CR_S, n, n, b->epar, b->pt, Kp, g_exp_lut,
                                                lut_load) != 0;
@@ -791,6 +794,65 @@ static void attention_all16(const dav2_tensor_t *qkv, int n, dav2_tensor_t *ctx)
         for (int d = 0; d < HD; d++)
             for (int m = n; m < Kp; m++)
                 vt2[k][(size_t)d * Kp + m] = 0;
+
+    /* With the softmax options (CAPS bit 21) the exponential job also adds
+     * up each query's column (CTRL.msums), and a second job normalises P
+     * (one parameter row per query, CTRL.nparam, 15 bits, CTRL.sat16): the
+     * CPU only divides, 82 times per head. The block does everything else,
+     * one head after the other. The same arithmetic as the CPU's
+     * attn_softmax_accel_norm, so the same P. */
+    int32_t *npar = (dav2_accel_smx_ok() && n <= 128 && !(n & 1))
+                  ? (int32_t *)dav2_arena_alloc((size_t)n * 3 * sizeof(int32_t)) : 0;
+    if (npar) {
+        for (int q = 0; q < n; q++)                  /* P's padding columns stay zero */
+            for (int m = n; m < Kp; m++)
+                b.p16[(size_t)q * Kp + m] = 0;
+        for (int h = 0; h < DAV2_N_HEADS; h++) {
+            b.vt16 = vt2[0];
+            attn_vt16(qkv, h, n, &b);
+            LAP(DAV2_SUB_ATT_PREP_V);
+            S_START(h);
+            S_FINISH(h);
+            LAP(DAV2_SUB_ATT_PREP_QK);
+            b.s = s2[h & 1]; b.sst = st2[h & 1]; b.pt = pt2[0];
+            int e_ok = attn_softmax_accel_start(qkv, n, &b, !lut_loaded, s_cr, (int32_t *)b.psum);
+            if (e_ok) lut_loaded = 1;
+            e_ok = e_ok && dav2_accel_finish();
+            LAP(DAV2_SUB_ATT_WAIT);
+            if (!e_ok) {
+                if (s_cr) S_DDR(h);                  /* attn_softmax reads S in DDR3 */
+                attn_softmax(qkv, n, &b);
+            } else {
+                for (int q = 0; q < n; q++) {
+                    const uint32_t sq = b.psum[q] ? b.psum[q] : 1u;
+                    npar[3 * q]     = (int32_t)((0x80000000u - 0x10000u) / sq);
+                    npar[3 * q + 1] = 16;
+                    npar[3 * q + 2] = 0;
+                }
+                if (!(dav2_accel_norm16_async(b.pt, (uint32_t)Kp * 2u, n, n, npar, b.p16, Kp)
+                      && dav2_accel_finish()))
+                    attn_softmax_accel_norm(n, &b, 0, n);
+            }
+            LAP(DAV2_SUB_ATT_SOFTMAX);
+            gemm_i32_finish();
+            c_cr = att_cr && dav2_accel_gemm16_cr_async(b.p16, (uint32_t)Kp * 2u, vt2[0],
+                                                        (uint32_t)Kp * 2u, 0, ATT_CR_C, n, Kp, HD, 0);
+            if (!c_cr) {
+                C_DDR(vt2[0]);
+            } else if (!dav2_accel_finish()) {
+                c_cr = 0;
+                C_DDR(vt2[0]);
+            }
+            LAP(DAV2_SUB_ATT_WAIT);
+            const int cp = attn_context16_start(h, n, &b, ctx, c_cr);
+            if (cp < 0 || (cp > 0 && !dav2_accel_finish())) {
+                if (c_cr) C_DDR(vt2[0]);
+                attn_context16_cpu(h, n, &b, ctx);
+            }
+            LAP(DAV2_SUB_ATT_NORM);
+        }
+        goto done;
+    }
     /* head 0: v^T, the scores, the exponential job */
     b.vt16 = vt2[0];
     attn_vt16(qkv, 0, n, &b);
@@ -799,7 +861,7 @@ static void attention_all16(const dav2_tensor_t *qkv, int n, dav2_tensor_t *ctx)
     LAP(DAV2_SUB_ATT_PREP_QK);
     S_FINISH(0);
     b.s = s2[0]; b.sst = st2[0]; b.pt = pt2[0];
-    int exp_ok = attn_softmax_accel_start(qkv, n, &b, !lut_loaded, s_cr);
+    int exp_ok = attn_softmax_accel_start(qkv, n, &b, !lut_loaded, s_cr, 0);
     if (exp_ok) lut_loaded = 1;
     exp_ok = exp_ok && dav2_accel_finish();
     if (!exp_ok && s_cr)
@@ -845,7 +907,7 @@ static void attention_all16(const dav2_tensor_t *qkv, int n, dav2_tensor_t *ctx)
         if (nx) {
             S_FINISH(h + 1);
             HEAD_BUFS(h + 1);
-            exp_next = attn_softmax_accel_start(qkv, n, &b, !lut_loaded, s_cr);
+            exp_next = attn_softmax_accel_start(qkv, n, &b, !lut_loaded, s_cr, 0);
             if (exp_next) lut_loaded = 1;
         }
         LAP(DAV2_SUB_ATT_WAIT);
@@ -895,6 +957,7 @@ static void attention_all16(const dav2_tensor_t *qkv, int n, dav2_tensor_t *ctx)
         attn_context16_cpu(DAV2_N_HEADS - 1, n, &b, ctx);
     }
     LAP(DAV2_SUB_ATT_NORM);
+done:
 #undef HEAD_BUFS
 #undef S_START
 #undef S_FINISH

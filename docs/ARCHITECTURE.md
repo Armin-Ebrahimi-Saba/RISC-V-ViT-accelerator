@@ -274,6 +274,14 @@ instead of reading them. The row extremes that the residual add and the
 column extremes need go through a small requantisation of their own, a
 2-column matrix, with the same derived parameters.
 
+Three requantisation options (CAPS bit 21) serve the softmax.
+**`CTRL.msums`** writes each column m's sum over the job's rows to S_ADDR
+(a LUT RAM accumulates the final values); the exponential job uses it for
+each query's sum. **`CTRL.nparam`** takes the parameters by output row n
+(N_ROWS rows) instead of by m, and **`CTRL.sat16`** saturates at ±32767.
+With both, an int16-input job normalises P^T into P: out[q][key] =
+round(p · i_q / 2^16), i_q = (2^31 − 2^16) / sum_q, the CPU's formula.
+
 The add needs the output scale of *h* before any *h* exists. Per row,
 requantisation is non-decreasing in the accumulator, so the row's largest
 |h| is reached at its largest or smallest accumulator, which the drain

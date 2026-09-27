@@ -154,7 +154,7 @@ module student_gemm #(
   logic [31:0] cycles_q;        // cycle counter, running while busy_q, for CYCLES
 
   assign hw2reg.status.d = {err_q, done_q, busy_q};        // STATUS register readback
-  assign hw2reg.caps.d   = {8'd255, 2'b11, 14'(KMAX), 8'(NROWS)};   // CAPS: what this instance supports
+  assign hw2reg.caps.d   = {8'd255, 3'b111, 13'(KMAX), 8'(NROWS)};   // CAPS: what this instance supports
   assign hw2reg.cycles.d = cycles_q;                       // CYCLES register readback
 
   logic start_strobe, start_requant, start_gather;
@@ -189,6 +189,10 @@ module student_gemm #(
   assign start_osums    = reg2hw.ctrl.osums.q;    // with ostats: row sums too   // requant job: output row statistics
   logic start_ln, start_lnb;
   logic start_rng, start_rng_load, start_dpar;
+  logic start_msums, start_nparam, start_sat16;
+  assign start_msums  = reg2hw.ctrl.msums.q;     // requant: column sums to S_ADDR
+  assign start_nparam = reg2hw.ctrl.nparam.q;    // requant: parameters per output row n
+  assign start_sat16  = reg2hw.ctrl.sat16.q;     // requant: saturate at +-32767
   assign start_rng      = reg2hw.ctrl.rng.q;      // GEMM: row ranges into RNG_VMAX/VMIN
   assign start_rng_load = reg2hw.ctrl.rng_load.q; // ... loading the table first
   assign start_dpar     = reg2hw.ctrl.dpar.q;     // requant: parameters from the table
@@ -250,6 +254,8 @@ module student_gemm #(
   logic           ly_busy, par_busy;         // Y unit / parameter unit working
   logic [11:0]    ln_cnt_q;                  // gamma / beta load: channel
   logic           rng_q, rngl_q, dpar_q;     // CTRL.rng, rng_load, dpar
+  logic           msums_q, nparam_q, sat16_q; // CTRL.msums, nparam, sat16
+  logic [AW-1:0]  rq_pcnt;                   // parameter rows of the job
   logic           rng_ld_done, rng_busy, dp_done;
   logic           rng_hasb_q;                // the table has biases
   logic [12:0]    rng_cnt_q;                 // table load: word
@@ -348,7 +354,8 @@ module student_gemm #(
   logic         lp_wr_req, lp_done;    // ST_LERP: a word to write, the last one issued
   logic [31:0]  lp_wr_addr, lp_wr_data;
   logic [31:0]  os_wr_addr, os_wr_data;   // RQ_STATS: one word per output row
-  logic [NRW+1:0] os_t_q, os_nw;         // RQ_STATS: word written, words owed
+  logic [11:0]    os_t_q, os_nw;         // RQ_STATS: word written, words owed
+  logic           ms_ok_q;               // RQ_STATS with CTRL.msums: the word is read
   logic           os_busy;               // row sums still in their pipeline
   assign wr_req  = (state_q == RQ_OUT || state_q == LN_P2) ? rq_wr_req : (state_q == RQ_STATS) ? os_wr_req
                  : (state_q == ST_LERP) ? lp_wr_req : drain_wr_req;
@@ -820,7 +827,7 @@ module student_gemm #(
       RQ_LOAD_P:   if (rq_p_done)                state_d = ln_q ? LN_LOAD_G : RQ_LOAD_ACC; // param table loaded
       RQ_LOAD_ACC: if (rq_acc_done)              state_d = add_q ? RQ_LOAD_X : RQ_OUT;
       RQ_LOAD_X:   if (rq_x_done)                state_d = RQ_OUT;      // residual loaded
-      RQ_OUT:      if (rq_out_done && !os_busy) state_d = ostats_q ? RQ_STATS : ST_FINISH;
+      RQ_OUT:      if (rq_out_done && !os_busy) state_d = (ostats_q | msums_q) ? RQ_STATS : ST_FINISH;
       RQ_STATS:    if (os_t_q == os_nw) state_d = ST_FINISH;   // every output word written
       LN_LOAD_G:   if (ln_ld_done)               state_d = LN_LOAD_B;
       LN_LOAD_B:   if (ln_ld_done)               state_d = ST_LOAD_A;
@@ -875,6 +882,7 @@ module student_gemm #(
       ln_cnt_q <= '0;
       rng_q <= 1'b0; rngl_q <= 1'b0; dpar_q <= 1'b0;
       rng_cnt_q <= '0; rng_hasb_q <= 1'b0;
+      msums_q <= 1'b0; nparam_q <= 1'b0; sat16_q <= 1'b0;
       rng_s_addr_q <= '0; rng_b_addr_q <= '0;
       // rq_m_q, rq_p_cnt_q and lut_cnt_q have no reset: they address block
       // RAMs (an asynchronous reset there is DRC REQP-1840), and every job
@@ -1005,6 +1013,9 @@ module student_gemm #(
             rng_q      <= start_rng & ~start_requant & ~start_ln & ~start_lerp;
             rngl_q     <= start_rng & start_rng_load & ~start_requant & ~start_ln & ~start_lerp;
             dpar_q     <= start_dpar & start_requant;
+            msums_q    <= start_msums & start_requant;
+            nparam_q   <= start_nparam & start_requant & ~start_dpar;
+            sat16_q    <= start_sat16 & start_requant;
             rng_cnt_q  <= '0;
             rng_s_addr_q <= reg2hw.rng_s_addr.q;
             rng_b_addr_q <= reg2hw.rng_b_addr.q;
@@ -1055,10 +1066,10 @@ module student_gemm #(
               // (LayerNorm A: per token).
               rd_addr_q      <= reg2hw.p_addr.q;
               rd_row_base_q  <= reg2hw.p_addr.q;
-              rd_row_beats_q <= 32'(reg2hw.m_len.q) * 32'd3;
-              rd_row_left_q  <= 32'(reg2hw.m_len.q) * 32'd3;
-              rd_stride_q    <= 32'(reg2hw.m_len.q) * 32'd12;
-              rd_left_q      <= (start_dpar & start_requant) ? 32'd0 : 32'(reg2hw.m_len.q) * 32'd3;
+              rd_row_beats_q <= 32'(start_nparam ? 16'(reg2hw.n_rows.q) : reg2hw.m_len.q) * 32'd3;
+              rd_row_left_q  <= 32'(start_nparam ? 16'(reg2hw.n_rows.q) : reg2hw.m_len.q) * 32'd3;
+              rd_stride_q    <= 32'(start_nparam ? 16'(reg2hw.n_rows.q) : reg2hw.m_len.q) * 32'd12;
+              rd_left_q      <= (start_dpar & start_requant) ? 32'd0 : 32'(start_nparam ? 16'(reg2hw.n_rows.q) : reg2hw.m_len.q) * 32'd3;
               if (start_lut_load & start_requant) begin
                 // Lookup table first: 8192 contiguous words, or 256 for
                 // the interpolating table (CTRL.lutint).
@@ -1172,10 +1183,10 @@ module student_gemm #(
           if (lut_ld_done) begin
             rd_addr_q      <= p_addr_q;
             rd_row_base_q  <= p_addr_q;
-            rd_row_beats_q <= 32'(m_len_q) * 32'd3;
-            rd_row_left_q  <= 32'(m_len_q) * 32'd3;
-            rd_stride_q    <= 32'(m_len_q) * 32'd12;
-            rd_left_q      <= dpar_q ? 32'd0 : 32'(m_len_q) * 32'd3;
+            rd_row_beats_q <= 32'(nparam_q ? 16'(n_rows_q) : m_len_q) * 32'd3;
+            rd_row_left_q  <= 32'(nparam_q ? 16'(n_rows_q) : m_len_q) * 32'd3;
+            rd_stride_q    <= 32'(nparam_q ? 16'(n_rows_q) : m_len_q) * 32'd12;
+            rd_left_q      <= dpar_q ? 32'd0 : 32'(nparam_q ? 16'(n_rows_q) : m_len_q) * 32'd3;
           end
         end
         RQ_LOAD_P: begin
@@ -1525,7 +1536,8 @@ module student_gemm #(
   logic [5:0]     pm_shift[KWORDS];   // per-row right-shift amount
   logic [AW-1:0]  pm_raddr;           // read address: row m, or the token in LN_P1
   logic [NRW-1:0] ln_t_q;             // LN pass: token
-  assign pm_raddr = (state_q == LN_P1) ? AW'(ln_t_q) : rq_m_q;
+  assign rq_pcnt  = nparam_q ? AW'(n_rows_q) : rq_mlen;
+  assign pm_raddr = (state_q == LN_P1) ? AW'(ln_t_q) : nparam_q ? AW'(rq_n_q) : rq_m_q;
   logic [31:0]    pm_bias [KWORDS];   // per-row bias, added after the shift
 
   // Demultiplex the incoming words into the three parameter RAMs, in the
@@ -1550,7 +1562,7 @@ module student_gemm #(
 
   // rq_p_done: the last row's bias word has just arrived.
   assign rq_p_done   = (state_q == RQ_LOAD_P) & rd_valid
-                     & (rq_p_sel_q == 2'd2) & (rq_p_cnt_q == rq_mlen - 1'b1);
+                     & (rq_p_sel_q == 2'd2) & (rq_p_cnt_q == rq_pcnt - 1'b1);
   // rq_acc_done: the acc chunk's last word (last row, last column) has just arrived.
   assign rq_x_done   = (state_q == RQ_LOAD_X) & rd_valid
                      & (rq_n_q == n_rows_q - 1'b1) & (rq_xw_q == rq_xwords - 1'b1);
@@ -1635,8 +1647,12 @@ module student_gemm #(
       logic signed [32:0] sum;
       // part-selects are unsigned: cast before widening or negatives break
       sum = 33'($signed(rq_shf5[31:0])) + 33'(rq_bias5);
-      rq_val6 <= (sum >  33'sd8191) ?  32'sd8191
-               : (sum < -33'sd8191) ? -32'sd8191 : 32'(sum);
+      if (sat16_q)
+        rq_val6 <= (sum >  33'sd32767) ?  32'sd32767
+                 : (sum < -33'sd32767) ? -32'sd32767 : 32'(sum);
+      else
+        rq_val6 <= (sum >  33'sd8191) ?  32'sd8191
+                 : (sum < -33'sd8191) ? -32'sd8191 : 32'(sum);
     end
     rq_odd6 <= rq_odd5;  rq_last6 <= rq_last5;
   end
@@ -1755,7 +1771,15 @@ module student_gemm #(
   logic rq_row_end0, rq_row_end1, rq_row_end2, rq_row_end3, rq_row_end4, rq_row_end5, rq_row_end6;
   logic rq_row_end7, rq_row_end8, rq_row_end9, rq_row_end10, rq_row_end11, rq_row_end12;
   assign rq_row_end0 = (rq_m_q == rq_mlen - 1'b1);
+  logic [AW-1:0] rq_mi [1:12];         // the element's m, q1 .. q12 (CTRL.msums)
+  logic          rq_fr [1:12];         // ... and whether it is in the job's first row
   always_ff @(posedge clk_i) begin
+    rq_mi[1] <= rq_m_q;
+    rq_fr[1] <= (rq_n_q == '0);
+    for (int i = 2; i <= 12; i++) begin
+      rq_mi[i] <= rq_mi[i-1];
+      rq_fr[i] <= rq_fr[i-1];
+    end
     rq_row_end1 <= rq_row_end0; rq_row_end2 <= rq_row_end1; rq_row_end3 <= rq_row_end2;
     rq_row_end4 <= rq_row_end3; rq_row_end5 <= rq_row_end4; rq_row_end6 <= rq_row_end5;
     rq_row_end7 <= rq_row_end6; rq_row_end8 <= rq_row_end7; rq_row_end9 <= rq_row_end8;
@@ -1850,18 +1874,35 @@ module student_gemm #(
 
   // RQ_STATS: word os_t_q; with CTRL.osums four per row (row = os_t_q / 4)
   logic [RW-1:0]  os_row;
-  assign os_nw  = osums_q ? {n_rows_q, 2'b00} : (NRW+2)'(n_rows_q);
+  assign os_nw  = msums_q ? 12'(m_len_q) : osums_q ? 12'({n_rows_q, 2'b00}) : 12'(n_rows_q);
   assign os_row = osums_q ? os_t_q[RW+1:2] : os_t_q[RW-1:0];
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni)                   os_t_q <= '0;
     else if (state_q != RQ_STATS)  os_t_q <= '0;
     else if (issue_wr)             os_t_q <= os_t_q + 1'b1;
   end
-  assign os_wr_req  = (state_q == RQ_STATS) & (os_t_q != os_nw);
+  assign os_wr_req  = (state_q == RQ_STATS) & (os_t_q != os_nw) & (~msums_q | ms_ok_q);
   assign os_wr_addr = s_ptr_q + 32'(os_t_q) * 32'd4;
+  // CTRL.msums: each m's sum over the job's rows, in a block RAM with a
+  // registered read. RQ_OUT reads m at q11 and writes the sum at q12 (the
+  // same m comes back M_LEN >= 2 elements later, after the write);
+  // RQ_STATS reads word os_t_q and writes it a cycle later (ms_ok_q).
+  (* ram_style = "block" *) logic [31:0] msum_ram [KWORDS];
+  logic [31:0] msum_rd_q;
+  always_ff @(posedge clk_i) begin
+    msum_rd_q <= msum_ram[(state_q == RQ_STATS) ? AW'(os_t_q) : rq_mi[11]];
+    if (msums_q && state_q == RQ_OUT && rq_v12)
+      msum_ram[rq_mi[12]] <= rq_fr[12] ? rq_val12 : msum_rd_q + rq_val12;
+  end
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) ms_ok_q <= 1'b0;
+    else         ms_ok_q <= (state_q == RQ_STATS) & ~issue_wr;
+  end
   always_comb begin
     os_wr_data = os_ram[os_row];
-    if (osums_q)
+    if (msums_q)
+      os_wr_data = msum_rd_q;
+    else if (osums_q)
       unique case (os_t_q[1:0])
         2'd0:    os_wr_data = os_ram[os_row];
         2'd1:    os_wr_data = os_sum_ram[os_row];

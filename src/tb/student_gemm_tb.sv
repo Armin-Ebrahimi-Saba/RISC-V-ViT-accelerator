@@ -1516,6 +1516,92 @@ module student_gemm_tb;
       $display("  ok, range %0d .. %0d, %0d outputs", vmin, vmax, ndim * mdim);
   endtask
 
+  // The softmax's normalisation: an int16-input requantisation of P^T
+  // (rows m = keys, columns n = queries) with one parameter row per n
+  // (CTRL.nparam) and, with sat16, saturation at +-32767; and before it the
+  // column sums of a job's output (CTRL.msums) to S_ADDR.
+  task automatic run_nparam(input int ndim, input int mdim, input int sat16, input int msums);
+    int mismatches = 0;
+    int mult [128], sh [128], bias [128];
+    int lim = sat16 ? 32767 : 8191;
+    $display("--- REQUANT A16 NPARAM N=%0d M=%0d%s%s", ndim, mdim, sat16 ? ", sat16" : "",
+             msums ? ", column sums" : "");
+    // input rows m of N int16 (P^T: values 0 .. 32767), A_STRIDE apart
+    for (int m = 0; m < mdim; m++)
+      for (int w = 0; w < ndim / 2; w++)
+        memory.mem[mem_word(A_BASE) + m * (ndim / 2 + 1) + w] = {16'($urandom % 32768), 16'($urandom % 32768)};
+    for (int n = 0; n < ndim; n++) begin
+      mult[n] = sat16 ? 32'd32768 + ($urandom % 32767) : 32'h4000_0000 + ($urandom % 32'h3fff_ffff);
+      sh[n]   = sat16 ? 16 : 30 + ($urandom % 4);
+      bias[n] = sat16 ? 0 : 32'($signed($urandom % 2001) - 1000);
+      memory.mem[mem_word(P_BASE) + 3 * n]     = mult[n];
+      memory.mem[mem_word(P_BASE) + 3 * n + 1] = sh[n];
+      memory.mem[mem_word(P_BASE) + 3 * n + 2] = bias[n];
+    end
+    for (int i = 0; i < ndim * (mdim + 2) / 2; i++)
+      memory.mem[mem_word(O_BASE) + i] = 32'hdead_beef;
+    for (int i = 0; i < mdim + 2; i++)
+      memory.mem[mem_word(S_BASE) + i] = 32'hdead_beef;
+    bus.put_word(R_A_ADDR,   A_BASE);
+    bus.put_word(R_A_STRIDE, (ndim / 2 + 1) * 4);
+    bus.put_word(R_P_ADDR,   P_BASE);
+    bus.put_word(R_S_ADDR,   msums ? S_BASE : 32'h0);
+    bus.put_word(R_C_ADDR,   O_BASE);
+    bus.put_word(R_C_STRIDE, (mdim + 2) * 2);                 // two gap columns per row
+    bus.put_word(R_M_LEN,    mdim);
+    bus.put_word(R_N_ROWS,   ndim);
+    bus.put_word(R_CTRL,     32'h3 | 32'h80 | 32'h400_0000 | (sat16 ? 32'h800_0000 : 32'h0)
+                             | (msums ? 32'h200_0000 : 32'h0));
+    rq_wait("nparam requant");
+    for (int m = 0; m < mdim; m++) begin
+      int sum = 0;
+      for (int n = 0; n < ndim; n++) begin
+        logic [31:0] iw, ow;
+        int x, e, got, idx;
+        longint r;
+        iw = memory.mem[mem_word(A_BASE) + m * (ndim / 2 + 1) + n / 2];
+        x = n[0] ? int'($signed(iw[31:16])) : int'($signed(iw[15:0]));
+        r = longint'(x) * longint'(mult[n]);
+        r = (r + (64'sd1 <<< (sh[n] - 1))) >>> sh[n];
+        e = int'(r[31:0]) + bias[n];
+        e = (e > lim) ? lim : (e < -lim) ? -lim : e;
+        sum += e;
+        idx = n * (mdim + 2) + m;
+        ow = memory.mem[mem_word(O_BASE) + (idx >> 1)];
+        got = idx[0] ? int'($signed(ow[31:16])) : int'($signed(ow[15:0]));
+        checks++;
+        if (got !== e) begin
+          if (mismatches < 5) $display("  FAIL n=%0d m=%0d: got %0d expected %0d", n, m, got, e);
+          mismatches++;
+        end
+      end
+      if (msums) begin
+        checks++;
+        if (int'(memory.mem[mem_word(S_BASE) + m]) !== sum) begin
+          if (mismatches < 5) $display("  FAIL sum m=%0d: got %0d expected %0d", m,
+                                       int'(memory.mem[mem_word(S_BASE) + m]), sum);
+          mismatches++;
+        end
+      end
+    end
+    for (int n = 0; n < ndim; n++) begin
+      logic [31:0] ow = memory.mem[mem_word(O_BASE) + (n * (mdim + 2) + mdim) / 2];
+      if (ow !== 32'hdead_beef) begin
+        if (mismatches < 5) $display("  FAIL: gap of row %0d written", n);
+        mismatches++;
+      end
+    end
+    if (msums && memory.mem[mem_word(S_BASE) + mdim] !== 32'hdead_beef) begin
+      $display("  FAIL: a sum past M_LEN written");
+      mismatches++;
+    end
+    if (mismatches) begin
+      $display("  %0d wrong", mismatches);
+      errors += mismatches;
+    end else
+      $display("  ok, %0d outputs", ndim * mdim);
+  endtask
+
   // ------------------------------------------------------------------ main
 
   initial begin
@@ -1528,12 +1614,19 @@ module student_gemm_tb;
     bus.reset();
 
     bus.get_word(R_CAPS, caps);
-    $display("caps = 0x%08x (nrows=%0d kmax=%0d)", caps, caps[7:0], caps[21:8]);
-    if (caps[7:0] !== NROWS[7:0] || caps[21:8] !== KMAX[13:0] || caps[23:22] !== 2'b11) begin
+    $display("caps = 0x%08x (nrows=%0d kmax=%0d)", caps, caps[7:0], caps[20:8]);
+    if (caps[7:0] !== NROWS[7:0] || caps[20:8] !== KMAX[12:0] || caps[23:21] !== 3'b111) begin
       $display("FAIL: caps does not match the parameters");
       errors++;
     end
 
+    if ($test$plusargs("smx_only")) begin
+      run_nparam(82, 82, 1, 0);
+      run_nparam(82, 82, 1, 1);
+      run_nparam(20, 30, 0, 1);
+      $display("student_gemm_tb SMX-only: %0d errors", errors);
+      $finish;
+    end
     if ($test$plusargs("rng_only")) begin
       run_rng(20, 64, 30, 1, 0, 0, 16);
       run_rng(130, 32, 40, 0, 0, 1, 20);
@@ -1664,6 +1757,17 @@ module student_gemm_tb;
     run_rng(82, 64, 60, 1, 1, 1, 60);            // on chip with the table
     stats_addr = S_BASE;
     run_gemm(20, 64, 30);    run_requant(20, 30);
+    stats_addr = 0;
+    // the softmax's normalisation: parameters per output row, 15-bit
+    // saturation, column sums; then the plain jobs again
+    run_nparam(82, 82, 1, 0);                    // the attention's shape
+    run_nparam(82, 82, 1, 1);
+    run_nparam(20, 30, 0, 1);                    // 14-bit, with bias, column sums
+    run_nparam(128, 1024, 1, 1);                 // full tile, M = KWORDS
+    run_nparam(2, 2, 1, 1);
+    stats_addr = S_BASE;
+    run_gemm(20, 64, 30);    run_requant(20, 30);
+    run_requant_ostats(82, 30, 1, 0, 1);
     stats_addr = 0;
 
     // Convolutions through gather mode.

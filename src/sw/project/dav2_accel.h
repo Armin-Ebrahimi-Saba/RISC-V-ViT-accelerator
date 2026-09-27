@@ -145,6 +145,13 @@ typedef struct {
     int            dpar;
     int32_t        dp_fk, dp_gb;
     int            dp_shift, dp_r, dp_k, dp_nob;
+    /* CTRL.msums: each m's sum over the job's rows n of the final values,
+     * M int32 at msums (instead of ostats; the job must be one n-tile) */
+    int32_t       *msums;
+    /* CTRL.nparam: parameter row n for output row n (N rows, not M) */
+    int            nparam;
+    /* CTRL.sat16: saturate at +-32767 (not with lut or add) */
+    int            sat16;
 } dav2_rq_epi_t;
 /* A GEMM whose int32 result stays in the block's result RAM (CTRL.onchip,
  * CAPS bit 28): N <= CAPS.NROWS, N*M <= DAV2_ACCEL_CR_WORDS. Only the row
@@ -243,6 +250,21 @@ typedef struct {
     int              beta_sh;       /* 0..31 */
 } dav2_accel_rng_t;
 int  dav2_accel_rng_ok(void);
+/* The softmax's normalisation (CAPS bit 21). dav2_accel_exp_async: the
+ * exponential job (dav2_accel_requant_lut_async's arithmetic, input from
+ * acc, or from the result RAM at word cr_base when acc is NULL) that also
+ * writes each column m's sum over the N rows to msums (M int32; N <=
+ * CAPS.NROWS). dav2_accel_norm16_async: out[n][m] = sat15(round(pt[m][n]
+ * mult_n / 2^shift_n) + bias_n) with the parameter row per n (N rows),
+ * pt rows pt_pitch bytes apart, out rows out_stride int16 apart; the
+ * columns M..out_stride-1 are not written. Both left running; 0 when
+ * declined. */
+int dav2_accel_smx_ok(void);
+int dav2_accel_exp_async(const int32_t *acc, uint32_t cr_base, int N, int M,
+                         const int32_t *params, int16_t *out, int out_stride,
+                         const int16_t *lut, int lut_load, int32_t *msums);
+int dav2_accel_norm16_async(const int16_t *pt, uint32_t pt_pitch, int N, int M,
+                            const int32_t *params, int16_t *out, int out_stride);
 void dav2_accel_rng_next(const dav2_accel_rng_t *r);
 int  dav2_accel_rng_get(int64_t *vmax, int64_t *vmin);
 int dav2_accel_ln_a(const int16_t *x, uint32_t x_pitch, int N, int C, const int32_t *tokpar,

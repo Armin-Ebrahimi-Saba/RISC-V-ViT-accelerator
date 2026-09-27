@@ -175,6 +175,21 @@
           desc: "Requantisation job: the parameters of chunk row i are derived from table row DP_M0 + i instead of read from P_ADDR: mult = mulh(S, DP_FK) >> DP_SH.r, shift = DP_SH.shift, bias = (mulh(B, DP_GB) + 2^(DP_SH.k - 1)) >> DP_SH.k, or 0 with DP_SH.nobias."
         }
         {
+          bits: 25
+          name: "msums"
+          desc: "Requantisation job: at the end, M_LEN words to S_ADDR: each row m's sum over the job's N_ROWS columns of the final values (int32), instead of the output row statistics. Present when CAPS bit 21 is set."
+        }
+        {
+          bits: 26
+          name: "nparam"
+          desc: "Requantisation job: the parameter table has N_ROWS rows, and output row n uses row n's {mult, shift, bias} (instead of M_LEN rows, one per m)."
+        }
+        {
+          bits: 27
+          name: "sat16"
+          desc: "Requantisation job: saturate at +-32767 instead of +-8191 (not with CTRL.lut or CTRL.add)."
+        }
+        {
           bits: 2
           name: "gather"
           desc: "GEMM job only: 1 - the A tile is gathered from an NHWC int16 image as im2col would lay it out (G_ADDR, G_GEOM, G_CHAN, G_CONV, G_START), instead of read from A_ADDR. K_LEN must equal kpos_count * C. C must be even."

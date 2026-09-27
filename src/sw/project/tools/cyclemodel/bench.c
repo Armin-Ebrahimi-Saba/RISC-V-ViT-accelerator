@@ -138,6 +138,15 @@ int dav2_accel_ln_b(int N, int C, int16_t *out, uint32_t out_pitch, int32_t fm, 
 int dav2_accel_rng_ok(void) { return 0; }
 void dav2_accel_rng_next(const dav2_accel_rng_t *r) { (void)r; }
 int dav2_accel_rng_get(int64_t *vmax, int64_t *vmin) { (void)vmax; (void)vmin; return 0; }
+int dav2_accel_smx_ok(void) { return 0; }
+int dav2_accel_exp_async(const int32_t *acc, uint32_t cr_base, int N, int M,
+                         const int32_t *params, int16_t *out, int out_stride,
+                         const int16_t *lut, int lut_load, int32_t *msums)
+{ (void)acc;(void)cr_base;(void)N;(void)M;(void)params;(void)out;(void)out_stride;(void)lut;
+  (void)lut_load;(void)msums; return 0; }
+int dav2_accel_norm16_async(const int16_t *pt, uint32_t pt_pitch, int N, int M,
+                            const int32_t *params, int16_t *out, int out_stride)
+{ (void)pt;(void)pt_pitch;(void)N;(void)M;(void)params;(void)out;(void)out_stride; return 0; }
 int dav2_accel_busy(void) { return 0; }
 
 static uint32_t rs = 12345;

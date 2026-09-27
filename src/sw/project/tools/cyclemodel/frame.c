@@ -62,7 +62,7 @@ int putchar(int c) { return c; }
  *        output one element per cycle, N*M/2 words written. */
 #define BEAT 21                         /* tenths of a cycle per bus word */
 static uint64_t busy_until;
-enum { K_GEMM_ENC, K_GEMM_CONV, K_ATT, K_RQ, K_RQ_ADD, K_RQ16, K_RQ_CTX, K_RQ_EXP, K_LERP, K_TP, K_LN, K_N };
+enum { K_GEMM_ENC, K_GEMM_CONV, K_ATT, K_RQ, K_RQ_ADD, K_RQ16, K_RQ_CTX, K_RQ_EXP, K_LERP, K_TP, K_LN, K_SMX, K_N };
 static uint64_t acc_time[K_N];          /* modelled job time by kind, reported at the end */
 static void wait_done(void)
 {
@@ -306,6 +306,31 @@ int dav2_accel_requant16(const int16_t *in, int N, int M, const int32_t *params,
   job_kind = K_RQ16; start_job(requant_cycles(N, M, 1, 0) + (ostats ? (uint64_t)N * BEAT / 10 : 0)); wait_done();
   *amax = 8000; return 1; }
 int dav2_accel_ostats_ok(void) { return 1; }
+#ifndef SMX_C
+#define SMX_C 1                         /* the softmax's normalisation on the block (round 32) */
+#endif
+int dav2_accel_smx_ok(void) { return SMX_C; }
+/* the exponential job, and M column sums written at the end */
+int dav2_accel_exp_async(const int32_t *acc, uint32_t cr_base, int N, int M,
+                         const int32_t *params, int16_t *out, int out_stride,
+                         const int16_t *lut, int lut_load, int32_t *msums)
+{ (void)params;(void)out;(void)out_stride;(void)lut;
+  if (!SMX_C || !EXP_C) return 0;
+  MMIO[7] = 1;
+  for (int m = 0; m < M; m++) msums[m] = 100000;     /* plausible sums */
+  MMIO[7] = 0;
+  onchip_last = acc == 0 && cr_base + (long)N * M <= CR_WORDS;
+  job_kind = K_RQ_EXP;
+  start_job(requant_cycles(N, M, 0, 0) + (lut_load ? 8192u * BEAT / 10 : 0) + (uint64_t)M * BEAT / 10);
+  return 2; }
+/* int16 in (M rows of N), parameters per row n (3N words), N x M out */
+int dav2_accel_norm16_async(const int16_t *pt, uint32_t pt_pitch, int N, int M,
+                            const int32_t *params, int16_t *out, int out_stride)
+{ (void)pt;(void)pt_pitch;(void)params;(void)out;(void)out_stride;
+  if (!SMX_C) return 0;
+  job_kind = K_SMX;
+  start_job(requant_cycles(N, M, 1, 0) - (uint64_t)3 * M * BEAT / 10 + (uint64_t)3 * N * BEAT / 10);
+  return 2; }
 #ifndef TP_C
 #define TP_C 1                          /* v^T by a transposition job (round 29) */
 #endif

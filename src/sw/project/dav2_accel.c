@@ -117,6 +117,9 @@
 #define CTRL_RNG      0x400000u
 #define CTRL_RNG_LOAD 0x800000u
 #define CTRL_DPAR     0x1000000u
+#define CTRL_MSUMS    0x2000000u
+#define CTRL_NPARAM   0x4000000u
+#define CTRL_SAT16    0x8000000u
 
 #define STATUS_BUSY 0x1u
 #define STATUS_DONE 0x2u
@@ -164,6 +167,8 @@ static int      accel_attcr_ok = 1;    /* its int16-weight use, cleared by its s
 static int      accel_tp_ok = 1;       /* the transposition job, cleared by its self-test */
 static int      accel_ln_ok;           /* CAPS bit 23, cleared if its self-test fails */
 static int      accel_rng_ok;          /* CAPS bit 22, cleared if its self-test fails */
+static int      accel_smx_ok;          /* CAPS bit 21, cleared if its self-test fails */
+static int32_t *accel_rq_msums;        /* the next requantisation writes column sums */
 /* the range unit: armed for the next GEMM operation, on while it runs */
 static dav2_accel_rng_t accel_rng_cfg;
 static int      accel_rng_armed, accel_rng_on, accel_rng_first, accel_rng_valid;
@@ -217,9 +222,10 @@ int dav2_accel_init(void)
 
     uint32_t caps = REG32(GEMM_CAPS);
     accel_nrows = caps & 0xffu;
-    accel_kmax  = (caps >> 8) & 0x3fffu;          /* bits 23, 22: LayerNorm, range */
+    accel_kmax  = (caps >> 8) & 0x1fffu;          /* bits 23..21: LayerNorm, range, softmax */
     accel_ln_ok = (int)((caps >> 23) & 1u);
     accel_rng_ok = (int)((caps >> 22) & 1u);
+    accel_smx_ok = (int)((caps >> 21) & 1u);
     accel_lut_ok = (int)((caps >> 24) & 1u);
     accel_a16_ok = (int)((caps >> 25) & 1u);
     accel_w16_ok = (int)((caps >> 26) & 1u);
@@ -560,6 +566,10 @@ static int accel_requant_rows(const void *acc, int N, int M, int m0, int mc,
     const int onchip = epi && epi->onchip;
     if (onchip)
         ctrl |= CTRL_ONCHIP;
+    const int nparam = epi && epi->nparam;
+    if (epi && epi->msums) ctrl |= CTRL_MSUMS;
+    if (nparam)            ctrl |= CTRL_NPARAM;
+    if (epi && epi->sat16) ctrl |= CTRL_SAT16;
     const int dpar = epi && epi->dpar;
     if (dpar) {
         ctrl |= CTRL_DPAR;
@@ -574,12 +584,17 @@ static int accel_requant_rows(const void *acc, int N, int M, int m0, int mc,
     REG32(GEMM_A_STRIDE) = onchip ? (uint32_t)N : (uint32_t)ipitch;
     REG32(GEMM_C_STRIDE) = (uint32_t)orow * 2u;
     REG32(GEMM_S_ADDR)   = 0u;
-    REG32(GEMM_P_ADDR)   = dpar ? 0u : (uint32_t)(uintptr_t)(params + (size_t)m0 * 3);
+    REG32(GEMM_P_ADDR)   = (dpar || nparam) ? 0u : (uint32_t)(uintptr_t)(params + (size_t)m0 * 3);
     REG32(GEMM_M_LEN)    = (uint32_t)mc;
     for (int n0 = 0; n0 < N; n0 += nc_max) {
         int nc = N - n0;
         if (nc > nc_max) nc = nc_max;
-        unsigned long beats = (dpar ? 0ul : (unsigned long)mc * 3u) + (unsigned long)mc * nc * esz / 4u
+        if (nparam)
+            REG32(GEMM_P_ADDR) = (uint32_t)(uintptr_t)(params + (size_t)n0 * 3);
+        if (epi && epi->msums)
+            REG32(GEMM_S_ADDR) = (uint32_t)(uintptr_t)epi->msums;
+        unsigned long beats = (dpar ? 0ul : (unsigned long)(nparam ? nc : mc) * 3u)
+                            + (unsigned long)mc * nc * esz / 4u
                             + (unsigned long)mc * nc / 2u
                             + (lut_load ? ((epi && epi->lut_int) ? 256u : 8192u) : 0u);
         REG32(GEMM_A_ADDR) = onchip ? accel_cr_base + (uint32_t)((size_t)m0 * N + n0)
@@ -945,6 +960,9 @@ int dav2_accel_requant_lut_async(const int32_t *acc, int N, int M, const int32_t
     epi.lut = lut;
     epi.lut_load = lut_load;
     epi.onchip = accel_rq_onchip;
+    epi.msums = accel_rq_msums;
+    if (epi.msums && (!accel_smx_ok || N > (int)accel_nrows || (((uintptr_t)epi.msums) & 3u)))
+        return 0;
     /* static: the deferred job's amax is written by dav2_accel_finish,
      * after this function has returned */
     static int32_t amax_sink;
@@ -1101,6 +1119,45 @@ int dav2_accel_qgemm_async(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t 
 }
 
 int dav2_accel_rng_ok(void) { return dav2_accel_init() && accel_rng_ok; }
+
+int dav2_accel_smx_ok(void) { return dav2_accel_init() && accel_smx_ok; }
+
+int dav2_accel_exp_async(const int32_t *acc, uint32_t cr_base, int N, int M,
+                         const int32_t *params, int16_t *out, int out_stride,
+                         const int16_t *lut, int lut_load, int32_t *msums)
+{
+    if (!dav2_accel_init() || !accel_smx_ok || !msums)
+        return 0;
+    accel_rq_msums = msums;
+    int r = acc ? dav2_accel_requant_lut_async(acc, N, M, params, out, out_stride, lut, lut_load)
+                : dav2_accel_requant_lut_cr_async(cr_base, N, M, params, out, out_stride, lut,
+                                                  lut_load);
+    accel_rq_msums = 0;
+    return r;
+}
+
+int dav2_accel_norm16_async(const int16_t *pt, uint32_t pt_pitch, int N, int M,
+                            const int32_t *params, int16_t *out, int out_stride)
+{
+    static int32_t amax_sink;
+    if (!dav2_accel_init() || !accel_smx_ok || !accel_a16_ok || N < 2 || (N & 1)
+        || N > (int)accel_nrows || M < 2 || (M & 1) || M > (int)(accel_kmax / 2u)
+        || (out_stride & 1) || out_stride < M || pt_pitch < (uint32_t)N * 2u
+        || ((((uintptr_t)pt) | ((uintptr_t)params) | ((uintptr_t)out) | pt_pitch) & 3u))
+        return 0;
+    dav2_rq_epi_t epi;
+    memset(&epi, 0, sizeof epi);
+    epi.nparam = 1;
+    epi.sat16 = 1;
+    accel_in_pitch = pt_pitch;
+    accel_out_stride = out_stride;
+    accel_defer = 1;
+    int r = accel_requant_rows(pt, N, M, 0, M, params, out, &amax_sink, &epi, 1);
+    accel_defer = 0;
+    accel_out_stride = 0;
+    accel_in_pitch = 0;
+    return r;
+}
 
 void dav2_accel_rng_next(const dav2_accel_rng_t *r)
 {
@@ -1682,6 +1739,70 @@ static int accel_check_attcr(void)
         accel_attcr_ok = 0;
     } else {
         printf("GEMM accelerator: attention result-RAM self-test ok\n");
+    }
+    return 0;
+}
+
+/* The softmax's normalisation: a P^T of 10 keys by 6 queries (rows 4 words
+ * apart), its column sums (CTRL.msums on a table-less int16 job) and the
+ * normalisation with one parameter row per query and 15-bit saturation. */
+static int accel_check_smx(void)
+{
+    if (!accel_smx_ok || !accel_a16_ok)
+        return 0;
+    enum { M = 10, N = 6, IP = 4, OS = 12 };
+    static int32_t par[3 * N], sums[M + 1];
+    int16_t *pt = chk_a, *out = chk_a + M * IP * 2;
+    uint32_t seed = 0x510e527fu;
+    for (int i = 0; i < M * IP * 2; i++)
+        pt[i] = (int16_t)(chk_rand(&seed) % 32768u);
+    for (int i = 0; i < N * OS; i++)
+        out[i] = 0x5a5a;
+    for (int n = 0; n < N; n++) {
+        par[3 * n] = (int32_t)(32768u + chk_rand(&seed) % 32767u);
+        par[3 * n + 1] = 16;
+        par[3 * n + 2] = 0;
+    }
+    sums[M] = 0x5a5a5a5a;
+    int ok = dav2_accel_norm16_async(pt, IP * 4u, N, M, par, out, OS) && dav2_accel_finish();
+    int bad = 0;
+    for (int n = 0; ok && n < N; n++)
+        for (int m = 0; m < OS; m++) {
+            int32_t e = 0x5a5a;
+            if (m < M) {
+                int64_t r = ((int64_t)pt[m * IP * 2 + n] * par[3 * n] + 32768) >> 16;
+                e = r > 32767 ? 32767 : (int32_t)r;
+            }
+            if (out[n * OS + m] != e) bad++;
+        }
+    /* the column sums, of an identity job over the same input */
+    static int32_t idp[3 * N];
+    for (int n = 0; n < N; n++) { idp[3 * n] = 1 << 30; idp[3 * n + 1] = 30; idp[3 * n + 2] = 0; }
+    if (ok) {
+        dav2_rq_epi_t epi;
+        memset(&epi, 0, sizeof epi);
+        epi.nparam = 1; epi.sat16 = 1; epi.msums = sums;
+        int32_t amax = 0;
+        accel_in_pitch = IP * 4u;
+        accel_out_stride = OS;
+        ok = accel_requant_rows(pt, N, M, 0, M, idp, out, &amax, &epi, 1) != 0;
+        accel_in_pitch = 0;
+        accel_out_stride = 0;
+        for (int m = 0; ok && m < M; m++) {
+            int32_t s = 0;
+            for (int n = 0; n < N; n++) s += pt[m * IP * 2 + n];
+            if (sums[m] != s) bad++;
+        }
+        if (ok && sums[M] != 0x5a5a5a5a) bad++;
+    }
+    if (!ok) {
+        printf("GEMM accelerator: softmax self-test could not run\n");
+        accel_smx_ok = 0;
+    } else if (bad) {
+        printf("GEMM accelerator: SOFTMAX SELF-TEST FAILED (%d), on the CPU\n", bad);
+        accel_smx_ok = 0;
+    } else {
+        printf("GEMM accelerator: softmax self-test ok\n");
     }
     return 0;
 }
@@ -2282,6 +2403,8 @@ int dav2_accel_check(void)
         bad = accel_check_ln();
     if (!bad)
         bad = accel_check_rng();
+    if (!bad)
+        bad = accel_check_smx();
     return bad;
 }
 
@@ -2374,6 +2497,15 @@ int dav2_accel_conv_async(const int16_t *img, int h, int w, int C, int k, int st
 int dav2_accel_grelu_ok(void) { return 0; }
 int dav2_accel_wsh_ok(void) { return 0; }
 int dav2_accel_rng_ok(void) { return 0; }
+int dav2_accel_smx_ok(void) { return 0; }
+int dav2_accel_exp_async(const int32_t *acc, uint32_t cr_base, int N, int M,
+                         const int32_t *params, int16_t *out, int out_stride,
+                         const int16_t *lut, int lut_load, int32_t *msums)
+{ (void)acc;(void)cr_base;(void)N;(void)M;(void)params;(void)out;(void)out_stride;(void)lut;
+  (void)lut_load;(void)msums; return 0; }
+int dav2_accel_norm16_async(const int16_t *pt, uint32_t pt_pitch, int N, int M,
+                            const int32_t *params, int16_t *out, int out_stride)
+{ (void)pt;(void)pt_pitch;(void)N;(void)M;(void)params;(void)out;(void)out_stride; return 0; }
 void dav2_accel_rng_next(const dav2_accel_rng_t *r) { (void)r; }
 int dav2_accel_rng_get(int64_t *vmax, int64_t *vmin) { (void)vmax; (void)vmin; return 0; }
 int dav2_accel_ln_ok(void) { return 0; }

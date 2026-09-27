@@ -13,6 +13,7 @@
 # FRAME_FLAGS=-DTP_C=0 models v^T made by the CPU (round twenty-eight).
 # FRAME_FLAGS=-DLN_C=0 models the block without the LayerNorm job (round twenty-nine).
 # FRAME_FLAGS=-DRNG_C=0 models the block without the range unit and CTRL.dpar (round thirty).
+# FRAME_FLAGS=-DSMX_C=0 models the softmax normalisation on the CPU (round thirty-one).
 HERE=$(cd "$(dirname "$0")" && pwd)
 SRC=${1:-$HERE/../..}
 GCC=$(command -v riscv-none-elf-gcc || ls ~/Public/xpack-riscv-none-elf-gcc-*/bin/riscv-none-elf-gcc | tail -1)

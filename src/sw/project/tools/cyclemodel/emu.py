@@ -193,7 +193,7 @@ if __name__ == "__main__":
                 "att prep v", "att softmax", "att normalise", "att wait", "gelu table"]
         kn = ["GEMM (encoder)", "GEMM (convolutions)", "GEMM (attention)", "requant",
               "requant + add", "requant int16 in", "requant context", "requant exp", "lerp",
-              "transpose", "layernorm"]
+              "transpose", "layernorm", "softmax norm"]
         by_site = {}
         for d, v in sub:
             if d >= 0x1000:                     # block idle by the job's call site

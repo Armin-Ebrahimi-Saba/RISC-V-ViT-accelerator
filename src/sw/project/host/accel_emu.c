@@ -29,7 +29,7 @@ static uint32_t regs[NREGS];
 /* the latched job */
 static struct {
     int      busy, requant, gather, add, relu, lut, lut_load, a16, w16, ostats, onchip, osums, grelu;
-    int      lutint, wsh, lerp, ln, lnb, rng, rngl, dpar;
+    int      lutint, wsh, lerp, ln, lnb, rng, rngl, dpar, msums, nparam, sat16;
     uint32_t dp_fk, dp_gb, dp_sh, dp_m0, rng_beta_m, rng_beta_sh;
     uint32_t ln_zs, ln_fm, ln_invm, ln_sh;
     uint32_t lut_addr;
@@ -177,13 +177,15 @@ static void requant_all(void)
             int64_t acc = job.onchip ? cr_ram[job.a_addr + m * job.a_stride + n]
                         : job.a16 ? ((const int16_t *)ptr(job.a_addr + m * job.a_stride))[n]
                                   : ((const int32_t *)ptr(job.a_addr + m * job.a_stride))[n];
-            int64_t mult = par[3 * m];
-            int     sh   = par[3 * m + 1];
+            const uint32_t pr = job.nparam ? n : m;          /* CTRL.nparam: by output row */
+            int64_t mult = par[3 * pr];
+            int     sh   = par[3 * pr + 1];
             int64_t r = acc * mult;
             if (sh > 0) r += (int64_t)1 << (sh - 1);
-            r = (r >> sh) + par[3 * m + 2];
-            if (r >  8191) r =  8191;
-            if (r < -8191) r = -8191;
+            r = (int64_t)(int32_t)(r >> sh) + par[3 * pr + 2];
+            const int64_t lim = job.sat16 ? 32767 : 8191;    /* CTRL.sat16 */
+            if (r >  lim) r =  lim;
+            if (r < -lim) r = -lim;
             if (job.add) {
                 /* the epilogue: residual and value rescaled, added, saturated */
                 int64_t x = ((const int16_t *)ptr(job.x_addr + n * job.c_stride))[m];
@@ -204,7 +206,12 @@ static void requant_all(void)
             int32_t a = r < 0 ? (int32_t)-r : (int32_t)r;
             if (a > amax) amax = a;
         }
-        if (job.ostats) {
+        if (job.msums) {
+            /* CTRL.msums: each m's sum over the job's rows */
+            int32_t *sv = (int32_t *)ptr(job.s_addr);
+            for (uint32_t m = 0; m < job.m; m++)
+                sv[m] = (n ? sv[m] : 0) + orow[m];
+        } else if (job.ostats) {
             int16_t mx = orow[0], mn = orow[0];
             for (uint32_t m = 1; m < job.m; m++) {
                 if (orow[m] > mx) mx = orow[m];
@@ -273,6 +280,11 @@ static void latch(void)
     job.rng      = ((ctrl >> 22) & 1u) && !job.requant && !job.ln && !job.lerp;
     job.rngl     = ((ctrl >> 23) & 1u) && job.rng;
     job.dpar     = ((ctrl >> 24) & 1u) && job.requant;
+    job.msums    = ((ctrl >> 25) & 1u) && job.requant;
+    job.nparam   = ((ctrl >> 26) & 1u) && job.requant && !job.dpar;
+    job.sat16    = ((ctrl >> 27) & 1u) && job.requant;
+    if (job.sat16 && (job.lut || job.add)) fail("CTRL.sat16 with the table or the add");
+    if (job.msums && (R(S_ADDR) & 3u)) fail("CTRL.msums: S_ADDR unaligned");
     job.rng_beta_m = R(RNG_BETA_M); job.rng_beta_sh = R(RNG_BETA_SH);
     job.dp_fk    = R(DP_FK);    job.dp_gb    = R(DP_GB);
     job.dp_sh    = R(DP_SH);    job.dp_m0    = R(DP_M0) & 0x7ffu;
@@ -461,7 +473,7 @@ volatile uint32_t *dav2_emu_reg(uint32_t addr)
     static int init;
     if (!init) {
         init = 1;
-        R(CAPS) = (255u << 24) | (3u << 22) | ((uint32_t)KMAX << 8) | NROWS;   /* bits 24-31: table, int16 input and weights, row statistics, result RAM, tap reuse, row sums, gather ReLU; bit 23: LayerNorm */
+        R(CAPS) = (255u << 24) | (7u << 21) | ((uint32_t)KMAX << 8) | NROWS;   /* bits 24-31: table, int16 input and weights, row statistics, result RAM, tap reuse, row sums, gather ReLU; bit 23: LayerNorm */
     }
     if (addr < STUDENT_GEMM0_BASE_ADDR || addr >= STUDENT_GEMM0_BASE_ADDR + NREGS * 4u)
         fail("register access outside the block");

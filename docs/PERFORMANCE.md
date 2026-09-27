@@ -1,4 +1,4 @@
-# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 1.35 s (estimated)
+# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 1.31 s (estimated)
 
 This is the record of the speed-up work: what was measured, what each change
 did, and what is left. Every step kept the FPGA output **bit-exact with the
@@ -1407,6 +1407,50 @@ Model: CPU range and parameters 14.0 → 0.8 Mcycles; the frame gains only
 this work while the GEMM ran. The block now waits mostly for the token
 embedding, the LayerNorm statistics, the gaps between requantisation
 chunks and the attention's softmax on the CPU.
+
+### Round thirty-two — the softmax's normalisation on the block (hardware; estimated, not yet measured)
+
+After the exponential job (P^T, round twenty), the CPU added up each
+query's column (1.5 Mcycles per frame) and wrote P[q][key] = round(p ·
+i_q / 2^16), i_q = (2^31 − 2^16) / sum_q (4.4 Mcycles). The attention was
+limited by this CPU work.
+
+Three requantisation options (CAPS bit 21):
+- **`CTRL.msums`**: at the end of the job, M words to S_ADDR: each column
+  m's sum over the job's rows. The final value of each element and its m
+  travel down the output pipeline; a LUT RAM (1024 × 32) accumulates them.
+  The exponential job uses it: its m are the queries.
+- **`CTRL.nparam`**: the parameter table has N_ROWS rows, and output row n
+  uses row n (the parameter RAM is read at n instead of m).
+- **`CTRL.sat16`**: saturation at ±32767 instead of ±8191.
+
+With nparam and sat16 an int16-input job turns P^T (rows = keys) into P
+(rows = queries) with the query's i_q (`dav2_accel_norm16_async`): the
+CPU's formula, (p i + 2^15) >> 16, so the same P. P's padding columns are
+zeroed once per attention call. With these options the attention runs a
+simple loop, one head after the other: v^T, S, the exponential job with
+the sums, 82 divisions on the CPU, the normalisation, C, the context. The
+old loop stays for a block without the options; a declined or failed job
+falls back to the CPU's softmax or normalisation. A boot self-test
+("softmax self-test ok") checks the normalisation and the column sums on
+10 keys by 6 queries.
+
+Checks: `student_gemm_tb`: five cases (the attention's 82 × 82 with and
+without sums, 14-bit with bias, 128 × 1024, 2 × 2), every output, the
+gaps, the sums. PASSED, 1,026,679 words. Same output, bit for bit (11
+images; an emulator without the options). Bus errors injected into each
+of the first 300 jobs, with AddressSanitizer and UBSan: no errors.
+Bitstream: timing met, WNS +0.395 ns (DDR3 controller), worst `sys_clk`
+path +0.749 ns, WHS +0.047 ns; LUT 36.5 % (LUTRAM 15.6 %), BRAM 92.6 %,
+DSP 42.7 %. The sums RAM was first a LUT RAM with an asynchronous read,
+which gave 256 SYNTH-5 warnings; it is now one block RAM with a
+registered read (the sum of m is read a stage before it is written; the
+output words take two cycles each), and the warnings are those of round
+thirty-one.
+
+Model: attention 8.9 → 6.4 Mcycles (the block +1.1 for the normalisation
+jobs; block idle before the attention's GEMMs 2.6 → 0.3); frame 70.5 →
+68.0 Mcycles, **about 1.31 s**. About 2167 jobs per frame.
 
 ## 7. What is left, in order of expected gain
 
