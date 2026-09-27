@@ -60,6 +60,27 @@ module student_gemm_tb;
   localparam logic [31:0] R_ADD_MH   = 32'h6c;
   localparam logic [31:0] R_ADD_SH   = 32'h70;
   localparam logic [31:0] R_LUT_ADDR = 32'h74;
+  localparam logic [31:0] R_LN_ZS    = 32'h78;
+  localparam logic [31:0] R_LN_FM    = 32'h7c;
+  localparam logic [31:0] R_LN_INVM  = 32'h80;
+  localparam logic [31:0] R_LN_SH    = 32'h84;
+  localparam logic [31:0] R_LN_YLO   = 32'h88;
+  localparam logic [31:0] R_LN_YHI   = 32'h8c;
+  localparam logic [31:0] R_RNG_S    = 32'h90;
+  localparam logic [31:0] R_RNG_B    = 32'h94;
+  localparam logic [31:0] R_RNG_E    = 32'h98;
+  localparam logic [31:0] R_RNG_BM   = 32'h9c;
+  localparam logic [31:0] R_RNG_BSH  = 32'ha0;
+  localparam logic [31:0] R_DP_FK    = 32'ha4;
+  localparam logic [31:0] R_DP_GB    = 32'ha8;
+  localparam logic [31:0] R_DP_SH    = 32'hac;
+  localparam logic [31:0] R_DP_M0    = 32'hb0;
+  localparam logic [31:0] R_RNG_XLO  = 32'hb4;
+  localparam logic [31:0] R_RNG_XHI  = 32'hb8;
+  localparam logic [31:0] R_RNG_NLO  = 32'hbc;
+  localparam logic [31:0] R_RNG_NHI  = 32'hc0;
+  localparam logic [31:0] RS_BASE    = 32'h8018_0000;   // range table: scales
+  localparam logic [31:0] RB_BASE    = 32'h8018_8000;   // range table: biases
   localparam logic [31:0] L_BASE     = 32'h801C_0000;   // requant: lookup table
   localparam logic [31:0] X_BASE     = 32'h8016_0000;   // requant: residual
   localparam logic [31:0] S_BASE     = 32'h800C_0000;   // per-row {max,min}
@@ -1159,6 +1180,342 @@ module student_gemm_tb;
     end
   endtask
 
+  // LayerNorm job (CTRL.ln): phase A, then phase B. N tokens of C channels
+  // at A_BASE (rows astride_w words apart), token parameters at P_BASE,
+  // gamma at W_BASE, beta at X_BASE; output rows ostride_w words apart.
+  function automatic int ln_sat(input longint v);
+    return (v > 8191) ? 8191 : (v < -8191) ? -8191 : int'(v);
+  endfunction
+  function automatic int ln_rq(input longint x, input longint mult, input int sh, input longint bias);
+    longint p;
+    int v32;
+    p = x * mult;
+    if (sh != 0) p = p + (64'sd1 <<< (sh - 1));
+    p = p >>> sh;
+    v32 = int'(p[31:0]);
+    return ln_sat(longint'(v32) + bias);
+  endfunction
+  task automatic ln_wait(input string what);
+    logic [31:0] st;
+    int guard = 0;
+    forever begin
+      bus.get_word(R_STATUS, st);
+      if (!(st & 32'h1)) break;
+      if (++guard > 400000) begin
+        $display("FAIL: LN %s did not finish (status=0x%08x)", what, st);
+        errors++;
+        return;
+      end
+    end
+    if (st & 32'h4) begin
+      $display("FAIL: LN %s: bus error latched", what);
+      errors++;
+    end
+  endtask
+  task automatic run_ln(input int ndim, input int cdim, input int astride_w, input int ostride_w);
+    int mismatches = 0;
+    int zq [][];
+    longint mult [], bias [], g [], b [];
+    int sh [];
+    longint zs = $urandom % (1 << 24);
+    longint ymax = 0;
+    longint fm = 32'h4000_0000 + ($urandom % 32'h3fff_ffff);
+    longint invm = 32'h4000_0000 + ($urandom % 32'h3fff_ffff);
+    int shift = 29 + ($urandom % 4), rr = $urandom % 3, bsr = 5 + ($urandom % 4);
+    int amax = 0;
+    logic [31:0] ylo, yhi, am;
+    $display("--- LayerNorm N=%0d C=%0d (row strides %0d, %0d words)", ndim, cdim, astride_w, ostride_w);
+    zq = new[ndim];
+    mult = new[ndim]; bias = new[ndim]; sh = new[ndim];
+    g = new[cdim]; b = new[cdim];
+    for (int t = 0; t < ndim; t++) begin
+      zq[t] = new[cdim];
+      mult[t] = 32'h2000_0000 + ($urandom % 32'h5fff_ffff);
+      sh[t]   = 31 + ($urandom % 4);
+      bias[t] = longint'($signed($urandom % 4001)) - 2000;
+      memory.mem[mem_word(P_BASE) + 3 * t]     = mult[t][31:0];
+      memory.mem[mem_word(P_BASE) + 3 * t + 1] = sh[t];
+      memory.mem[mem_word(P_BASE) + 3 * t + 2] = bias[t][31:0];
+      for (int w = 0; w < astride_w; w++)
+        memory.mem[mem_word(A_BASE) + t * astride_w + w] =
+            {16'($signed($urandom % 16383) - 8191), 16'($signed($urandom % 16383) - 8191)};
+    end
+    for (int c = 0; c < cdim; c++) begin
+      g[c] = longint'($signed($urandom % (1 << 19))) - (1 << 18);
+      b[c] = longint'($signed($urandom % (1 << 21))) - (1 << 20);
+      memory.mem[mem_word(W_BASE) + c] = g[c][31:0];
+      memory.mem[mem_word(X_BASE) + c] = b[c][31:0];
+    end
+    for (int i = 0; i < ndim * ostride_w; i++)
+      memory.mem[mem_word(O_BASE) + i] = 32'hdead_beef;
+    // reference: zq, the channel extremes, the largest |y|
+    for (int t = 0; t < ndim; t++)
+      for (int c = 0; c < cdim; c++) begin
+        logic [31:0] xw = memory.mem[mem_word(A_BASE) + t * astride_w + c / 2];
+        longint x = c[0] ? longint'($signed(xw[31:16])) : longint'($signed(xw[15:0]));
+        zq[t][c] = ln_rq(x, mult[t], sh[t], bias[t]);
+      end
+    for (int c = 0; c < cdim; c++) begin
+      int lo = zq[0][c], hi = zq[0][c];
+      longint gg = g[c] * zs;
+      for (int t = 1; t < ndim; t++) begin
+        if (zq[t][c] < lo) lo = zq[t][c];
+        if (zq[t][c] > hi) hi = zq[t][c];
+      end
+      for (int k = 0; k < 2; k++) begin
+        longint y = ((longint'(k ? hi : lo) * gg) >>> 31) + b[c];
+        if (y < 0) y = -y;
+        if (y > ymax) ymax = y;
+      end
+    end
+    // phase A
+    bus.put_word(R_A_ADDR,   A_BASE);
+    bus.put_word(R_A_STRIDE, astride_w * 4);
+    bus.put_word(R_K_LEN,    cdim);
+    bus.put_word(R_N_ROWS,   ndim);
+    bus.put_word(R_M_LEN,    ndim);
+    bus.put_word(R_P_ADDR,   P_BASE);
+    bus.put_word(R_W_ADDR,   W_BASE);
+    bus.put_word(R_X_ADDR,   X_BASE);
+    bus.put_word(R_LN_ZS,    zs[31:0]);
+    bus.put_word(R_CTRL,     32'h1 | 32'h10_0000);
+    ln_wait("phase A");
+    bus.get_word(R_LN_YLO, ylo);
+    bus.get_word(R_LN_YHI, yhi);
+    checks++;
+    if ({yhi, ylo} !== ymax[63:0]) begin
+      $display("  FAIL: LN_YMAX 0x%016x, expected 0x%016x", {yhi, ylo}, ymax);
+      mismatches++;
+    end
+    // phase B
+    bus.put_word(R_C_ADDR,   O_BASE);
+    bus.put_word(R_C_STRIDE, ostride_w * 4);
+    bus.put_word(R_LN_FM,    fm[31:0]);
+    bus.put_word(R_LN_INVM,  invm[31:0]);
+    bus.put_word(R_LN_SH,    shift | (rr << 8) | (bsr << 16));
+    bus.put_word(R_CTRL,     32'h1 | 32'h30_0000);
+    ln_wait("phase B");
+    for (int c = 0; c < cdim; c++) begin
+      longint gc, bc;
+      gc = ((longint'(int'(g[c][31:0] << 12)) * fm) >>> 32) >>> rr;
+      bc = (((b[c] * invm) >>> 32) + (64'sd1 <<< (bsr - 1))) >>> bsr;
+      gc = longint'(int'(gc[31:0]));
+      bc = longint'(int'(bc[31:0]));
+      for (int t = 0; t < ndim; t++) begin
+        logic [31:0] ow;
+        int got, e, ae, zi;
+        ow = memory.mem[mem_word(O_BASE) + t * ostride_w + c / 2];
+        got = c[0] ? int'($signed(ow[31:16])) : int'($signed(ow[15:0]));
+        zi = zq[t][c];                    // via int: xsim widens zq[t][c] wrongly
+        e = ln_rq(zi, gc, shift, bc);
+        ae = e < 0 ? -e : e;
+        if (ae > amax) amax = ae;
+        checks++;
+        if (got !== e) begin
+          if (mismatches < 5)
+            $display("  FAIL t=%0d c=%0d: got %0d expected %0d (zq %0d, G %0d, B %0d, g %0d, b %0d, fm %0d, invm %0d, sh %0d rr %0d bsr %0d)",
+                     t, c, got, e, zq[t][c], gc, bc, g[c], b[c], fm, invm, shift, rr, bsr);
+          mismatches++;
+        end
+      end
+    end
+    for (int t = 0; t < ndim; t++)
+      for (int w = cdim / 2; w < ostride_w; w++)
+        if (memory.mem[mem_word(O_BASE) + t * ostride_w + w] !== 32'hdead_beef) begin
+          if (mismatches < 5) $display("  FAIL: gap word t=%0d w=%0d written", t, w);
+          mismatches++;
+        end
+    bus.get_word(R_RQ_AMAX, am);
+    if (am !== amax) begin
+      $display("  FAIL: RQ_AMAX %0d, expected %0d", am, amax);
+      mismatches++;
+    end
+    if (mismatches) begin
+      $display("  %0d wrong", mismatches);
+      errors += mismatches;
+    end else
+      $display("  ok, %0d outputs, largest |y| %0d", ndim * cdim, ymax);
+  endtask
+
+  // Range unit (CTRL.rng) and derived parameters (CTRL.dpar): a GEMM whose
+  // first tile loads the table, RNG_VMAX/VMIN against the reference, then
+  // its requantisation in chunks of chunk rows with the parameters derived
+  // by the block. onchip: the result stays in the result RAM; lut: the
+  // requantisation maps through a table loaded by the first chunk.
+  function automatic int rng_align(input int m, input int sh, input int e);
+    int d = sh - e;
+    return (d > 31) ? ((m < 0) ? -1 : 0) : (d < 0) ? 0 : (m >>> d);
+  endfunction
+  function automatic int rng_mulh(input int a, input int b);
+    longint p;
+    p = longint'(a) * longint'(b);
+    return int'(p >>> 32);
+  endfunction
+  task automatic rq_wait(input string what);
+    logic [31:0] st;
+    int guard = 0;
+    forever begin
+      bus.get_word(R_STATUS, st);
+      if (!(st & 32'h1)) break;
+      if (++guard > 400000) begin
+        $display("FAIL: %s did not finish (status=0x%08x)", what, st);
+        errors++;
+        return;
+      end
+    end
+    if (st & 32'h4) begin
+      $display("FAIL: %s: bus error latched", what);
+      errors++;
+    end
+  endtask
+  task automatic run_rng(input int ndim, input int kdim, input int mdim, input int bias,
+                         input int onchip, input int lut, input int chunk);
+    int mismatches = 0;
+    int S [2048], B [2048];
+    int es = 1 << 30, eb = 1 << 30;
+    int beta_m = 32'h4000_0000 + ($urandom % 32'h3fff_ffff), beta_sh = $urandom % 8;
+    int fk = 32'h4000_0000 + ($urandom % 32'h3fff_ffff), gb = 32'h4000_0000 + ($urandom % 32'h3fff_ffff);
+    int shift = 40 + ($urandom % 5), r = $urandom % 3, k = 5 + ($urandom % 16);
+    longint vmax = 0, vmin = 0;
+    logic [31:0] xlo, xhi, nlo, nhi;
+    $display("--- RANGE N=%0d K=%0d M=%0d%s%s%s, chunks of %0d", ndim, kdim, mdim,
+             bias ? ", bias" : "", onchip ? ", on chip" : "", lut ? ", table" : "", chunk);
+    for (int n = 0; n < ndim; n++)
+      for (int kk = 0; kk < kdim; kk++)
+        poke_a(n, kk, kdim, 16'($signed($urandom % 16383) - 8191));
+    for (int m = 0; m < mdim; m++)
+      for (int kk = 0; kk < kdim; kk++)
+        poke_w(m, kk, kdim, 8'($signed($urandom % 255) - 127));
+    // the table: scales {m, sh}, biases (some zero)
+    for (int m = 0; m < mdim; m++) begin
+      int sm = 32'h4000_0000 + ($urandom % 32'h3fff_ffff), ssh = 40 + ($urandom % 20);
+      int bm = (32'h4000_0000 + ($urandom % 32'h3fff_ffff)) * ((m & 1) ? -1 : 1);
+      int bsh = 30 + ($urandom % 40);
+      if (m % 7 == 3) begin bm = 0; bsh = 0; end
+      memory.mem[mem_word(RS_BASE) + 2 * m]     = sm;
+      memory.mem[mem_word(RS_BASE) + 2 * m + 1] = ssh;
+      memory.mem[mem_word(RB_BASE) + 2 * m]     = bm;
+      memory.mem[mem_word(RB_BASE) + 2 * m + 1] = bsh;
+      if (ssh < es) es = ssh;
+      if (bm != 0 && bsh < eb) eb = bsh;
+    end
+    if (!bias) eb = 0;
+    for (int m = 0; m < mdim; m++) begin
+      S[m] = rng_align(int'(memory.mem[mem_word(RS_BASE) + 2 * m]), int'(memory.mem[mem_word(RS_BASE) + 2 * m + 1]), es);
+      B[m] = bias ? rng_align(int'(memory.mem[mem_word(RB_BASE) + 2 * m]), int'(memory.mem[mem_word(RB_BASE) + 2 * m + 1]), eb) : 0;
+    end
+    // the GEMM, tile by tile; the first loads the table
+    bus.put_word(R_RNG_S,   RS_BASE);
+    bus.put_word(R_RNG_B,   bias ? RB_BASE : 32'h0);
+    bus.put_word(R_RNG_E,   (eb << 16) | (es & 32'hffff));
+    bus.put_word(R_RNG_BM,  beta_m);
+    bus.put_word(R_RNG_BSH, beta_sh);
+    for (int n0 = 0; n0 < ndim; n0 += NROWS) begin
+      int nt = (ndim - n0 > int'(NROWS)) ? NROWS : ndim - n0;
+      ctrl_extra = 32'h40_0000 | (n0 == 0 ? 32'h80_0000 : 32'h0) | (onchip ? 32'h400 : 32'h0);
+      run_job(A_BASE + 32'(n0 * kdim * 2), W_BASE,
+              onchip ? 32'(n0) : C_BASE + 32'(n0 * 4),
+              onchip ? ndim : ndim * 4, kdim, mdim, nt, 0, 0);
+    end
+    ctrl_extra = 32'h0;
+    // the reference: accumulators, the range over rows and tiles
+    begin
+      int acc [];
+      acc = new[mdim * ndim];
+      for (int m = 0; m < mdim; m++)
+        for (int n = 0; n < ndim; n++) begin
+          int v = 0;
+          for (int kk = 0; kk < kdim; kk++)
+            v += int'(peek_a(n, kk, kdim)) * int'(peek_w(m, kk, kdim));
+          acc[m * ndim + n] = v;
+        end
+      for (int n0 = 0; n0 < ndim; n0 += NROWS) begin
+        int nt = (ndim - n0 > int'(NROWS)) ? NROWS : ndim - n0;
+        for (int m = 0; m < mdim; m++) begin
+          int mx = acc[m * ndim + n0], mn = acc[m * ndim + n0], bv;
+          longint hv, lv;
+          for (int n = n0; n < n0 + nt; n++) begin
+            if (acc[m * ndim + n] > mx) mx = acc[m * ndim + n];
+            if (acc[m * ndim + n] < mn) mn = acc[m * ndim + n];
+          end
+          bv = rng_mulh(B[m], beta_m) >>> beta_sh;
+          hv = longint'(rng_mulh(mx, S[m])) + longint'(bv);
+          lv = longint'(rng_mulh(mn, S[m])) + longint'(bv);
+          if (hv > vmax) vmax = hv;
+          if (lv < vmin) vmin = lv;
+        end
+      end
+      bus.get_word(R_RNG_XLO, xlo); bus.get_word(R_RNG_XHI, xhi);
+      bus.get_word(R_RNG_NLO, nlo); bus.get_word(R_RNG_NHI, nhi);
+      checks += 2;
+      if ({xhi, xlo} !== vmax[63:0] || {nhi, nlo} !== vmin[63:0]) begin
+        $display("  FAIL: RNG_VMAX %0d VMIN %0d, expected %0d, %0d", $signed({xhi, xlo}),
+                 $signed({nhi, nlo}), vmax, vmin);
+        mismatches++;
+      end
+      // the table for the requantisation
+      if (lut)
+        for (int i = 0; i < 8192; i++) begin
+          int e0 = ((2 * i) - 8192) * 3 / 4, e1 = ((2 * i + 1) - 8192) * 3 / 4;
+          memory.mem[mem_word(L_BASE) + i] = {16'(e1), 16'(e0)};
+        end
+      for (int i = 0; i < ndim * mdim / 2; i++)
+        memory.mem[mem_word(O_BASE) + i] = 32'hdead_beef;
+      // the requantisation, parameters from the table
+      bus.put_word(R_DP_FK, fk);
+      bus.put_word(R_DP_GB, gb);
+      bus.put_word(R_DP_SH, shift | (r << 8) | (k << 16) | (bias ? 0 : (1 << 24)));
+      bus.put_word(R_LUT_ADDR, L_BASE);
+      for (int m0 = 0; m0 < mdim; m0 += chunk) begin
+        int mc = (mdim - m0 > chunk) ? chunk : mdim - m0;
+        for (int n0 = 0; n0 < ndim; n0 += NROWS) begin
+          int nc = (ndim - n0 > int'(NROWS)) ? NROWS : ndim - n0;
+          bus.put_word(R_A_ADDR,   onchip ? 32'(m0 * ndim + n0) : C_BASE + 32'((m0 * ndim + n0) * 4));
+          bus.put_word(R_A_STRIDE, onchip ? ndim : ndim * 4);
+          bus.put_word(R_P_ADDR,   32'h0);
+          bus.put_word(R_C_ADDR,   O_BASE + 32'(n0 * mdim * 2 + m0 * 2));
+          bus.put_word(R_C_STRIDE, mdim * 2);
+          bus.put_word(R_M_LEN,    mc);
+          bus.put_word(R_N_ROWS,   nc);
+          bus.put_word(R_DP_M0,    m0);
+          bus.put_word(R_CTRL,     32'h3 | 32'h100_0000 | (onchip ? 32'h400 : 32'h0)
+                                   | (lut ? (32'h20 | ((m0 == 0 && n0 == 0) ? 32'h40 : 32'h0)) : 32'h0));
+          rq_wait("dpar requant");
+        end
+      end
+      for (int m = 0; m < mdim; m++) begin
+        int mult, bb;
+        mult = rng_mulh(S[m], fk) >>> r;
+        if (bias) begin
+          longint t;
+          t = longint'(rng_mulh(B[m], gb)) + (64'sd1 <<< (k - 1));
+          bb = int'(t >>> k);
+        end else bb = 0;
+        for (int n = 0; n < ndim; n++) begin
+          int e, got, idx;
+          logic [31:0] w;
+          e = ln_rq(acc[m * ndim + n], mult, shift, bb);
+          if (lut) e = (e * 3) / 4;
+          idx = n * mdim + m;
+          w = memory.mem[mem_word(O_BASE) + (idx >> 1)];
+          got = idx[0] ? int'($signed(w[31:16])) : int'($signed(w[15:0]));
+          checks++;
+          if (got !== e) begin
+            if (mismatches < 5)
+              $display("  FAIL n=%0d m=%0d: got %0d expected %0d (acc %0d mult %0d bias %0d)",
+                       n, m, got, e, acc[m * ndim + n], mult, bb);
+            mismatches++;
+          end
+        end
+      end
+    end
+    if (mismatches) begin
+      $display("  %0d wrong", mismatches);
+      errors += mismatches;
+    end else
+      $display("  ok, range %0d .. %0d, %0d outputs", vmin, vmax, ndim * mdim);
+  endtask
+
   // ------------------------------------------------------------------ main
 
   initial begin
@@ -1171,12 +1528,25 @@ module student_gemm_tb;
     bus.reset();
 
     bus.get_word(R_CAPS, caps);
-    $display("caps = 0x%08x (nrows=%0d kmax=%0d)", caps, caps[7:0], caps[23:8]);
-    if (caps[7:0] !== NROWS[7:0] || caps[23:8] !== KMAX[15:0]) begin
+    $display("caps = 0x%08x (nrows=%0d kmax=%0d)", caps, caps[7:0], caps[21:8]);
+    if (caps[7:0] !== NROWS[7:0] || caps[21:8] !== KMAX[13:0] || caps[23:22] !== 2'b11) begin
       $display("FAIL: caps does not match the parameters");
       errors++;
     end
 
+    if ($test$plusargs("rng_only")) begin
+      run_rng(20, 64, 30, 1, 0, 0, 16);
+      run_rng(130, 32, 40, 0, 0, 1, 20);
+      run_rng(82, 64, 60, 1, 1, 0, 32);
+      $display("student_gemm_tb RNG-only: %0d errors", errors);
+      $finish;
+    end
+    if ($test$plusargs("ln_only")) begin
+      run_ln(3, 6, 4, 5);
+      run_ln(82, 384, 200, 196);
+      $display("student_gemm_tb LN-only: %0d errors", errors);
+      $finish;
+    end
     run_gemm(4,  8,   3);    // smaller than one tile
     // Partial FIRST tile with a weight stream long enough that reads are
     // still being issued after the first drain. This is the shape the
@@ -1271,6 +1641,29 @@ module student_gemm_tb;
     run_onchip(20, 128, 30);
     // and a plain job afterwards must not use the table
     run_gemm(20, 64, 30);    run_requant_epi(20, 30, 1);
+    stats_addr = 0;
+
+    // LayerNorm jobs (CTRL.ln): the encoder's shape, a full tile, tiny
+    // and odd shapes, KMAX; then the other jobs again
+    run_ln(82, 384, 192, 192);
+    run_ln(82, 384, 200, 196);
+    run_ln(1, 2, 1, 2);
+    run_ln(3, 6, 4, 5);
+    run_ln(128, 512, 256, 256);
+    run_ln(4, 2048, 1024, 1024);
+    run_gemm(20, 64, 30);    stats_addr = S_BASE;
+    run_gemm(20, 64, 30);    run_requant_epi(20, 30, 1);
+    run_requant_a16(82, 384, 0);
+    // the range unit and derived parameters (CTRL.rng, CTRL.dpar), with and
+    // without statistics, then the plain jobs again
+    run_rng(82, 64, 60, 1, 0, 0, 32);
+    run_rng(20, 64, 30, 1, 1, 0, 16);            // on chip
+    stats_addr = 0;
+    run_rng(130, 32, 40, 0, 0, 1, 20);           // two tiles, no bias, table
+    run_rng(3, 8, 2048, 1, 0, 0, 1024);          // the whole table
+    run_rng(82, 64, 60, 1, 1, 1, 60);            // on chip with the table
+    stats_addr = S_BASE;
+    run_gemm(20, 64, 30);    run_requant(20, 30);
     stats_addr = 0;
 
     // Convolutions through gather mode.

@@ -62,7 +62,7 @@ int putchar(int c) { return c; }
  *        output one element per cycle, N*M/2 words written. */
 #define BEAT 21                         /* tenths of a cycle per bus word */
 static uint64_t busy_until;
-enum { K_GEMM_ENC, K_GEMM_CONV, K_ATT, K_RQ, K_RQ_ADD, K_RQ16, K_RQ_CTX, K_RQ_EXP, K_LERP, K_TP, K_N };
+enum { K_GEMM_ENC, K_GEMM_CONV, K_ATT, K_RQ, K_RQ_ADD, K_RQ16, K_RQ_CTX, K_RQ_EXP, K_LERP, K_TP, K_LN, K_N };
 static uint64_t acc_time[K_N];          /* modelled job time by kind, reported at the end */
 static void wait_done(void)
 {
@@ -75,14 +75,21 @@ static void wait_done(void)
 }
 static int job_kind;
 static uint64_t idle_before[K_N];       /* block idle before a job, by the job's kind */
-static void start_job(uint64_t cyc)
+static void start_job_at(uint64_t cyc, uintptr_t site)
 {
     const uint64_t now0 = dav2_cycles();
-    if (busy_until && now0 > busy_until) idle_before[job_kind] += now0 - busy_until;
+    if (busy_until && now0 > busy_until) {
+        idle_before[job_kind] += now0 - busy_until;
+        /* by call site (IDLE_SITES=n in emu.py prints the largest) */
+        MMIO[7] = 1;
+        MMIO[3] = (uint32_t)site; MMIO[4] = (uint32_t)(now0 - busy_until);
+        MMIO[7] = 0;
+    }
     acc_time[job_kind] += cyc;
     wait_done();
     busy_until = dav2_cycles() + cyc;
 }
+#define start_job(c) start_job_at((c), (uintptr_t)__builtin_return_address(0))
 #ifndef MACW
 #define MACW 2                          /* weights per MAC cycle (1 before round 15) */
 #endif
@@ -131,6 +138,41 @@ static uint64_t gemm_core(int N, int K, int M, int w16, int onchip, int rk, int 
     }
     return c;
 }
+#ifndef RNG_C
+#define RNG_C 1                         /* the range unit and CTRL.dpar (round 31) */
+#endif
+static int32_t stats_buf[2 * 4096];      /* the statistics the stubs return (below) */
+static int rng_armed, rng_valid, rng_m;
+static dav2_accel_rng_t rng_cfg;
+int dav2_accel_rng_ok(void) { return RNG_C; }
+void dav2_accel_rng_next(const dav2_accel_rng_t *r) { rng_cfg = *r; rng_armed = RNG_C; }
+static int32_t st_mulh(int32_t a, int32_t b) { return (int32_t)(((int64_t)a * b) >> 32); }
+static int32_t st_align(dav2_xf_t v, int e)
+{ int d = v.sh - e; return d > 31 ? (v.m < 0 ? -1 : 0) : d < 0 ? 0 : (v.m >> d); }
+/* the range the block would report for the statistics the stubs return
+ * (stats_buf), computed in a section the model does not count */
+int dav2_accel_rng_get(int64_t *vmax, int64_t *vmin)
+{
+    if (!rng_valid) return 0;
+    rng_valid = 0;
+    MMIO[7] = 1;
+    int64_t hx = 0, hn = 0;
+    for (int m = 0; m < rng_m; m++) {
+        const int32_t S = st_align(rng_cfg.s[m], rng_cfg.es);
+        const int32_t B = rng_cfg.b ? st_align(rng_cfg.b[m], rng_cfg.eb) : 0;
+        const int32_t bv = st_mulh(B, rng_cfg.beta_m) >> rng_cfg.beta_sh;
+        const int64_t hv = (int64_t)st_mulh(stats_buf[2 * m], S) + bv;
+        const int64_t lv = (int64_t)st_mulh(stats_buf[2 * m + 1], S) + bv;
+        if (hv > hx) hx = hv;
+        if (lv < hn) hn = lv;
+    }
+    MMIO[7] = 0;
+    *vmax = hx; *vmin = hn; return 1;
+}
+/* the table load of an operation's first job (scales and biases, 4M words) */
+static uint64_t rng_take(int M)
+{ uint64_t c = rng_armed ? (uint64_t)4 * M * BEAT / 10 : 0; rng_valid = rng_armed; rng_armed = 0;
+  rng_m = M; return c; }
 static uint64_t gemm_cycles(int N, int K, int M, int w16)
 {
     const int onchip = ONCHIP_C && N <= 128 && (long)N * M <= CR_WORDS && !w16;
@@ -148,7 +190,7 @@ static uint64_t requant_cycles(int N, int M, int in16, int add)
 static int32_t stats_buf[2 * 4096];
 int dav2_accel_qgemm_async(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc,
                            dav2_accel_stats_t *st)
-{ (void)acc; job_kind = K_GEMM_ENC; start_job(gemm_cycles(a->n, a->c, wt->m, 0));
+{ (void)acc; job_kind = K_GEMM_ENC; start_job(gemm_cycles(a->n, a->c, wt->m, 0) + rng_take(wt->m));
   st->v = stats_buf; st->tiles = 1; return 2; }
 #ifndef GRELU_C
 #define GRELU_C 1                       /* ReLU while gathering, CTRL.grelu (round 19) */
@@ -181,7 +223,8 @@ int dav2_accel_conv_async(const int16_t *img, int h, int w, int C, int k, int st
   int single = k * k * C <= 2048;
   onchip_last = 0;
   job_kind = K_GEMM_CONV;
-  start_job(gemm_core(oh * ow, k * k * C, M, 0, 0, (REUSE_C && stride == 1 && single) ? k : 0, ow));
+  start_job(gemm_core(oh * ow, k * k * C, M, 0, 0, (REUSE_C && stride == 1 && single) ? k : 0, ow)
+            + (single ? rng_take(M) : (rng_armed = 0)));
   st->v = stats_buf; st->tiles = 1; return 2; }
 int dav2_accel_conv_onchip_async(const int16_t *img, int h, int w, int C, int k, int stride,
                                  int pad, const int8_t *wt, int M, dav2_accel_stats_t *st,
@@ -192,7 +235,7 @@ int dav2_accel_conv_onchip_async(const int16_t *img, int h, int w, int C, int k,
   if (!ONCHIP_C || !ONCHIP_CONV || !single || (long)oh * ow * M > CR_WORDS) return 0;
   onchip_last = 1;
   job_kind = K_GEMM_CONV;
-  start_job(gemm_core(oh * ow, k * k * C, M, 0, 1, (REUSE_C && stride == 1) ? k : 0, ow));
+  start_job(gemm_core(oh * ow, k * k * C, M, 0, 1, (REUSE_C && stride == 1) ? k : 0, ow) + rng_take(M));
   st->v = stats_buf; st->tiles = 1; return 2; }
 int dav2_accel_gemm_raw_async(const int16_t *a, uint32_t as, const int8_t *w, uint32_t ws,
                               int32_t *acc, int N, int K, int M)
@@ -214,8 +257,11 @@ int dav2_accel_requant_rows_async(const int32_t *acc, int N, int M, int m0, int 
   }
   /* a table load first: 8192 words, or 256 for the interpolating table */
   const uint64_t lutw = (epi && epi->lut && epi->lut_load) ? (epi->lut_int ? 256u : 8192u) : 0u;
-  start_job(requant_cycles(N, mc, 0, epi && epi->add) + (uint64_t)N * wpr * BEAT / 10
-            + lutw * BEAT / 10);
+  uint64_t c = requant_cycles(N, mc, 0, epi && epi->add);
+  /* CTRL.dpar: no parameter words; one row per cycle through the unit */
+  if (epi && epi->dpar)
+      c = c - (uint64_t)3 * mc * ((N + 127) / 128) * BEAT / 10 + (uint64_t)mc + 10;
+  start_job(c + (uint64_t)N * wpr * BEAT / 10 + lutw * BEAT / 10);
   *amax = 8000; return 2; }
 #ifndef OSUMS_C
 #define OSUMS_C 1                       /* output row sums, CTRL.osums (round 18) */
@@ -269,6 +315,30 @@ int dav2_accel_transpose16_async(const int16_t *in, uint32_t in_pitch, int N, in
 { (void)in;(void)in_pitch;(void)out;(void)out_stride;
   if (!TP_C) return 0;
   job_kind = K_TP; start_job(requant_cycles(N, M, 1, 0)); return 2; }
+#ifndef LN_C
+#define LN_C 1                          /* the LayerNorm job, CTRL.ln (round 30) */
+#endif
+int dav2_accel_ln_ok(void) { return LN_C; }
+/* phase A: 3N + 2C words of parameters, the N x C/2-word tile, then one
+ * element pair per cycle and about 15 cycles per channel pair */
+int dav2_accel_ln_a(const int16_t *x, uint32_t x_pitch, int N, int C, const int32_t *tokpar,
+                    const int32_t *g, const int32_t *b, uint32_t zs, uint64_t *ymax)
+{ (void)x;(void)x_pitch;(void)tokpar;(void)g;(void)b;(void)zs;
+  if (!LN_C) return 0;
+  job_kind = K_LN;
+  start_job((uint64_t)(3 * N + 2 * C + N * C / 2) * BEAT / 10 + (uint64_t)N * C / 2
+            + 15u * (uint64_t)C / 2);
+  wait_done();
+  *ymax = (uint64_t)1 << 30; return 1; }
+/* phase B: four products per channel pair, then N x C/2 words out */
+int dav2_accel_ln_b(int N, int C, int16_t *out, uint32_t out_pitch, int32_t fm, int32_t invm,
+                    int shift, int rr, int bsr, int32_t *amax)
+{ (void)out;(void)out_pitch;(void)fm;(void)invm;(void)shift;(void)rr;(void)bsr;
+  if (!LN_C) return 0;
+  job_kind = K_LN;
+  start_job(2u * (uint64_t)C + (uint64_t)N * C / 2 * BEAT / 10 + 20);
+  wait_done();
+  *amax = 8000; return 1; }
 #ifndef ATTCR_C
 #define ATTCR_C 1                       /* the attention's S and C in the result RAM (round 28) */
 #endif
@@ -295,7 +365,7 @@ int dav2_accel_onchip_ok(void) { return ONCHIP_C; }
 int dav2_accel_qgemm_onchip_async(const dav2_tensor_t *a, const dav2_qw_t *wt,
                                   dav2_accel_stats_t *st)
 { if ((long)a->n * wt->m > CR_WORDS) return 0;
-  job_kind = K_GEMM_ENC; start_job(gemm_cycles(a->n, a->c, wt->m, 0));
+  job_kind = K_GEMM_ENC; start_job(gemm_cycles(a->n, a->c, wt->m, 0) + rng_take(wt->m));
   st->v = stats_buf; st->tiles = 1; return 2; }
 
 

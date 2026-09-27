@@ -127,6 +127,17 @@ int dav2_accel_requant_stride_cr_async(uint32_t cr_base, int N, int M, const int
 int dav2_accel_transpose16_async(const int16_t *in, uint32_t in_pitch, int N, int M,
                                  int16_t *out, int out_stride)
 { (void)in;(void)in_pitch;(void)N;(void)M;(void)out;(void)out_stride; return 0; }
+int dav2_accel_ln_ok(void) { return 0; }
+int dav2_accel_ln_a(const int16_t *x, uint32_t x_pitch, int N, int C, const int32_t *tokpar,
+                    const int32_t *g, const int32_t *b, uint32_t zs, uint64_t *ymax)
+{ (void)x;(void)x_pitch;(void)N;(void)C;(void)tokpar;(void)g;(void)b;(void)zs;(void)ymax; return 0; }
+int dav2_accel_ln_b(int N, int C, int16_t *out, uint32_t out_pitch, int32_t fm, int32_t invm,
+                    int shift, int rr, int bsr, int32_t *amax)
+{ (void)N;(void)C;(void)out;(void)out_pitch;(void)fm;(void)invm;(void)shift;(void)rr;(void)bsr;
+  (void)amax; return 0; }
+int dav2_accel_rng_ok(void) { return 0; }
+void dav2_accel_rng_next(const dav2_accel_rng_t *r) { (void)r; }
+int dav2_accel_rng_get(int64_t *vmax, int64_t *vmin) { (void)vmax; (void)vmin; return 0; }
 int dav2_accel_busy(void) { return 0; }
 
 static uint32_t rs = 12345;

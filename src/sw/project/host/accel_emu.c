@@ -29,7 +29,9 @@ static uint32_t regs[NREGS];
 /* the latched job */
 static struct {
     int      busy, requant, gather, add, relu, lut, lut_load, a16, w16, ostats, onchip, osums, grelu;
-    int      lutint, wsh, lerp;
+    int      lutint, wsh, lerp, ln, lnb, rng, rngl, dpar;
+    uint32_t dp_fk, dp_gb, dp_sh, dp_m0, rng_beta_m, rng_beta_sh;
+    uint32_t ln_zs, ln_fm, ln_invm, ln_sh;
     uint32_t lut_addr;
     uint32_t x_addr, add_mx, add_mh, add_shift;
     uint32_t a_addr, a_stride, w_addr, w_stride, c_addr, c_stride, s_addr, p_addr;
@@ -45,6 +47,22 @@ static void *ptr(uint32_t a) { return (void *)(uintptr_t)a; }
 static int16_t lut_tab[16384];
 static int32_t cr_ram[131072];          /* the result RAM (CTRL.onchip) */
 static int     lut_valid;
+/* CTRL.ln: what phase A leaves in the block for phase B */
+static int16_t ln_zq[NROWS * KMAX];
+static int32_t ln_g[KMAX], ln_b[KMAX];
+static int     ln_valid;
+/* CTRL.rng: the table (aligned scales and biases) and the running range */
+static int32_t rng_S[2048], rng_B[2048];
+static int     rng_valid;
+static uint32_t rng_rows;
+static int64_t rng_vmax, rng_vmin;
+static int32_t emu_align(int32_t m, int32_t sh, int32_t e)
+{
+    const int32_t d = sh - e;
+    return d > 31 ? (m < 0 ? -1 : 0) : d < 0 ? 0 : (m >> d);
+}
+static inline int32_t emu_mulh(int32_t a, int32_t b) { return (int32_t)(((int64_t)a * b) >> 32); }
+static uint32_t ln_n, ln_k;
 
 static void fail(const char *what)
 {
@@ -106,6 +124,14 @@ static void gemm_row(uint32_t m)
         if (t == 0 || s < mn) mn = s;
     }
     job.writes += job.n;
+    if (job.rng) {
+        /* the range unit: this row's extremes through the table */
+        const int32_t bv = emu_mulh(rng_B[m], (int32_t)job.rng_beta_m) >> (job.rng_beta_sh & 31u);
+        const int64_t hv = (int64_t)emu_mulh(mx, rng_S[m]) + bv;
+        const int64_t lv = (int64_t)emu_mulh(mn, rng_S[m]) + bv;
+        if (hv > rng_vmax) rng_vmax = hv;
+        if (lv < rng_vmin) rng_vmin = lv;
+    }
     if (job.s_addr) {
         int32_t *sv = (int32_t *)ptr(job.s_addr + m * 8u);
         sv[0] = mx;
@@ -132,6 +158,19 @@ static void requant_all(void)
         lut_valid = 1;
     }
     if (job.lut && !lut_valid) fail("CTRL.lut before any table was loaded");
+    static int32_t dpar_tab[3 * KMAX];
+    if (job.dpar) {
+        /* CTRL.dpar: the parameters from the table */
+        const int k = (int)((job.dp_sh >> 16) & 31u), r = (int)((job.dp_sh >> 8) & 31u);
+        for (uint32_t m = 0; m < job.m; m++) {
+            const int32_t S = rng_S[job.dp_m0 + m], B = rng_B[job.dp_m0 + m];
+            dpar_tab[3 * m]     = emu_mulh(S, (int32_t)job.dp_fk) >> r;
+            dpar_tab[3 * m + 1] = (int32_t)(job.dp_sh & 63u);
+            dpar_tab[3 * m + 2] = ((job.dp_sh >> 24) & 1u) ? 0
+                                : (int32_t)(((int64_t)emu_mulh(B, (int32_t)job.dp_gb) + ((int64_t)1 << (k - 1))) >> k);
+        }
+        par = dpar_tab;
+    }
     for (uint32_t n = 0; n < job.n; n++) {
         int16_t *orow = (int16_t *)ptr(job.c_addr + n * job.c_stride);
         for (uint32_t m = 0; m < job.m; m++) {
@@ -202,7 +241,9 @@ static void latch(void)
     memset(&job, 0, sizeof job);
     job.busy     = 1;
     job.requant  = (ctrl >> 1) & 1u;
-    job.gather   = ((ctrl >> 2) & 1u) && !job.requant;
+    job.ln       = ((ctrl >> 20) & 1u) && !job.requant;
+    job.lnb      = ((ctrl >> 21) & 1u) && job.ln;
+    job.gather   = ((ctrl >> 2) & 1u) && !job.requant && !job.ln;
     job.add      = ((ctrl >> 3) & 1u) && job.requant;
     job.relu     = ((ctrl >> 4) & 1u) && job.requant;
     job.lut      = ((ctrl >> 5) & 1u) && job.requant;
@@ -214,7 +255,7 @@ static void latch(void)
     job.onchip   = (ctrl >> 10) & 1u;
     job.osums    = ((ctrl >> 12) & 1u) && job.ostats;
     job.grelu    = ((ctrl >> 13) & 1u) && job.gather;
-    job.lerp     = ((ctrl >> 19) & 1u) && !job.requant && !job.gather;
+    job.lerp     = ((ctrl >> 19) & 1u) && !job.requant && !job.gather && !job.ln;
     job.wsh      = job.w16 ? (int)((ctrl >> 14) & 15u) : 0;
     job.lutint   = ((ctrl >> 18) & 1u) && job.lut;
     if (((ctrl >> 13) & 1u) && !job.gather) fail("CTRL.grelu without CTRL.gather");
@@ -229,6 +270,56 @@ static void latch(void)
     job.k        = R(K_LEN);    job.m        = R(M_LEN);   job.n = R(N_ROWS);
     job.g_addr   = R(G_ADDR);   job.g_geom   = R(G_GEOM);  job.g_chan = R(G_CHAN);
     job.g_conv   = R(G_CONV);   job.g_start  = R(G_START);
+    job.rng      = ((ctrl >> 22) & 1u) && !job.requant && !job.ln && !job.lerp;
+    job.rngl     = ((ctrl >> 23) & 1u) && job.rng;
+    job.dpar     = ((ctrl >> 24) & 1u) && job.requant;
+    job.rng_beta_m = R(RNG_BETA_M); job.rng_beta_sh = R(RNG_BETA_SH);
+    job.dp_fk    = R(DP_FK);    job.dp_gb    = R(DP_GB);
+    job.dp_sh    = R(DP_SH);    job.dp_m0    = R(DP_M0) & 0x7ffu;
+    if (job.rngl) {
+        /* the table, read at the start as the block loads it first */
+        const int32_t es = (int16_t)(R(RNG_E) & 0xffffu), eb = (int16_t)(R(RNG_E) >> 16);
+        const int32_t *sv = (const int32_t *)ptr(R(RNG_S_ADDR));
+        const int32_t *bv = R(RNG_B_ADDR) ? (const int32_t *)ptr(R(RNG_B_ADDR)) : 0;
+        if (job.m > 2048) fail("CTRL.rng_load: M_LEN over 2048");
+        if ((R(RNG_S_ADDR) | R(RNG_B_ADDR)) & 3u) fail("CTRL.rng_load: unaligned table");
+        for (uint32_t m = 0; m < job.m; m++) {
+            rng_S[m] = emu_align(sv[2 * m], sv[2 * m + 1], es);
+            rng_B[m] = bv ? emu_align(bv[2 * m], bv[2 * m + 1], eb) : 0;
+        }
+        rng_valid = 1;
+        rng_rows = job.m;
+        rng_vmax = rng_vmin = 0;
+    }
+    if (job.rng && (!rng_valid || job.m > rng_rows)) fail("CTRL.rng without its table");
+    if (job.dpar) {
+        const uint32_t k = (job.dp_sh >> 16) & 31u;
+        if (!rng_valid || job.dp_m0 + job.m > rng_rows) fail("CTRL.dpar outside the table");
+        if (!((job.dp_sh >> 24) & 1u) && (k < 1 || k > 31)) fail("CTRL.dpar: DP_SH.k out of range");
+    }
+    job.ln_zs    = R(LN_ZS);    job.ln_fm    = R(LN_FM);
+    job.ln_invm  = R(LN_INVM);  job.ln_sh    = R(LN_SH);
+    if (job.ln) {
+        /* CTRL.ln: its own contract (see student_gemm.hjson) */
+        if (job.n < 1 || job.n > NROWS) fail("CTRL.ln: N_ROWS out of range");
+        if (job.k < 2 || (job.k & 1u) || job.k > KMAX) fail("CTRL.ln: K_LEN out of range");
+        if (!job.lnb) {
+            if (job.m != job.n) fail("CTRL.ln: M_LEN != N_ROWS");
+            if ((job.a_addr | job.a_stride | job.p_addr | job.w_addr | job.x_addr) & 3u)
+                fail("CTRL.ln: unaligned address");
+            if (job.ln_zs >> 25) fail("CTRL.ln: LN_ZS over 25 bits");
+            ln_valid = 0;
+            a_snapshot();
+        } else {
+            const uint32_t bsr = (job.ln_sh >> 16) & 31u;
+            if (!ln_valid || job.n != ln_n || job.k != ln_k)
+                fail("CTRL.lnb without a matching phase A just before");
+            if ((job.c_addr | job.c_stride) & 3u) fail("CTRL.lnb: unaligned output");
+            if (bsr < 1 || bsr > 30) fail("CTRL.lnb: LN_SH.bsr out of range");
+        }
+        return;
+    }
+    ln_valid = 0;                          /* any other job overwrites the tile */
 
     if (job.lerp && job.n != 2) fail("CTRL.lerp: N_ROWS must be 2");
     /* the contract, as student_gemm.hjson states it */
@@ -263,6 +354,62 @@ static void latch(void)
     if (((ctrl >> 11) & 1u) && !job.gather) fail("CTRL.greuse without CTRL.gather");
 }
 
+/* CTRL.ln, phase A: zq in place, the channel extremes, the largest |y| */
+static void ln_phase_a(void)
+{
+    const int32_t *par = (const int32_t *)ptr(job.p_addr);
+    const int32_t *g = (const int32_t *)ptr(job.w_addr), *b = (const int32_t *)ptr(job.x_addr);
+    uint64_t ymax = 0;
+    for (uint32_t c = 0; c < job.k; c++) { ln_g[c] = g[c]; ln_b[c] = b[c]; }
+    for (uint32_t t = 0; t < job.n; t++)
+        for (uint32_t c = 0; c < job.k; c++) {
+            int64_t r = (int64_t)(int32_t)apply_mult(a_elem(t, c), par[3 * t], par[3 * t + 1])
+                      + par[3 * t + 2];
+            ln_zq[t * job.k + c] = (int16_t)(r > 8191 ? 8191 : r < -8191 ? -8191 : r);
+        }
+    for (uint32_t c = 0; c < job.k; c++) {
+        int32_t lo = ln_zq[c], hi = ln_zq[c];
+        for (uint32_t t = 1; t < job.n; t++) {
+            const int32_t z = ln_zq[t * job.k + c];
+            if (z < lo) lo = z;
+            if (z > hi) hi = z;
+        }
+        const int64_t G = (int64_t)ln_g[c] * (int64_t)(job.ln_zs & 0x1ffffffu);
+        for (int e = 0; e < 2; e++) {
+            int64_t y = (((int64_t)(e ? hi : lo) * G) >> 31) + ln_b[c];
+            uint64_t a = y < 0 ? (uint64_t)-y : (uint64_t)y;
+            if (a > ymax) ymax = a;
+        }
+    }
+    R(LN_YMAX_LO) = (uint32_t)ymax;
+    R(LN_YMAX_HI) = (uint32_t)(ymax >> 32);
+    ln_n = job.n; ln_k = job.k;
+    ln_valid = 1;
+}
+
+/* CTRL.ln | CTRL.lnb, phase B: channel multipliers and biases, the output */
+static void ln_phase_b(void)
+{
+    const int shift = (int)(job.ln_sh & 63u), rr = (int)((job.ln_sh >> 8) & 31u);
+    const int bsr = (int)((job.ln_sh >> 16) & 31u);
+    int32_t amax = 0;
+    for (uint32_t c = 0; c < job.k; c++) {
+        const int32_t G = (int32_t)(((int64_t)(int32_t)((uint32_t)ln_g[c] << 12)
+                                     * (int64_t)(int32_t)job.ln_fm) >> 32) >> rr;
+        const int32_t B = (int32_t)(((int64_t)(int32_t)(((int64_t)ln_b[c] * (int64_t)(int32_t)job.ln_invm) >> 32)
+                                     + ((int64_t)1 << (bsr - 1))) >> bsr);
+        for (uint32_t t = 0; t < job.n; t++) {
+            int64_t r = (int64_t)(int32_t)apply_mult(ln_zq[t * job.k + c], G, shift) + B;
+            r = r > 8191 ? 8191 : r < -8191 ? -8191 : r;
+            ((int16_t *)ptr(job.c_addr + t * job.c_stride))[c] = (int16_t)r;
+            const int32_t a = r < 0 ? (int32_t)-r : (int32_t)r;
+            if (a > amax) amax = a;
+        }
+    }
+    R(RQ_AMAX) = (uint32_t)amax;
+    ln_valid = 0;
+}
+
 /* Advance the running job; called on every STATUS read. */
 static void step(void)
 {
@@ -271,6 +418,10 @@ static void step(void)
     if (job.requant) {
         requant_all();
         job.writes = job.n * job.m / 2u;
+        job.busy = 0;
+    } else if (job.ln) {
+        if (job.lnb) ln_phase_b(); else ln_phase_a();
+        job.writes = job.lnb ? job.n * job.k / 2u : 0u;
         job.busy = 0;
     } else if (job.lerp) {
         /* CTRL.lerp: the two A rows (read at the start), interpolated */
@@ -299,6 +450,8 @@ static void step(void)
         jobs_done++;
         R(STATUS) = (fail_at && jobs_done == fail_at) ? 6u : 2u;   /* done (+ error) */
         R(DBG2)   = ((job.writes & 0xffffu) << 16) | (job.writes & 0xffffu);
+        R(RNG_VMAX_LO) = (uint32_t)rng_vmax;  R(RNG_VMAX_HI) = (uint32_t)((uint64_t)rng_vmax >> 32);
+        R(RNG_VMIN_LO) = (uint32_t)rng_vmin;  R(RNG_VMIN_HI) = (uint32_t)((uint64_t)rng_vmin >> 32);
         R(CYCLES) = job.m * (job.k / 4u + 1u) * 3u;       /* plausible, unmodelled */
     }
 }
@@ -308,7 +461,7 @@ volatile uint32_t *dav2_emu_reg(uint32_t addr)
     static int init;
     if (!init) {
         init = 1;
-        R(CAPS) = (255u << 24) | ((uint32_t)KMAX << 8) | NROWS;   /* bits 24-31: table, int16 input and weights, row statistics, result RAM, tap reuse, row sums, gather ReLU */
+        R(CAPS) = (255u << 24) | (3u << 22) | ((uint32_t)KMAX << 8) | NROWS;   /* bits 24-31: table, int16 input and weights, row statistics, result RAM, tap reuse, row sums, gather ReLU; bit 23: LayerNorm */
     }
     if (addr < STUDENT_GEMM0_BASE_ADDR || addr >= STUDENT_GEMM0_BASE_ADDR + NREGS * 4u)
         fail("register access outside the block");

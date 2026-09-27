@@ -79,6 +79,25 @@
 #define GEMM_ADD_MH   STUDENT_GEMM_ADD_MULT_H(0)
 #define GEMM_ADD_SH   STUDENT_GEMM_ADD_SHIFT(0)
 #define GEMM_LUT_ADDR STUDENT_GEMM_LUT_ADDR(0)
+#define GEMM_LN_ZS    STUDENT_GEMM_LN_ZS(0)
+#define GEMM_LN_FM    STUDENT_GEMM_LN_FM(0)
+#define GEMM_LN_INVM  STUDENT_GEMM_LN_INVM(0)
+#define GEMM_LN_SH    STUDENT_GEMM_LN_SH(0)
+#define GEMM_LN_YLO   STUDENT_GEMM_LN_YMAX_LO(0)
+#define GEMM_LN_YHI   STUDENT_GEMM_LN_YMAX_HI(0)
+#define GEMM_RNG_S    STUDENT_GEMM_RNG_S_ADDR(0)
+#define GEMM_RNG_B    STUDENT_GEMM_RNG_B_ADDR(0)
+#define GEMM_RNG_E    STUDENT_GEMM_RNG_E(0)
+#define GEMM_RNG_BM   STUDENT_GEMM_RNG_BETA_M(0)
+#define GEMM_RNG_BSH  STUDENT_GEMM_RNG_BETA_SH(0)
+#define GEMM_DP_FK    STUDENT_GEMM_DP_FK(0)
+#define GEMM_DP_GB    STUDENT_GEMM_DP_GB(0)
+#define GEMM_DP_SH    STUDENT_GEMM_DP_SH(0)
+#define GEMM_DP_M0    STUDENT_GEMM_DP_M0(0)
+#define GEMM_RNG_XLO  STUDENT_GEMM_RNG_VMAX_LO(0)
+#define GEMM_RNG_XHI  STUDENT_GEMM_RNG_VMAX_HI(0)
+#define GEMM_RNG_NLO  STUDENT_GEMM_RNG_VMIN_LO(0)
+#define GEMM_RNG_NHI  STUDENT_GEMM_RNG_VMIN_HI(0)
 #define CTRL_ADD      0x8u
 #define CTRL_RELU     0x10u
 #define CTRL_LUT      0x20u
@@ -93,6 +112,11 @@
 #define CTRL_WSH(s)   ((uint32_t)(s) << 14)
 #define CTRL_LUTINT   0x40000u
 #define CTRL_LERP     0x80000u
+#define CTRL_LN       0x100000u
+#define CTRL_LNB      0x200000u
+#define CTRL_RNG      0x400000u
+#define CTRL_RNG_LOAD 0x800000u
+#define CTRL_DPAR     0x1000000u
 
 #define STATUS_BUSY 0x1u
 #define STATUS_DONE 0x2u
@@ -138,6 +162,40 @@ static uint32_t accel_cr_base;         /* result RAM: word offset of the next jo
 static int      accel_rq_onchip;       /* the next requantisation reads the result RAM */
 static int      accel_attcr_ok = 1;    /* its int16-weight use, cleared by its self-test */
 static int      accel_tp_ok = 1;       /* the transposition job, cleared by its self-test */
+static int      accel_ln_ok;           /* CAPS bit 23, cleared if its self-test fails */
+static int      accel_rng_ok;          /* CAPS bit 22, cleared if its self-test fails */
+/* the range unit: armed for the next GEMM operation, on while it runs */
+static dav2_accel_rng_t accel_rng_cfg;
+static int      accel_rng_armed, accel_rng_on, accel_rng_first, accel_rng_valid;
+
+static void accel_rng_begin(int M)
+{
+    accel_rng_on = accel_rng_armed && accel_rng_ok && M >= 1 && M <= 2048;
+    accel_rng_first = accel_rng_on;
+    accel_rng_valid = 0;
+    accel_rng_armed = 0;
+}
+static void accel_rng_end(int r)
+{
+    accel_rng_valid = accel_rng_on && r != 0;
+    accel_rng_on = 0;
+}
+/* the CTRL bits of the operation's next GEMM job; the first loads the table */
+static uint32_t accel_rng_ctrl(void)
+{
+    if (!accel_rng_on)
+        return 0;
+    if (!accel_rng_first)
+        return CTRL_RNG;
+    accel_rng_first = 0;
+    REG32(GEMM_RNG_S)   = (uint32_t)(uintptr_t)accel_rng_cfg.s;
+    REG32(GEMM_RNG_B)   = (uint32_t)(uintptr_t)accel_rng_cfg.b;
+    REG32(GEMM_RNG_E)   = ((uint32_t)(uint16_t)accel_rng_cfg.eb << 16)
+                        | (uint16_t)accel_rng_cfg.es;
+    REG32(GEMM_RNG_BM)  = (uint32_t)accel_rng_cfg.beta_m;
+    REG32(GEMM_RNG_BSH) = (uint32_t)accel_rng_cfg.beta_sh;
+    return CTRL_RNG | CTRL_RNG_LOAD;
+}
 static int      accel_out_stride;      /* requant output row length in int16, 0 = M */
 static uint32_t accel_in_pitch;        /* requant input row pitch in bytes, 0 = N elements */
 static int      accel_ok;
@@ -159,7 +217,9 @@ int dav2_accel_init(void)
 
     uint32_t caps = REG32(GEMM_CAPS);
     accel_nrows = caps & 0xffu;
-    accel_kmax  = (caps >> 8) & 0xffffu;
+    accel_kmax  = (caps >> 8) & 0x3fffu;          /* bits 23, 22: LayerNorm, range */
+    accel_ln_ok = (int)((caps >> 23) & 1u);
+    accel_rng_ok = (int)((caps >> 22) & 1u);
     accel_lut_ok = (int)((caps >> 24) & 1u);
     accel_a16_ok = (int)((caps >> 25) & 1u);
     accel_w16_ok = (int)((caps >> 26) & 1u);
@@ -309,7 +369,7 @@ static int accel_run(const int16_t *av, uint32_t a_stride,
         REG32(GEMM_S_ADDR) = stats ? (uint32_t)(uintptr_t)(stats + (size_t)tile * M * 2) : 0u;
         if (stats && accel_defer && n0 + nt >= N)
             accel_prefill_stats(stats + (size_t)tile * M * 2, M);
-        REG32(GEMM_CTRL)   = CTRL_START | accel_gemm_ctrl;
+        REG32(GEMM_CTRL)   = CTRL_START | accel_gemm_ctrl | accel_rng_ctrl();
         tile++;
         if (accel_maybe_defer(n0 + nt >= N,
                               (unsigned long)M * (K / ((accel_gemm_ctrl & CTRL_W16) ? 2 : 4))
@@ -500,17 +560,26 @@ static int accel_requant_rows(const void *acc, int N, int M, int m0, int mc,
     const int onchip = epi && epi->onchip;
     if (onchip)
         ctrl |= CTRL_ONCHIP;
+    const int dpar = epi && epi->dpar;
+    if (dpar) {
+        ctrl |= CTRL_DPAR;
+        REG32(GEMM_DP_FK) = (uint32_t)epi->dp_fk;
+        REG32(GEMM_DP_GB) = (uint32_t)epi->dp_gb;
+        REG32(GEMM_DP_SH) = (uint32_t)epi->dp_shift | ((uint32_t)epi->dp_r << 8)
+                          | ((uint32_t)epi->dp_k << 16) | (epi->dp_nob ? 1u << 24 : 0u);
+        REG32(GEMM_DP_M0) = (uint32_t)m0;
+    }
     const size_t orow = accel_out_stride ? (size_t)accel_out_stride : (size_t)M;
     const size_t ipitch = accel_in_pitch ? (size_t)accel_in_pitch : (size_t)N * esz;
     REG32(GEMM_A_STRIDE) = onchip ? (uint32_t)N : (uint32_t)ipitch;
     REG32(GEMM_C_STRIDE) = (uint32_t)orow * 2u;
     REG32(GEMM_S_ADDR)   = 0u;
-    REG32(GEMM_P_ADDR)   = (uint32_t)(uintptr_t)(params + (size_t)m0 * 3);
+    REG32(GEMM_P_ADDR)   = dpar ? 0u : (uint32_t)(uintptr_t)(params + (size_t)m0 * 3);
     REG32(GEMM_M_LEN)    = (uint32_t)mc;
     for (int n0 = 0; n0 < N; n0 += nc_max) {
         int nc = N - n0;
         if (nc > nc_max) nc = nc_max;
-        unsigned long beats = (unsigned long)mc * 3u + (unsigned long)mc * nc * esz / 4u
+        unsigned long beats = (dpar ? 0ul : (unsigned long)mc * 3u) + (unsigned long)mc * nc * esz / 4u
                             + (unsigned long)mc * nc / 2u
                             + (lut_load ? ((epi && epi->lut_int) ? 256u : 8192u) : 0u);
         REG32(GEMM_A_ADDR) = onchip ? accel_cr_base + (uint32_t)((size_t)m0 * N + n0)
@@ -587,6 +656,10 @@ int dav2_accel_requant_rows_async(const int32_t *acc, int N, int M, int m0, int 
     if (epi && epi->onchip
         && (!accel_onchip_ok || accel_cr_base + (long)N * M > DAV2_ACCEL_CR_WORDS))
         return 0;
+    if (epi && epi->dpar
+        && (!accel_rng_ok || m0 + mc > 2048 || epi->dp_shift < 1 || epi->dp_shift > 62
+            || epi->dp_r < 0 || epi->dp_r > 31 || (!epi->dp_nob && (epi->dp_k < 1 || epi->dp_k > 31))))
+        return 0;
     if (m0 < 0 || mc < 2 || (mc & 1) || m0 + mc > M
         || mc > (int)(accel_kmax / (add ? 4u : 2u)))
         return 0;
@@ -632,6 +705,8 @@ int dav2_accel_conv(const int16_t *img, int h, int w, int C, int k, int stride,
     const int nrows = (int)accel_nrows;
     const int tiles = (N + nrows - 1) / nrows;
     const int single = (pc_max == k * k);
+    if (!single)
+        accel_rng_on = 0;                  /* partial sums: no range */
     /* the result RAM: one chunk, the statistics as the only way back */
     const int onchip = accel_conv_onchip;
     if (onchip && (!single || !st || !accel_onchip_ok || (long)N * M > DAV2_ACCEL_CR_WORDS))
@@ -700,7 +775,7 @@ int dav2_accel_conv(const int16_t *img, int h, int w, int C, int k, int stride,
             REG32(GEMM_S_ADDR)  = stats ? (uint32_t)(uintptr_t)(stats + (size_t)t * M * 2) : 0u;
             if (stats && accel_defer && single && n0 + nt >= N)
                 accel_prefill_stats(stats + (size_t)t * M * 2, M);
-            REG32(GEMM_CTRL)    = ctrl;
+            REG32(GEMM_CTRL)    = ctrl | accel_rng_ctrl();
             {
                 unsigned long beats = (unsigned long)M * (pc * C / 4)
                                     + (unsigned long)nt * (pc * C / 2)
@@ -901,6 +976,69 @@ int dav2_accel_requant_stride_async(const int32_t *acc, int N, int M, const int3
     return r;
 }
 
+/* The LayerNorm job (CTRL.ln, CAPS bit 23), see dav2_accel.h. Phase B
+ * must follow phase A with no other job in between: ln_a_jobs records the
+ * job count phase A ended with. */
+static unsigned long ln_a_jobs = ~0ul;
+
+int dav2_accel_ln_ok(void) { return dav2_accel_init() && accel_ln_ok; }
+
+int dav2_accel_ln_a(const int16_t *x, uint32_t x_pitch, int N, int C, const int32_t *tokpar,
+                    const int32_t *g, const int32_t *b, uint32_t zs, uint64_t *ymax)
+{
+    ln_a_jobs = ~0ul;
+    if (!dav2_accel_init() || !accel_ln_ok || N < 1 || N > (int)accel_nrows || C < 2 || (C & 1)
+        || (unsigned)C > accel_kmax || (zs >> 25) || x_pitch < (uint32_t)C * 2u
+        || ((((uintptr_t)x) | ((uintptr_t)tokpar) | ((uintptr_t)g) | ((uintptr_t)b) | x_pitch) & 3u))
+        return 0;
+    if (!dav2_accel_finish())
+        return 0;
+    REG32(GEMM_A_ADDR)   = (uint32_t)(uintptr_t)x;
+    REG32(GEMM_A_STRIDE) = x_pitch;
+    REG32(GEMM_K_LEN)    = (uint32_t)C;
+    REG32(GEMM_N_ROWS)   = (uint32_t)N;
+    REG32(GEMM_M_LEN)    = (uint32_t)N;
+    REG32(GEMM_P_ADDR)   = (uint32_t)(uintptr_t)tokpar;
+    REG32(GEMM_W_ADDR)   = (uint32_t)(uintptr_t)g;
+    REG32(GEMM_X_ADDR)   = (uint32_t)(uintptr_t)b;
+    REG32(GEMM_LN_ZS)    = zs;
+    REG32(GEMM_CTRL)     = CTRL_START | CTRL_LN;
+    if (!accel_wait_simple("LayerNorm A"))
+        return 0;
+    accel_cycles += REG32(GEMM_CYCLES);
+    accel_jobs++;
+    accel_beats += 3ul * (unsigned long)N + 2ul * (unsigned long)C
+                 + (unsigned long)N * (unsigned long)C / 2u;
+    *ymax = ((uint64_t)REG32(GEMM_LN_YHI) << 32) | REG32(GEMM_LN_YLO);
+    ln_a_jobs = accel_jobs;
+    return 1;
+}
+
+int dav2_accel_ln_b(int N, int C, int16_t *out, uint32_t out_pitch, int32_t fm, int32_t invm,
+                    int shift, int rr, int bsr, int32_t *amax)
+{
+    if (!dav2_accel_init() || !accel_ln_ok || ln_a_jobs != accel_jobs || pend.active
+        || shift < 1 || shift > 62 || rr < 0 || rr > 31 || bsr < 1 || bsr > 30
+        || out_pitch < (uint32_t)C * 2u || ((((uintptr_t)out) | out_pitch) & 3u))
+        return 0;
+    ln_a_jobs = ~0ul;
+    REG32(GEMM_C_ADDR)   = (uint32_t)(uintptr_t)out;
+    REG32(GEMM_C_STRIDE) = out_pitch;
+    REG32(GEMM_K_LEN)    = (uint32_t)C;
+    REG32(GEMM_N_ROWS)   = (uint32_t)N;
+    REG32(GEMM_LN_FM)    = (uint32_t)fm;
+    REG32(GEMM_LN_INVM)  = (uint32_t)invm;
+    REG32(GEMM_LN_SH)    = (uint32_t)shift | ((uint32_t)rr << 8) | ((uint32_t)bsr << 16);
+    REG32(GEMM_CTRL)     = CTRL_START | CTRL_LN | CTRL_LNB;
+    if (!accel_wait_simple("LayerNorm B"))
+        return 0;
+    accel_cycles += REG32(GEMM_CYCLES);
+    accel_jobs++;
+    accel_beats += (unsigned long)N * (unsigned long)C / 2u;
+    *amax = (int32_t)REG32(GEMM_RQ_AMAX);
+    return 1;
+}
+
 /* out[n][m] = in[m][n] for int16: an int16-input requantisation with
  * identity parameters (round(v 2^30 / 2^30) + 0, saturated at 14 bits: v
  * itself for activations). Input rows in_pitch bytes apart, output rows
@@ -954,21 +1092,44 @@ int dav2_accel_gemm_raw_async(const int16_t *a, uint32_t a_stride,
 int dav2_accel_qgemm_async(const dav2_tensor_t *a, const dav2_qw_t *wt, int32_t *acc,
                            dav2_accel_stats_t *st)
 {
+    accel_rng_begin(wt->m);
     accel_defer = 1;
     int r = dav2_accel_qgemm(a, wt, acc, st);
     accel_defer = 0;
+    accel_rng_end(r);
     return r;
+}
+
+int dav2_accel_rng_ok(void) { return dav2_accel_init() && accel_rng_ok; }
+
+void dav2_accel_rng_next(const dav2_accel_rng_t *r)
+{
+    accel_rng_cfg = *r;
+    accel_rng_armed = r->beta_sh >= 0 && r->beta_sh <= 31 && r->es >= -32768 && r->es <= 32767
+                   && r->eb >= -32768 && r->eb <= 32767 && ((((uintptr_t)r->s) | ((uintptr_t)r->b)) & 3u) == 0;
+}
+
+int dav2_accel_rng_get(int64_t *vmax, int64_t *vmin)
+{
+    if (!accel_rng_valid || pend.active)
+        return 0;
+    accel_rng_valid = 0;
+    *vmax = (int64_t)(((uint64_t)REG32(GEMM_RNG_XHI) << 32) | REG32(GEMM_RNG_XLO));
+    *vmin = (int64_t)(((uint64_t)REG32(GEMM_RNG_NHI) << 32) | REG32(GEMM_RNG_NLO));
+    return 1;
 }
 
 int dav2_accel_conv_async(const int16_t *img, int h, int w, int C, int k, int stride,
                           int pad, const int8_t *wt, int M, int32_t *acc,
                           dav2_accel_stats_t *st, int in_relu)
 {
+    accel_rng_begin(M);
     accel_defer = 1;
     accel_conv_relu = in_relu;
     int r = dav2_accel_conv(img, h, w, C, k, stride, pad, wt, M, acc, st);
     accel_conv_relu = 0;
     accel_defer = 0;
+    accel_rng_end(r);
     return r;
 }
 
@@ -981,10 +1142,12 @@ int dav2_accel_conv_onchip_async(const int16_t *img, int h, int w, int C, int k,
     st->v = 0; st->tiles = 0;
     if (!dav2_accel_init() || !accel_onchip_ok)
         return 0;
+    accel_rng_begin(M);
     accel_defer = 1;
     accel_conv_onchip = 1;
     accel_conv_relu = in_relu;
     int r = dav2_accel_conv(img, h, w, C, k, stride, pad, wt, M, 0, st);
+    accel_rng_end(r);
     accel_conv_relu = 0;
     accel_conv_onchip = 0;
     accel_defer = 0;
@@ -1454,10 +1617,12 @@ int dav2_accel_qgemm_onchip_async(const dav2_tensor_t *a, const dav2_qw_t *wt,
     if (!stats)
         return 0;
     st->v = stats; st->tiles = 1;
+    accel_rng_begin(M);
     accel_defer = 1;
     accel_gemm_ctrl = CTRL_ONCHIP;
     int r = accel_run(a->v, 0, wt->w, 0, 0, N, K, M, stats);
     accel_gemm_ctrl = 0;
+    accel_rng_end(r);
     accel_defer = 0;
     if (!r) { st->v = 0; st->tiles = 0; }
     return r;
@@ -1517,6 +1682,174 @@ static int accel_check_attcr(void)
         accel_attcr_ok = 0;
     } else {
         printf("GEMM accelerator: attention result-RAM self-test ok\n");
+    }
+    return 0;
+}
+
+/* The range unit and the derived parameters: a 20 x 64 x 30 GEMM with
+ * the table (scales, biases), then its requantisation with CTRL.dpar in
+ * two chunks, against the CPU. */
+static int accel_check_rng(void)
+{
+    if (!accel_rng_ok)
+        return 0;
+    enum { N = 20, K = 64, M = 30 };
+    static dav2_xf_t s[M], b[M];
+    static int32_t acc[M * N], par[3 * M];
+    static int16_t out[N * M];
+    int16_t *a = chk_a;                 /* N x K */
+    int8_t  *w = (int8_t *)(chk_a + N * K);
+    uint32_t seed = 0x6a09e667u;
+    for (int i = 0; i < N * K; i++)
+        a[i] = (int16_t)((int32_t)(chk_rand(&seed) % 16383u) - 8191);
+    for (int i = 0; i < M * K; i++)
+        w[i] = (int8_t)((int32_t)(chk_rand(&seed) % 255u) - 127);
+    int es = 1 << 30, eb = 1 << 30;
+    for (int m = 0; m < M; m++) {
+        s[m].m  = (int32_t)(0x40000000u + chk_rand(&seed) % 0x3fffffffu);
+        s[m].sh = 40 + (int32_t)(chk_rand(&seed) % 20u);
+        b[m].m  = (int32_t)(0x40000000u + chk_rand(&seed) % 0x3fffffffu) * ((m & 1) ? -1 : 1);
+        b[m].sh = 30 + (int32_t)(chk_rand(&seed) % 40u);
+        if (m == 3) { b[m].m = 0; b[m].sh = 0; }          /* a zero bias */
+        if (s[m].sh < es) es = s[m].sh;
+        if (b[m].m && b[m].sh < eb) eb = b[m].sh;
+    }
+    const int32_t beta_m = (int32_t)(0x40000000u + chk_rand(&seed) % 0x3fffffffu);
+    const int beta_sh = 5;
+    /* the reference range */
+    int64_t vmax = 0, vmin = 0;
+    for (int m = 0; m < M; m++) {
+        int32_t mx = -2147483647 - 1, mn = 2147483647;
+        for (int n = 0; n < N; n++) {
+            int32_t v = 0;
+            for (int k = 0; k < K; k++) v += (int32_t)a[n * K + k] * w[m * K + k];
+            if (v > mx) mx = v;
+            if (v < mn) mn = v;
+        }
+        int32_t S = (s[m].sh - es) > 31 ? (s[m].m < 0 ? -1 : 0) : s[m].m >> (s[m].sh - es);
+        int32_t B = !b[m].m ? 0 : (b[m].sh - eb) > 31 ? (b[m].m < 0 ? -1 : 0) : b[m].m >> (b[m].sh - eb);
+        int32_t bv = (int32_t)(((int64_t)B * beta_m) >> 32) >> beta_sh;
+        int64_t hv = (int64_t)(int32_t)(((int64_t)mx * S) >> 32) + bv;
+        int64_t lv = (int64_t)(int32_t)(((int64_t)mn * S) >> 32) + bv;
+        if (hv > vmax) vmax = hv;
+        if (lv < vmin) vmin = lv;
+        par[3 * m] = S; par[3 * m + 2] = B;               /* kept for the parameters */
+    }
+    dav2_accel_rng_t r = { s, b, es, eb, beta_m, beta_sh };
+    dav2_tensor_t at = { a, XF_ONE, N, K, -1, 0, 0 };
+    dav2_qw_t wq = { w, 0, 0, M, K };
+    dav2_accel_stats_t st;
+    int64_t hx = 0, hn = 0;
+    dav2_accel_rng_next(&r);
+    int ok = dav2_accel_qgemm_async(&at, &wq, acc, &st) && dav2_accel_finish()
+          && dav2_accel_rng_get(&hx, &hn);
+    int bad = ok && (hx != vmax || hn != vmin);
+    /* the parameters, derived by the block, in two chunks */
+    dav2_rq_epi_t epi;
+    memset(&epi, 0, sizeof epi);
+    epi.dpar = 1;
+    epi.dp_fk = (int32_t)(0x40000000u + chk_rand(&seed) % 0x3fffffffu);
+    epi.dp_gb = (int32_t)(0x40000000u + chk_rand(&seed) % 0x3fffffffu);
+    epi.dp_shift = 30; epi.dp_r = 2; epi.dp_k = 12;
+    int32_t amax = 0;
+    ok = ok && dav2_accel_requant_rows_async(acc, N, M, 0, 16, 0, out, &amax, &epi)
+            && dav2_accel_requant_rows_async(acc, N, M, 16, 14, 0, out, &amax, &epi)
+            && dav2_accel_finish();
+    for (int m = 0; ok && m < M; m++) {
+        const int32_t mult = (int32_t)(((int64_t)par[3 * m] * epi.dp_fk) >> 32) >> epi.dp_r;
+        const int32_t bias = (int32_t)(((int64_t)(int32_t)(((int64_t)par[3 * m + 2] * epi.dp_gb) >> 32)
+                                        + (1 << (epi.dp_k - 1))) >> epi.dp_k);
+        for (int n = 0; n < N; n++)
+            if (out[n * M + m] != chk_sat(chk_apply(acc[m * N + n], mult, epi.dp_shift) + bias))
+                bad++;
+    }
+    if (!ok) {
+        printf("GEMM accelerator: range self-test could not run\n");
+        accel_rng_ok = 0;
+    } else if (bad) {
+        printf("GEMM accelerator: RANGE SELF-TEST FAILED (%d), on the CPU\n", bad);
+        accel_rng_ok = 0;
+    } else {
+        printf("GEMM accelerator: range self-test ok\n");
+    }
+    return 0;
+}
+
+/* The LayerNorm job: 5 tokens of 12 channels (rows 8 words apart), both
+ * phases, against the CPU; output rows 7 words apart, gaps untouched. */
+static int accel_check_ln(void)
+{
+    if (!accel_ln_ok)
+        return 0;
+    enum { N = 5, C = 12, XP = 16, OP = 14 };
+    static int32_t tp[3 * N], g[C], b[C] __attribute__((aligned(4)));
+    static int16_t zq[N * C];
+    int16_t *x = chk_a, *out = chk_a + N * XP;
+    uint32_t seed = 0x3c6ef372u;
+    for (int i = 0; i < N * XP; i++)
+        x[i] = (int16_t)((int32_t)(chk_rand(&seed) % 16383u) - 8191);
+    for (int i = 0; i < N * OP; i++)
+        out[i] = 0x5a5a;
+    for (int t = 0; t < N; t++) {
+        tp[3 * t]     = (int32_t)(0x20000000u + chk_rand(&seed) % 0x5fffffffu);
+        tp[3 * t + 1] = 31 + (int32_t)(chk_rand(&seed) % 4u);
+        tp[3 * t + 2] = (int32_t)(chk_rand(&seed) % 4001u) - 2000;
+    }
+    for (int c = 0; c < C; c++) {
+        g[c] = (int32_t)(chk_rand(&seed) % (1u << 19)) - (1 << 18);
+        b[c] = (int32_t)(chk_rand(&seed) % (1u << 21)) - (1 << 20);
+    }
+    const uint32_t zs = chk_rand(&seed) % (1u << 24);
+    const int32_t fm = (int32_t)(0x40000000u + chk_rand(&seed) % 0x3fffffffu);
+    const int32_t invm = (int32_t)(0x40000000u + chk_rand(&seed) % 0x3fffffffu);
+    const int shift = 30, rr = 1, bsr = 6;
+    /* the reference: zq, the largest |y|, the output */
+    uint64_t ymax = 0;
+    for (int t = 0; t < N; t++)
+        for (int c = 0; c < C; c++)
+            zq[t * C + c] = (int16_t)chk_sat(chk_apply(x[t * XP + c], tp[3 * t], tp[3 * t + 1])
+                                             + tp[3 * t + 2]);
+    for (int c = 0; c < C; c++) {
+        int32_t lo = zq[c], hi = zq[c];
+        for (int t = 1; t < N; t++) {
+            if (zq[t * C + c] < lo) lo = zq[t * C + c];
+            if (zq[t * C + c] > hi) hi = zq[t * C + c];
+        }
+        const int64_t G = (int64_t)g[c] * (int64_t)zs;
+        for (int e = 0; e < 2; e++) {
+            int64_t y = (((int64_t)(e ? hi : lo) * G) >> 31) + b[c];
+            uint64_t a = y < 0 ? (uint64_t)-y : (uint64_t)y;
+            if (a > ymax) ymax = a;
+        }
+    }
+    uint64_t ym = 0;
+    int32_t amax = -1;
+    int ok = dav2_accel_ln_a(x, XP * 2u, N, C, tp, g, b, zs, &ym)
+          && dav2_accel_ln_b(N, C, out, OP * 2u, fm, invm, shift, rr, bsr, &amax);
+    int bad = ok && ym != ymax;
+    int32_t emax = 0;
+    for (int c = 0; ok && c < C; c++) {
+        const int32_t Gc = (int32_t)(((int64_t)(int32_t)((uint32_t)g[c] << 12) * fm) >> 32) >> rr;
+        const int32_t Bc = (int32_t)(((int64_t)(int32_t)(((int64_t)b[c] * invm) >> 32)
+                                      + ((int64_t)1 << (bsr - 1))) >> bsr);
+        for (int t = 0; t < N; t++) {
+            const int32_t e = chk_sat(chk_apply(zq[t * C + c], Gc, shift) + Bc);
+            if (out[t * OP + c] != e) bad++;
+            if ((e < 0 ? -e : e) > emax) emax = e < 0 ? -e : e;
+        }
+    }
+    for (int t = 0; ok && t < N; t++)
+        for (int c = C; c < OP; c++)
+            if (out[t * OP + c] != 0x5a5a) bad++;
+    if (ok && amax != emax) bad++;
+    if (!ok) {
+        printf("GEMM accelerator: LayerNorm self-test could not run\n");
+        accel_ln_ok = 0;
+    } else if (bad) {
+        printf("GEMM accelerator: LAYERNORM SELF-TEST FAILED (%d), on the CPU\n", bad);
+        accel_ln_ok = 0;
+    } else {
+        printf("GEMM accelerator: LayerNorm self-test ok\n");
     }
     return 0;
 }
@@ -1945,6 +2278,10 @@ int dav2_accel_check(void)
         bad = accel_check_onchip();
     if (!bad)
         bad = accel_check_tp();
+    if (!bad)
+        bad = accel_check_ln();
+    if (!bad)
+        bad = accel_check_rng();
     return bad;
 }
 
@@ -2036,6 +2373,17 @@ int dav2_accel_conv_async(const int16_t *img, int h, int w, int C, int k, int st
 }
 int dav2_accel_grelu_ok(void) { return 0; }
 int dav2_accel_wsh_ok(void) { return 0; }
+int dav2_accel_rng_ok(void) { return 0; }
+void dav2_accel_rng_next(const dav2_accel_rng_t *r) { (void)r; }
+int dav2_accel_rng_get(int64_t *vmax, int64_t *vmin) { (void)vmax; (void)vmin; return 0; }
+int dav2_accel_ln_ok(void) { return 0; }
+int dav2_accel_ln_a(const int16_t *x, uint32_t x_pitch, int N, int C, const int32_t *tokpar,
+                    const int32_t *g, const int32_t *b, uint32_t zs, uint64_t *ymax)
+{ (void)x;(void)x_pitch;(void)N;(void)C;(void)tokpar;(void)g;(void)b;(void)zs;(void)ymax; return 0; }
+int dav2_accel_ln_b(int N, int C, int16_t *out, uint32_t out_pitch, int32_t fm, int32_t invm,
+                    int shift, int rr, int bsr, int32_t *amax)
+{ (void)N;(void)C;(void)out;(void)out_pitch;(void)fm;(void)invm;(void)shift;(void)rr;(void)bsr;
+  (void)amax; return 0; }
 int dav2_accel_transpose16_async(const int16_t *in, uint32_t in_pitch, int N, int M,
                                  int16_t *out, int out_stride)
 { (void)in;(void)in_pitch;(void)N;(void)M;(void)out;(void)out_stride; return 0; }

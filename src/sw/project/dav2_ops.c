@@ -626,6 +626,35 @@ void dav2_qgemm_ex(const dav2_tensor_t *a, const dav2_qw_t *wt,
     qgemm_impl(a, 0, wt, res, relu, 0, out);
 }
 
+/* The common exponents of a weight's scales and biases (the smallest
+ * shifts of the non-zero ones), kept per weight: the weights are the
+ * blob's, fixed for the program's life. */
+static void qgemm_exps(const dav2_qw_t *wt, int *es_out, int *eb_out)
+{
+    enum { NE = 256 };
+    static struct { const dav2_xf_t *s; int m, es, eb; } cache[NE];
+    unsigned h = (unsigned)(((uintptr_t)wt->s >> 3) ^ (uintptr_t)wt->m) & (NE - 1u);
+    for (unsigned i = 0; i < NE; i++, h = (h + 1u) & (NE - 1u)) {
+        if (cache[h].s == wt->s && cache[h].m == wt->m) {
+            *es_out = cache[h].es;
+            *eb_out = cache[h].eb;
+            return;
+        }
+        if (!cache[h].s)
+            break;
+    }
+    int es = 1 << 30, eb = 1 << 30;
+    for (int m = 0; m < wt->m; m++) {
+        if (wt->s[m].m && wt->s[m].sh < es) es = wt->s[m].sh;
+        if (wt->b && wt->b[m].m && wt->b[m].sh < eb) eb = wt->b[m].sh;
+    }
+    if (!cache[h].s) {
+        cache[h].s = wt->s; cache[h].m = wt->m; cache[h].es = es; cache[h].eb = eb;
+    }
+    *es_out = es;
+    *eb_out = eb;
+}
+
 /* a is the input image when cv is set: N = output pixels, K = k*k*C.
  * res, relu: the epilogue, see dav2_qgemm_ex. */
 static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
@@ -696,17 +725,33 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
      * m+1.. are still being computed. Profile: "gemm (accelerator)" counts
      * only the time the CPU actually waits for the block. */
     uint64_t t_start = dav2_cycles(), waited = 0;
+    /* The range unit (CTRL.rng): the block computes the range below from
+     * each row's extremes and the scales and biases, and later derives
+     * the requantisation parameters itself (CTRL.dpar). The same integer
+     * arithmetic as the CPU's, so the same result. */
+    int es, eb;
+    qgemm_exps(wt, &es, &eb);
+    const dav2_xf_t a_scale = a->scale.m ? a->scale : XF_ONE;
+    dav2_xf_t beta = xf_recip(a_scale);
+    beta.sh += eb - es;
+    const int b_fast = beta.sh >= 0 && beta.sh <= 31;
+    const int rng_try = dav2_accel_rng_ok() && b_fast && M <= 2048;
+    dav2_accel_rng_t rcfg = { wt->s, wt->b, es, wt->b ? eb : 0, beta.m, beta.sh };
+#define RNG_ARM() do { if (rng_try) dav2_accel_rng_next(&rcfg); } while (0)
     /* a convolution's tiles all drain into the result RAM (C_ADDR = n0) */
     int use_onchip = !qgemm_no_onchip && dav2_accel_onchip_ok()
                   && (M & 1) == 0 && (cv || N <= 128) && (long)N * M <= DAV2_ACCEL_CR_WORDS
                   && (!res || (res->n == N && res->c == M && (((uintptr_t)res->v) & 3u) == 0));
     dav2_accel_stats_t st;
     int run = 0;
-    if (cv && use_onchip)
+    if (cv && use_onchip) {
+        RNG_ARM();
         run = dav2_accel_conv_onchip_async(a->v, cv->h, cv->w, a->c, cv->k, cv->stride,
                                            cv->pad, wt->w, M, &st, cv->in_relu);
+    }
     if (cv && !run) {
         use_onchip = 0;
+        RNG_ARM();
         run = dav2_accel_conv_async(a->v, cv->h, cv->w, a->c, cv->k, cv->stride,
                                     cv->pad, wt->w, M, acc, &st, cv->in_relu);
     }
@@ -732,10 +777,13 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
         }
         /* keep the int32 result on chip when it fits and the whole
          * requantisation can run on the block (M even, no odd residual) */
-        if (use_onchip)
+        if (use_onchip) {
+            RNG_ARM();
             run = dav2_accel_qgemm_onchip_async(&cols, wt, &st);
+        }
         if (!run) {
             use_onchip = 0;
+            RNG_ARM();
             run = dav2_accel_qgemm_async(&cols, wt, acc, &st);
         }
         /* the accelerator took its tiles' rows as they were made; the
@@ -769,10 +817,16 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
      * errors below 2^-30 of the largest bias. */
     uint64_t range_t0 = dav2_cycles();
     const uint64_t range_w0 = waited;
-    int es = 1 << 30, eb = 1 << 30;
-    for (int m = 0; m < M; m++) {
-        if (wt->s[m].m && wt->s[m].sh < es) es = wt->s[m].sh;
-        if (wt->b && wt->b[m].m && wt->b[m].sh < eb) eb = wt->b[m].sh;
+#undef RNG_ARM
+    /* with the range unit: the operation's result, once it has finished */
+    int rng_used = 0;
+    int64_t rng_vmax = 0, rng_vmin = 0;
+    if (run && rng_try && st.tiles) {
+        uint64_t w0 = dav2_cycles();
+        if (run == 2 && !dav2_accel_finish()) goto redo_on_cpu;
+        waited += dav2_cycles() - w0;
+        run = 1;
+        rng_used = dav2_accel_rng_get(&rng_vmax, &rng_vmin);
     }
     /* The range is computed in units of V = 2^(32-es) * a->scale: the high
      * word of acc * S_m (mulh), and the bias as mulh(B_m, beta.m) >> beta.sh.
@@ -781,16 +835,22 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
      * of a typical range, and the output saturates at DAV2_ACT_QMAX anyway.
      * A bias exponent outside 0..31 (never in this model) takes the 64-bit
      * path. */
-    const dav2_xf_t a_scale = a->scale.m ? a->scale : XF_ONE;
-    dav2_xf_t beta = xf_recip(a_scale);
-    beta.sh += eb - es;
-    const int b_fast = beta.sh >= 0 && beta.sh <= 31;
-
     /* Exact output range, including bias, so nothing clips. The per-row
      * extremes come from the accelerator's drain when it produced them (two
      * words per row per tile); otherwise from a scan of acc. */
-    int64_t vmax = 0, vmin = 0;                 /* in units of V */
-    for (int m = 0; m < M; m++) {
+    int64_t vmax = rng_vmax, vmin = rng_vmin;   /* in units of V */
+    for (int m = 0; rng_used && rmax && m < M; m++) {
+        /* only the row extremes, for the add and the column extremes */
+        const int32_t *sv = st.v + (size_t)m * 2;
+        int32_t cmax = sv[0], cmin = sv[1];
+        for (int t = 1; t < st.tiles; t++) {
+            const int32_t *tv = sv + (size_t)t * M * 2;
+            if (tv[0] > cmax) cmax = tv[0];
+            if (tv[1] < cmin) cmin = tv[1];
+        }
+        rmax[m] = cmax; rmin[m] = cmin;
+    }
+    for (int m = 0; !rng_used && m < M; m++) {
         int32_t cmax, cmin;
         if (st.tiles) {
             const volatile int32_t *sv = st.v + (size_t)m * 2;
@@ -877,12 +937,16 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
     const int gb_k = gb.sh - 32;
     const int gb_fast = gb_k >= 1 && gb_k <= 31;
     int par_done = 0;
+    /* CTRL.dpar: the block derives the parameters from its range table */
+    int dpar = rng_used && par_shift >= 1 && (!wt->b || gb_fast);
 #define PAR_UPTO(end_m) do {                                                  \
         uint64_t par_t0_ = dav2_cycles();                                     \
-        for (; par_done < (end_m); par_done++) {                              \
+        for (; !dpar && par_done < (end_m); par_done++) {                     \
             int m_ = par_done;                                                \
             if (par_shift >= 1) {                                             \
-                par[3 * m_] = mulh32(par[3 * m_], fk.m) >> par_r;             \
+                const int32_t S_ = rng_used ? align_mant(wt->s[m_], es)       \
+                                            : par[3 * m_];                    \
+                par[3 * m_] = mulh32(S_, fk.m) >> par_r;                      \
                 par[3 * m_ + 1] = par_shift;                                  \
             } else {                  /* factor >= 1: never in this model */  \
                 int sh_;                                                      \
@@ -914,6 +978,43 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
         memset(&epi, 0, sizeof epi);
         epi.relu = relu;
         epi.onchip = use_onchip;
+        if (dpar) {
+            epi.dpar = 1;
+            epi.dp_fk = fk.m;
+            epi.dp_gb = gb.m;
+            epi.dp_shift = par_shift;
+            epi.dp_r = par_r;
+            epi.dp_k = wt->b ? gb_k : 1;
+            epi.dp_nob = !wt->b;
+        }
+        /* With dpar the row extremes go through the same parameters in a
+         * job of their own (rows max and min, as a 2-column matrix): the
+         * add's largest |h|, and the column extremes. */
+        int32_t amax_x2 = -1;
+        int16_t *ext2 = 0;
+        if (dpar && (res || want_ext)) {
+            int32_t *rm2 = (int32_t *)dav2_arena_alloc((size_t)M * 2 * sizeof(int32_t));
+            ext2 = (int16_t *)dav2_arena_alloc((size_t)M * 2 * sizeof(int16_t));
+            dav2_rq_epi_t e2;
+            memset(&e2, 0, sizeof e2);
+            e2.dpar = 1; e2.dp_fk = epi.dp_fk; e2.dp_gb = epi.dp_gb; e2.dp_shift = epi.dp_shift;
+            e2.dp_r = epi.dp_r; e2.dp_k = epi.dp_k; e2.dp_nob = epi.dp_nob;
+            int ok2 = rm2 && ext2;
+            for (int m = 0; ok2 && m < M; m++) { rm2[2 * m] = rmax[m]; rm2[2 * m + 1] = rmin[m]; }
+            int32_t a2 = 0;
+            for (int m0 = 0; ok2 && m0 < M; m0 += RQ_CHUNK) {
+                const int mc = M - m0 < RQ_CHUNK ? M - m0 : RQ_CHUNK;
+                ok2 = dav2_accel_requant_rows_async(rm2, 2, M, m0, mc, 0, ext2, &a2, &e2) != 0;
+            }
+            ok2 = ok2 && dav2_accel_finish();
+            if (ok2) amax_x2 = a2;
+            else     ext2 = 0;
+            if (!ok2) {
+                /* the block failed (or declined): parameters on the CPU */
+                dpar = 0;
+                epi.dpar = 0;
+            }
+        }
         uint64_t gelu_cycles = 0;
         /* the output's row ranges, when the caller asks (out->rst): one
          * statistics word per row and chunk, combined below */
@@ -950,8 +1051,8 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
              * needs every row's parameters first, so in add mode they are
              * not overlapped with the chunks. */
             PAR_UPTO(M);
-            int32_t amax_h = 0;
-            for (int m = 0; m < M; m++) {
+            int32_t amax_h = amax_x2 >= 0 ? amax_x2 : 0;
+            for (int m = 0; amax_x2 < 0 && m < M; m++) {
                 int32_t e0 = sat_act(apply_multiplier(rmax[m], par[3 * m], par[3 * m + 1])
                                      + par[3 * m + 2]);
                 int32_t e1 = sat_act(apply_multiplier(rmin[m], par[3 * m], par[3 * m + 1])
@@ -983,7 +1084,7 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
             uint64_t w0 = dav2_cycles();
             ok = dav2_accel_requant_rows_async(acc, N, M, m0, mc, par, dst, &rq_amax,
                                                (epi.add || epi.relu || epi.lut || epi.ostats
-                                                || epi.onchip) ? &epi : 0) != 0;
+                                                || epi.onchip || epi.dpar) ? &epi : 0) != 0;
             epi.lut_load = 0;                     /* the block keeps the table */
             waited += dav2_cycles() - w0;         /* includes settling the previous */
         }
@@ -1032,8 +1133,13 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
                 if (sums) out->rsum = rsum_want;
             }
             trace_tensor("qgemm", out);
-            if (want_ext)
+            if (want_ext && ext2) {
+                dav2_copy16(g_cext_max, ext2, (size_t)M);
+                dav2_copy16(g_cext_min, ext2 + M, (size_t)M);
+            } else if (want_ext) {
+                PAR_UPTO(M);
                 qgemm_colext(rmax, rmin, par, M);
+            }
             if (gelu && !epi.lut)
                 dav2_gelu(out);                   /* no lookup table: on the CPU */
             dav2_arena_release(mark);
@@ -1047,6 +1153,7 @@ static void qgemm_impl(const dav2_tensor_t *a, const conv_desc_t *cv,
     }
     if (use_onchip)
         goto redo_on_cpu;
+    dpar = 0;                                  /* the CPU converts: parameters here */
     PAR_UPTO(M);
 #undef PAR_UPTO
     dav2_prof_add(DAV2_PROF_GEMM_ACCEL, waited);
@@ -1444,6 +1551,32 @@ static inline void row_stats(const int16_t *row, int C, int wide, const uint32_t
     *sum_out = sum; *sq_out = sq; *xmax_out = xmax; *xmin_out = xmin;
 }
 
+/* LayerNorm's output scale from the largest |y| (Q16), and the parameters
+ * of the channels' requantisation: per channel G = g zs / scale and
+ * B = b / scale, G = mulh(g << 12, F.m) >> rr with F = zs 2^-15 / scale and
+ * one shift F.sh - 20 for every channel. B = round(b inv.m / 2^s),
+ * s = inv.sh + 16: for s >= 33 the rounding constant is a multiple of 2^32,
+ * so it is (mulh(b, inv.m) + 2^(s-33)) >> (s-32), which fits 32 bits. */
+typedef struct {
+    dav2_xf_t out_scale, inv, F;
+    int shift, rr, bs, b_fast;
+} ln_scale_t;
+
+static void ln_out_scale(int64_t ymax_all, dav2_xf_t zs, ln_scale_t *ls)
+{
+    ls->out_scale = ymax_all ? xf_div(xf_norm(ymax_all, 16), xf_from_int(DAV2_ACT_QMAX))
+                             : XF_ONE;
+    ls->inv = xf_recip(ls->out_scale);
+    ls->F = xf_mul(zs, ls->inv);
+    ls->F.sh += 15;
+    ls->shift = ls->F.sh - 20;
+    ls->rr = 0;
+    if (ls->shift > 62) { ls->rr = ls->shift - 62; ls->shift = 62; }
+    if (ls->rr > 31) ls->rr = 31;
+    ls->bs = ls->inv.sh + 16;
+    ls->b_fast = ls->bs >= 33 && ls->bs <= 62;
+}
+
 static void layernorm_affine(const dav2_tensor_t *in, const int32_t *gq,
                              const int32_t *bq, dav2_tensor_t *out)
 {
@@ -1513,13 +1646,38 @@ static void layernorm_affine(const dav2_tensor_t *in, const int32_t *gq,
         parn[3 * n + 2] = (int32_t)-xf_round(xf_mul(xf_norm(p[0], 16), k), 0);
     }
     SUB_LAP(DAV2_SUB_LN_STATS);
+    /* ZS = zs 2^32 (|zq g| < 2^33, ZS < 2^24: the product fits int64) */
+    const int64_t ZS = xf_round(zs, 32);
+
+    /* Steps 2 and 3 in the block (CTRL.ln): phase A makes zq and the
+     * largest |y|, phase B the output with the parameters below. The same
+     * arithmetic as the two jobs and the CPU pass that follow, so the same
+     * result; on a decline or a failure they run instead (x is intact). */
+    uint64_t ym;
+    if (dav2_accel_ln_ok() && ZS >= 0 && ZS < ((int64_t)1 << 25)
+        && dav2_accel_ln_a(in->v, (uint32_t)C * 2u, N, C, parn, gq, bq, (uint32_t)ZS, &ym)) {
+        SUB_LAP(DAV2_SUB_LN_Y);
+        ln_scale_t ls;
+        ln_out_scale((int64_t)ym, zs, &ls);
+        int32_t omax;
+        if (ls.shift >= 1 && ls.b_fast
+            && dav2_accel_ln_b(N, C, out->v, (uint32_t)C * 2u, ls.F.m, ls.inv.m, ls.shift,
+                               ls.rr, ls.bs - 32, &omax)) {
+            SUB_LAP(DAV2_SUB_LN_OUT);
+            out->scale = ls.out_scale;
+            out->n = N;
+            out->c = C;
+            out->amax_q = omax;
+            dav2_arena_release(mark);
+            return;
+        }
+    }
+
     /* rows n, C columns -> zq[c][n], and each channel's {max, min} */
     uint32_t *zst = (uint32_t *)dav2_arena_alloc((size_t)C * sizeof(uint32_t));
     requant16(in->v, C, N, parn, zq, zst);
 
-    /* step 3: channel extremes of zq, the exact range of y in Q16, with
-     * ZS = zs 2^32 (|zq g| < 2^33, ZS < 2^24: the product fits int64) */
-    const int64_t ZS = xf_round(zs, 32);
+    /* step 3: channel extremes of zq, the exact range of y in Q16 */
     int64_t ymax_all = 0;
     for (int c = 0; c < C; c++) {
         const int16_t *zr = zq + (size_t)c * N;
@@ -1564,21 +1722,10 @@ static void layernorm_affine(const dav2_tensor_t *in, const int32_t *gq,
     }
     SUB_LAP(DAV2_SUB_LN_Y);
 
-    /* per channel: G = g zs / scale, B = b / scale; G = mulh(g << 12, F.m)
-     * with F = zs 2^-15 / scale, one shift F.sh - 20 for every channel */
-    dav2_xf_t out_scale = ymax_all ? xf_div(xf_norm(ymax_all, 16), xf_from_int(DAV2_ACT_QMAX))
-                                   : XF_ONE;
-    dav2_xf_t inv = xf_recip(out_scale);
-    dav2_xf_t F = xf_mul(zs, inv);
-    F.sh += 15;
-    int shift = F.sh - 20, rr = 0;
-    if (shift > 62) { rr = shift - 62; shift = 62; }
-    if (rr > 31) rr = 31;
-    /* B = round(b inv.m / 2^s), s = inv.sh + 16: for s >= 33 the rounding
-     * constant is a multiple of 2^32, so it is (mulh(b, inv.m) +
-     * 2^(s-33)) >> (s-32), which fits 32 bits */
-    const int bs = inv.sh + 16;
-    const int b_fast = bs >= 33 && bs <= 62;
+    ln_scale_t ls;
+    ln_out_scale(ymax_all, zs, &ls);
+    const dav2_xf_t out_scale = ls.out_scale, inv = ls.inv, F = ls.F;
+    const int shift = ls.shift, rr = ls.rr, bs = ls.bs, b_fast = ls.b_fast;
     for (int c = 0; c < C; c++) {
         if (shift >= 1) {
             parn[3 * c] = mulh32(gq[c] << 12, F.m) >> rr;

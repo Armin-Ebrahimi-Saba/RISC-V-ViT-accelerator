@@ -154,7 +154,7 @@ module student_gemm #(
   logic [31:0] cycles_q;        // cycle counter, running while busy_q, for CYCLES
 
   assign hw2reg.status.d = {err_q, done_q, busy_q};        // STATUS register readback
-  assign hw2reg.caps.d   = {8'd255, 16'(KMAX), 8'(NROWS)};   // CAPS: what this instance supports
+  assign hw2reg.caps.d   = {8'd255, 2'b11, 14'(KMAX), 8'(NROWS)};   // CAPS: what this instance supports
   assign hw2reg.cycles.d = cycles_q;                       // CYCLES register readback
 
   logic start_strobe, start_requant, start_gather;
@@ -187,6 +187,13 @@ module student_gemm #(
   assign start_ostats   = reg2hw.ctrl.ostats.q;
   logic start_osums;
   assign start_osums    = reg2hw.ctrl.osums.q;    // with ostats: row sums too   // requant job: output row statistics
+  logic start_ln, start_lnb;
+  logic start_rng, start_rng_load, start_dpar;
+  assign start_rng      = reg2hw.ctrl.rng.q;      // GEMM: row ranges into RNG_VMAX/VMIN
+  assign start_rng_load = reg2hw.ctrl.rng_load.q; // ... loading the table first
+  assign start_dpar     = reg2hw.ctrl.dpar.q;     // requant: parameters from the table
+  assign start_ln      = reg2hw.ctrl.ln.q;       // LayerNorm job, phase A
+  assign start_lnb     = reg2hw.ctrl.lnb.q;      // ... phase B
   logic start_onchip;
   assign start_onchip   = reg2hw.ctrl.onchip.q;   // results in the on-chip RAM
 
@@ -236,6 +243,17 @@ module student_gemm #(
   logic           greuse_q;                  // CTRL.greuse, sampled at start
   logic           grelu_q;                   // CTRL.grelu, sampled at start
   logic           lerp_q;                    // CTRL.lerp: a LERP job
+  logic           ln_q, lnb_q;               // CTRL.ln (phase A), with CTRL.lnb phase B
+  logic           ln_ld_done;                // gamma / beta load: last word arrived
+  logic           ln_p1_done, ln_par_done, ln_p2_done;
+  logic           ln_issue;                  // an element enters the LN pipeline
+  logic           ly_busy, par_busy;         // Y unit / parameter unit working
+  logic [11:0]    ln_cnt_q;                  // gamma / beta load: channel
+  logic           rng_q, rngl_q, dpar_q;     // CTRL.rng, rng_load, dpar
+  logic           rng_ld_done, rng_busy, dp_done;
+  logic           rng_hasb_q;                // the table has biases
+  logic [12:0]    rng_cnt_q;                 // table load: word
+  logic [31:0]    rng_s_addr_q, rng_b_addr_q;
   logic           g_reuse_ok;                // tap reuse applies to this job
   logic           gw_inb;                    // writer: current position in bounds
   logic           gi_handover;               // issuer: a run is ready for the read engine
@@ -243,7 +261,7 @@ module student_gemm #(
 
   // ------------------------------------------------------------- control FSM
 
-  typedef enum logic [3:0] {
+  typedef enum logic [4:0] {
     ST_IDLE,       // waiting for CTRL.start
     ST_LOAD_A,     // reading the A tile into on-chip RAM
     ST_MAC,        // streaming one row of W, multiply-accumulating into acc_q
@@ -257,7 +275,15 @@ module student_gemm #(
     RQ_OUT,         // stream int16 pairs out
     RQ_LOAD_L,     // lookup table -> LUT RAM (CTRL.lut_load)
     RQ_STATS,     // output row statistics -> S_ADDR (CTRL.ostats)
-    ST_LERP       // LERP job: the two tile rows, interpolated, out (CTRL.lerp)
+    ST_LERP,      // LERP job: the two tile rows, interpolated, out (CTRL.lerp)
+    LN_LOAD_G,    // LayerNorm A: gamma -> LUT RAMs
+    LN_LOAD_B,    // LayerNorm A: beta -> LUT RAMs
+    LN_P1,        // LayerNorm A: zq in place, channel extremes, largest |y|
+    LN_PAR,       // LayerNorm B: channel multipliers and biases
+    LN_P2,        // LayerNorm B: the output, row by row
+    RNG_LOAD_S,   // GEMM with rng_load: scales -> table S
+    RNG_LOAD_B,   // ... biases -> table B
+    RQ_DPAR       // requant with dpar: parameters derived from the table
   } state_e;
 
   state_e state_q, state_d;  // state_q: current state (registered); state_d: next state
@@ -324,11 +350,11 @@ module student_gemm #(
   logic [31:0]  os_wr_addr, os_wr_data;   // RQ_STATS: one word per output row
   logic [NRW+1:0] os_t_q, os_nw;         // RQ_STATS: word written, words owed
   logic           os_busy;               // row sums still in their pipeline
-  assign wr_req  = (state_q == RQ_OUT) ? rq_wr_req : (state_q == RQ_STATS) ? os_wr_req
+  assign wr_req  = (state_q == RQ_OUT || state_q == LN_P2) ? rq_wr_req : (state_q == RQ_STATS) ? os_wr_req
                  : (state_q == ST_LERP) ? lp_wr_req : drain_wr_req;
-  assign wr_addr = (state_q == RQ_OUT) ? rq_wr_addr : (state_q == RQ_STATS) ? os_wr_addr
+  assign wr_addr = (state_q == RQ_OUT || state_q == LN_P2) ? rq_wr_addr : (state_q == RQ_STATS) ? os_wr_addr
                  : (state_q == ST_LERP) ? lp_wr_addr : drain_wr_addr;
-  assign wr_data = (state_q == RQ_OUT) ? rq_wr_data : (state_q == RQ_STATS) ? os_wr_data
+  assign wr_data = (state_q == RQ_OUT || state_q == LN_P2) ? rq_wr_data : (state_q == RQ_STATS) ? os_wr_data
                  : (state_q == ST_LERP) ? lp_wr_data : drain_wr_data;
   logic [CW-1:0] wr_out_q;      // writes issued without an ack yet
   logic [SW-1:0] wr_src_q;      // a_source to tag the next write with (cycles through OUTSTANDING slots)
@@ -572,7 +598,14 @@ module student_gemm #(
   logic [31:0] g1_prev;                  // row t-1's word, for a copy
   assign g1_prev = a_q[RW'(g1_row_q - 1'b1)];
 
-  assign a_wr_data = (onchip_q && state_q == RQ_LOAD_ACC) ? cr_rdata2_q
+  logic           ln_v7, ln_p2_7;              // LN pipeline stage 7 (declared early)
+  logic [RW-1:0]  ln_t7;
+  logic [AW-1:0]  ln_w7, ln_w_q;
+  logic signed [31:0] ln_ve7, ln_vo7;
+  logic           ln_wb;                       // LN_P1: zq back into the tile
+  assign ln_wb = ln_v7 & ~ln_p2_7;
+  assign a_wr_data = ln_wb ? {ln_vo7[15:0], ln_ve7[15:0]}
+                   : (onchip_q && state_q == RQ_LOAD_ACC) ? cr_rdata2_q
                    : g1_we_q ? (g1_copy_q ? g1_prev : g1_data_q) : ld_data;
   always_comb begin
     a_we      = '0;
@@ -589,6 +622,10 @@ module student_gemm #(
     if (state_q == RQ_LOAD_X) begin
       a_wr_addr = XOFF + rq_xw_q;
       if (rd_valid) a_we[rq_n_q[RW-1:0]] = 1'b1;
+    end
+    if (ln_wb) begin
+      a_wr_addr = ln_w7;
+      a_we[ln_t7] = 1'b1;
     end
   end
 
@@ -617,7 +654,8 @@ module student_gemm #(
   logic          rq_xcyc_q;
   logic [AW-1:0] rq_xaddr_q;
   logic [AW:0]   lp_j_q;           // ST_LERP: the output word
-  assign a_rd_addr = (state_q == RQ_OUT)    ? (rq_xcyc_q ? rq_xaddr_q : rq_m_q)
+  assign a_rd_addr = (state_q == LN_P1 || state_q == LN_P2) ? ln_w_q
+                   : (state_q == RQ_OUT)    ? (rq_xcyc_q ? rq_xaddr_q : rq_m_q)
                    : (state_q == ST_LERP)   ? lp_j_q[AW-1:0]                // LERP: word j of both rows
                    : (state_q == ST_LOAD_A) ? a_ld_word_q + AW'(g_cwords)   // gather copy source
                                             : AW'(kcnt_q >> 1);
@@ -630,7 +668,8 @@ module student_gemm #(
     if (state_q == ST_LOAD_A) begin
       rd_pop = gather_q ? gf_push : rd_valid;
     end else if (state_q == RQ_LOAD_P || state_q == RQ_LOAD_ACC || state_q == RQ_LOAD_X
-                 || state_q == RQ_LOAD_L) begin
+                 || state_q == RQ_LOAD_L || state_q == LN_LOAD_G || state_q == LN_LOAD_B
+                 || state_q == RNG_LOAD_S || state_q == RNG_LOAD_B) begin
       rd_pop = rd_valid;
     end else if (state_q == ST_MAC) begin
       // Refill an empty buffer, or replace the buffer as its last byte is
@@ -767,21 +806,30 @@ module student_gemm #(
     state_d = state_q;
     unique case (state_q)
       ST_IDLE:     if (start_strobe)              // CPU asked for a job
-                     state_d = !start_requant ? ST_LOAD_A
-                             : start_lut_load ? RQ_LOAD_L : RQ_LOAD_P;
-      RQ_LOAD_L:   if (lut_ld_done)      state_d = RQ_LOAD_P;
-      ST_LOAD_A:   if (a_load_done)              state_d = lerp_q ? ST_LERP : ST_MAC;       // tile fully loaded
+                     state_d = start_requant ? (start_lut_load ? RQ_LOAD_L : start_dpar ? RQ_DPAR : RQ_LOAD_P)
+                             : start_ln ? (start_lnb ? LN_PAR : RQ_LOAD_P)
+        : (start_rng & start_rng_load) ? RNG_LOAD_S : ST_LOAD_A;
+      RQ_LOAD_L:   if (lut_ld_done)      state_d = dpar_q ? RQ_DPAR : RQ_LOAD_P;
+      ST_LOAD_A:   if (a_load_done)              state_d = lerp_q ? ST_LERP : ln_q ? LN_P1 : ST_MAC;       // tile fully loaded
       ST_LERP:     if (lp_done)                  state_d = ST_FINISH;   // LERP: last word issued
       ST_MAC:      if (klast)                    state_d = ST_MAC_TAIL; // W row fully streamed
       ST_MAC_TAIL: if (pipe_idle)                state_d = ST_DRAIN;    // pipeline flushed
       ST_DRAIN:    if (t_q == n_wr)                                     // row's outputs all issued
                      state_d = (m_q == (m_len_q - 1'b1)) ? ST_FINISH : ST_MAC; // last W row? else next row
-      ST_FINISH:   if (wr_out_q == '0)           state_d = ST_IDLE;     // all writes acked
-      RQ_LOAD_P:   if (rq_p_done)                state_d = RQ_LOAD_ACC; // param table loaded
+      ST_FINISH:   if (wr_out_q == '0 && !rng_busy)           state_d = ST_IDLE;     // all writes acked
+      RQ_LOAD_P:   if (rq_p_done)                state_d = ln_q ? LN_LOAD_G : RQ_LOAD_ACC; // param table loaded
       RQ_LOAD_ACC: if (rq_acc_done)              state_d = add_q ? RQ_LOAD_X : RQ_OUT;
       RQ_LOAD_X:   if (rq_x_done)                state_d = RQ_OUT;      // residual loaded
       RQ_OUT:      if (rq_out_done && !os_busy) state_d = ostats_q ? RQ_STATS : ST_FINISH;
       RQ_STATS:    if (os_t_q == os_nw) state_d = ST_FINISH;   // every output word written
+      LN_LOAD_G:   if (ln_ld_done)               state_d = LN_LOAD_B;
+      LN_LOAD_B:   if (ln_ld_done)               state_d = ST_LOAD_A;
+      LN_P1:       if (ln_p1_done)               state_d = ST_FINISH;
+      LN_PAR:      if (ln_par_done)              state_d = LN_P2;
+      LN_P2:       if (ln_p2_done)               state_d = ST_FINISH;
+      RNG_LOAD_S:  if (rng_ld_done)              state_d = rng_b_addr_q != '0 ? RNG_LOAD_B : ST_LOAD_A;
+      RNG_LOAD_B:  if (rng_ld_done)              state_d = ST_LOAD_A;
+      RQ_DPAR:     if (dp_done)                  state_d = RQ_LOAD_ACC;
       default:                                   state_d = ST_IDLE;
     endcase
   end
@@ -822,6 +870,12 @@ module student_gemm #(
       greuse_q <= 1'b0;
       grelu_q  <= 1'b0;
       lerp_q   <= 1'b0;
+      ln_q     <= 1'b0;
+      lnb_q    <= 1'b0;
+      ln_cnt_q <= '0;
+      rng_q <= 1'b0; rngl_q <= 1'b0; dpar_q <= 1'b0;
+      rng_cnt_q <= '0; rng_hasb_q <= 1'b0;
+      rng_s_addr_q <= '0; rng_b_addr_q <= '0;
       // rq_m_q, rq_p_cnt_q and lut_cnt_q have no reset: they address block
       // RAMs (an asynchronous reset there is DRC REQP-1840), and every job
       // sets them before use.
@@ -930,8 +984,8 @@ module student_gemm #(
             s_ptr_q    <= reg2hw.s_addr.q;
             a_addr_q   <= reg2hw.a_addr.q;
             a_stride_q <= reg2hw.a_stride.q;
-            stats_en_q <= (reg2hw.s_addr.q != 32'd0) & ~start_requant;
-            gather_q   <= start_gather & ~start_requant;
+            stats_en_q <= (reg2hw.s_addr.q != 32'd0) & ~start_requant & ~start_ln;
+            gather_q   <= start_gather & ~start_requant & ~start_ln;
             add_q      <= start_add & start_requant;
             relu_q     <= start_relu & start_requant;
             lut_q      <= start_lut & start_requant;
@@ -941,10 +995,21 @@ module student_gemm #(
             w16_q      <= start_w16 & ~start_requant;
             ostats_q   <= start_ostats & start_requant;
             osums_q    <= start_osums & start_ostats & start_requant;
-            onchip_q   <= start_onchip;
+            onchip_q   <= start_onchip & ~start_ln;
             greuse_q   <= start_greuse & start_gather & ~start_requant;
             grelu_q    <= start_grelu & start_gather & ~start_requant;
-            lerp_q     <= start_lerp & ~start_gather & ~start_requant;
+            lerp_q     <= start_lerp & ~start_gather & ~start_requant & ~start_ln;
+            ln_q       <= start_ln & ~start_requant;
+            lnb_q      <= start_ln & start_lnb & ~start_requant;
+            ln_cnt_q   <= '0;
+            rng_q      <= start_rng & ~start_requant & ~start_ln & ~start_lerp;
+            rngl_q     <= start_rng & start_rng_load & ~start_requant & ~start_ln & ~start_lerp;
+            dpar_q     <= start_dpar & start_requant;
+            rng_cnt_q  <= '0;
+            rng_s_addr_q <= reg2hw.rng_s_addr.q;
+            rng_b_addr_q <= reg2hw.rng_b_addr.q;
+            if (start_rng & start_rng_load & ~start_requant & ~start_ln & ~start_lerp)
+              rng_hasb_q <= reg2hw.rng_b_addr.q != 32'd0;
             p_addr_q   <= reg2hw.p_addr.q;
             lut_cnt_q  <= '0;
             x_addr_q   <= reg2hw.x_addr.q;
@@ -973,18 +1038,28 @@ module student_gemm #(
                                                            : 32'(reg2hw.k_len.q) * 32'd2;
             // In gather mode nothing is issued until the walker hands over
             // the first run.
-            rd_left_q      <= (start_gather & ~start_requant) ? 32'd0
+            rd_left_q      <= ((start_gather | (start_ln & start_lnb)) & ~start_requant) ? 32'd0
                             : 32'(reg2hw.n_rows.q) * 32'(reg2hw.k_len.q >> 1);
 
-            if (start_requant) begin
-              // Parameter table first: 3 words per row m, contiguous.
+            if (start_rng & start_rng_load & ~start_requant & ~start_ln & ~start_lerp) begin
+              // Range table first: 2 words per weight row, contiguous.
+              rd_addr_q      <= reg2hw.rng_s_addr.q;
+              rd_row_base_q  <= reg2hw.rng_s_addr.q;
+              rd_row_beats_q <= 32'(reg2hw.m_len.q) * 32'd2;
+              rd_row_left_q  <= 32'(reg2hw.m_len.q) * 32'd2;
+              rd_stride_q    <= 32'(reg2hw.m_len.q) * 32'd8;
+              rd_left_q      <= 32'(reg2hw.m_len.q) * 32'd2;
+            end
+            if (start_requant | (start_ln & ~start_lnb)) begin
+              // Parameter table first: 3 words per row m, contiguous
+              // (LayerNorm A: per token).
               rd_addr_q      <= reg2hw.p_addr.q;
               rd_row_base_q  <= reg2hw.p_addr.q;
               rd_row_beats_q <= 32'(reg2hw.m_len.q) * 32'd3;
               rd_row_left_q  <= 32'(reg2hw.m_len.q) * 32'd3;
               rd_stride_q    <= 32'(reg2hw.m_len.q) * 32'd12;
-              rd_left_q      <= 32'(reg2hw.m_len.q) * 32'd3;
-              if (start_lut_load) begin
+              rd_left_q      <= (start_dpar & start_requant) ? 32'd0 : 32'(reg2hw.m_len.q) * 32'd3;
+              if (start_lut_load & start_requant) begin
                 // Lookup table first: 8192 contiguous words, or 256 for
                 // the interpolating table (CTRL.lutint).
                 rd_addr_q      <= reg2hw.lut_addr.q;
@@ -1030,7 +1105,7 @@ module student_gemm #(
             rd_stride_q    <= 32'(g_cwords) * 32'd4;
             rd_left_q      <= 32'(g_cwords);
           end
-          if (a_load_done && !lerp_q) begin   // a LERP job reads no weights
+          if (a_load_done && !lerp_q && !ln_q) begin   // LERP and LN jobs read no weights
             // Reprogram the read engine for the weight stream: M rows of
             // K/4 beats, read exactly once for the whole tile.
             rd_addr_q      <= w_addr_q;
@@ -1100,7 +1175,7 @@ module student_gemm #(
             rd_row_beats_q <= 32'(m_len_q) * 32'd3;
             rd_row_left_q  <= 32'(m_len_q) * 32'd3;
             rd_stride_q    <= 32'(m_len_q) * 32'd12;
-            rd_left_q      <= 32'(m_len_q) * 32'd3;
+            rd_left_q      <= dpar_q ? 32'd0 : 32'(m_len_q) * 32'd3;
           end
         end
         RQ_LOAD_P: begin
@@ -1126,6 +1201,76 @@ module student_gemm #(
             rd_left_q      <= onchip_q ? 32'd0 : 32'(m_len_q) * (a16_q ? 32'(n_rows_q >> 1) : 32'(n_rows_q));
             rq_m_q <= '0;
             rq_n_q <= '0;
+          end
+          if (rq_p_done && ln_q) begin
+            // LayerNorm A: gamma next, one int32 per channel
+            rd_addr_q      <= w_addr_q;
+            rd_row_base_q  <= w_addr_q;
+            rd_row_beats_q <= 32'(k_len_q);
+            rd_row_left_q  <= 32'(k_len_q);
+            rd_stride_q    <= 32'(k_len_q) * 32'd4;
+            rd_left_q      <= 32'(k_len_q);
+          end
+        end
+
+        RNG_LOAD_S, RNG_LOAD_B: begin
+          // two words per row; then the biases, or the A tile
+          if (rd_valid) rng_cnt_q <= rng_cnt_q + 1'b1;
+          if (rng_ld_done) begin
+            rng_cnt_q <= '0;
+            if (state_q == RNG_LOAD_S && rng_b_addr_q != '0) begin
+              rd_addr_q      <= rng_b_addr_q;
+              rd_row_base_q  <= rng_b_addr_q;
+              rd_row_beats_q <= 32'(m_len_q) * 32'd2;
+              rd_row_left_q  <= 32'(m_len_q) * 32'd2;
+              rd_stride_q    <= 32'(m_len_q) * 32'd8;
+              rd_left_q      <= 32'(m_len_q) * 32'd2;
+            end else begin
+              // the A tile, as ST_IDLE programs it for a job without the table
+              rd_addr_q      <= a_addr_q;
+              rd_row_base_q  <= a_addr_q;
+              rd_row_beats_q <= 32'(k_len_q >> 1);
+              rd_row_left_q  <= 32'(k_len_q >> 1);
+              rd_stride_q    <= (a_stride_q != 32'd0) ? a_stride_q : 32'(k_len_q) * 32'd2;
+              rd_left_q      <= gather_q ? 32'd0 : 32'(n_rows_q) * 32'(k_len_q >> 1);
+            end
+          end
+        end
+
+        RQ_DPAR: begin
+          if (dp_done) begin
+            // acc chunk, as after RQ_LOAD_P
+            rd_addr_q      <= a_addr_q;
+            rd_row_base_q  <= a_addr_q;
+            rd_row_beats_q <= (a16_q ? 32'(n_rows_q >> 1) : 32'(n_rows_q));
+            rd_row_left_q  <= (a16_q ? 32'(n_rows_q >> 1) : 32'(n_rows_q));
+            rd_stride_q    <= a_stride_q;
+            rd_left_q      <= onchip_q ? 32'd0 : 32'(m_len_q) * (a16_q ? 32'(n_rows_q >> 1) : 32'(n_rows_q));
+            rq_m_q <= '0;
+            rq_n_q <= '0;
+          end
+        end
+
+        LN_LOAD_G, LN_LOAD_B: begin
+          // one channel per word; then beta, then the tile
+          if (rd_valid) ln_cnt_q <= ln_cnt_q + 1'b1;
+          if (ln_ld_done) begin
+            ln_cnt_q <= '0;
+            if (state_q == LN_LOAD_G) begin
+              rd_addr_q      <= x_addr_q;
+              rd_row_base_q  <= x_addr_q;
+              rd_row_beats_q <= 32'(k_len_q);
+              rd_row_left_q  <= 32'(k_len_q);
+              rd_stride_q    <= 32'(k_len_q) * 32'd4;
+              rd_left_q      <= 32'(k_len_q);
+            end else begin
+              rd_addr_q      <= a_addr_q;
+              rd_row_base_q  <= a_addr_q;
+              rd_row_beats_q <= 32'(k_len_q >> 1);
+              rd_row_left_q  <= 32'(k_len_q >> 1);
+              rd_stride_q    <= (a_stride_q != 32'd0) ? a_stride_q : 32'(k_len_q) * 32'd2;
+              rd_left_q      <= 32'(n_rows_q) * 32'(k_len_q >> 1);
+            end
           end
         end
 
@@ -1188,7 +1333,7 @@ module student_gemm #(
 
         ST_FINISH: begin
           // Wait for the last outstanding write to be acked, then report done.
-          if (wr_out_q == '0) begin
+          if (wr_out_q == '0 && !rng_busy) begin
             busy_q <= 1'b0;
             done_q <= 1'b1;
           end
@@ -1256,7 +1401,8 @@ module student_gemm #(
       gi_q <= GI_IDLE;
       gi_t_q <= '0; gi_oy_q <= '0; gi_ox_q <= '0; gi_oys_q <= '0; gi_oxs_q <= '0;
       gi_ky_q <= '0; gi_kx_q <= '0; gi_pos_q <= '0;
-    end else if (state_q == ST_IDLE && start_strobe && start_gather && !start_requant) begin
+    end else if (state_q == ST_IDLE && start_strobe && start_gather && !start_requant
+                 && !start_ln) begin
       gi_q     <= GI_SCAN;
       gi_t_q   <= '0;
       gi_oy_q  <= reg2hw.g_start.q[31:16];
@@ -1329,7 +1475,8 @@ module student_gemm #(
     if (!rst_ni) begin
       gw_t_q <= '0; gw_oys_q <= '0; gw_oxs_q <= '0; gw_ox_q <= '0;
       gw_ky_q <= '0; gw_kx_q <= '0; gw_pos_q <= '0; gw_cw_q <= '0;
-    end else if (state_q == ST_IDLE && start_strobe && start_gather && !start_requant) begin
+    end else if (state_q == ST_IDLE && start_strobe && start_gather && !start_requant
+                 && !start_ln) begin
       gw_t_q   <= '0;
       gw_ox_q  <= reg2hw.g_start.q[15:0];
       gw_oys_q <= reg2hw.g_start.q[31:16] * 16'(reg2hw.g_conv.q[7:4]);
@@ -1376,10 +1523,17 @@ module student_gemm #(
   // words per row, which is what bounds a chunk's M_LEN.
   logic [31:0]    pm_mult [KWORDS];   // per-row multiplier, indexed by output row m
   logic [5:0]     pm_shift[KWORDS];   // per-row right-shift amount
+  logic [AW-1:0]  pm_raddr;           // read address: row m, or the token in LN_P1
+  logic [NRW-1:0] ln_t_q;             // LN pass: token
+  assign pm_raddr = (state_q == LN_P1) ? AW'(ln_t_q) : rq_m_q;
   logic [31:0]    pm_bias [KWORDS];   // per-row bias, added after the shift
 
   // Demultiplex the incoming words into the three parameter RAMs, in the
   // order they arrive: mult, shift, bias, for row 0, then row 1, ...
+  logic           dp_v4;               // RQ_DPAR: row dp_i4's parameters are ready
+  logic [AW-1:0]  dp_i4;
+  logic [31:0]    dp_mult4, dp_bias4;
+  logic [5:0]     dp_shift_q;
   always_ff @(posedge clk_i) begin
     if ((state_q == RQ_LOAD_P) && rd_valid) begin
       unique case (rq_p_sel_q)
@@ -1387,6 +1541,10 @@ module student_gemm #(
         2'd1:    pm_shift[rq_p_cnt_q] <= rd_data[5:0];
         default: pm_bias [rq_p_cnt_q] <= rd_data;
       endcase
+    end else if (dp_v4) begin
+      pm_mult [dp_i4] <= dp_mult4;
+      pm_shift[dp_i4] <= dp_shift_q;
+      pm_bias [dp_i4] <= dp_bias4;
     end
   end
 
@@ -1457,9 +1615,9 @@ module student_gemm #(
     rq_row1   <= rq_n_q;
     rq_odd1   <= rq_m_q[0];
     rq_last1  <= rq_last_elem;
-    rq_mult1  <= pm_mult [rq_m_q];
-    rq_sh1    <= pm_shift[rq_m_q];
-    rq_bias1  <= pm_bias [rq_m_q];
+    rq_mult1  <= pm_mult [pm_raddr];
+    rq_sh1    <= pm_shift[pm_raddr];
+    rq_bias1  <= pm_bias [pm_raddr];
     // q2: product
     rq_prod2  <= $signed(rq_acc1) * $signed(rq_mult1);
     rq_sh2    <= rq_sh1;  rq_bias2 <= rq_bias1;  rq_odd2 <= rq_odd1;  rq_last2 <= rq_last1;
@@ -1769,7 +1927,7 @@ module student_gemm #(
     end else begin
       cr_v_q <= (state_q == RQ_LOAD_ACC) & onchip_q & cr_act_q;
       cr_v2_q <= cr_v_q & (state_q == RQ_LOAD_ACC);
-      if (rq_p_done & onchip_q) begin
+      if ((rq_p_done | dp_done) & onchip_q) begin
         cr_act_q <= 1'b1;
       end else if ((state_q == RQ_LOAD_ACC) & cr_act_q
                    & (cr_n_q == n_rows_q - 1'b1) & (cr_m_q == rq_mlen - 1'b1)) begin
@@ -1778,7 +1936,7 @@ module student_gemm #(
     end
   end
   always_ff @(posedge clk_i) begin
-    if (rq_p_done) begin
+    if (rq_p_done | dp_done) begin
       cr_base_q <= CRA'(a_addr_q);
       cr_n_q    <= '0;
       cr_m_q    <= '0;
@@ -1796,8 +1954,14 @@ module student_gemm #(
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       rq_amax_q <= '0;
-    end else if (start_strobe && start_requant) begin
+    end else if (start_strobe && (start_requant || start_ln)) begin
       rq_amax_q <= '0;
+    end else if (ln_v7 && ln_p2_7) begin
+      logic [31:0] ae, ao, am;
+      ae = (ln_ve7 < 0) ? 32'(-ln_ve7) : 32'(ln_ve7);
+      ao = (ln_vo7 < 0) ? 32'(-ln_vo7) : 32'(ln_vo7);
+      am = (ae > ao) ? ae : ao;
+      if (am > rq_amax_q) rq_amax_q <= am;
     end else if (rq_v12) begin
       rq_amax_q <= (rq_val12 < 0) ? (32'(-rq_val12) > rq_amax_q ? 32'(-rq_val12) : rq_amax_q)
                                   : (32'(rq_val12)  > rq_amax_q ? 32'(rq_val12)  : rq_amax_q);
@@ -1807,8 +1971,12 @@ module student_gemm #(
   // Pair the even element with the odd one and enqueue the word.
   logic        rq_fifo_push;
   logic [63:0] rq_fifo_wdata;   // {addr, data}
-  assign rq_fifo_push  = rq_v12 & rq_odd12;
-  assign rq_fifo_wdata = {rq_out_ptr_q, rq_val12[15:0], rq_prev_q};
+  logic        ln_push;          // LN_P2: an output word (declared here for the FIFO)
+  logic [31:0] ln_optr_q;        // its address
+  assign ln_push       = ln_v7 & ln_p2_7;
+  assign rq_fifo_push  = (rq_v12 & rq_odd12) | ln_push;
+  assign rq_fifo_wdata = ln_push ? {ln_optr_q, ln_vo7[15:0], ln_ve7[15:0]}
+                                 : {rq_out_ptr_q, rq_val12[15:0], rq_prev_q};
 
   always_ff @(posedge clk_i) begin
     if (rq_v12 & ~rq_odd12) rq_prev_q <= rq_val12[15:0];
@@ -1826,7 +1994,7 @@ module student_gemm #(
   assign rq_wr_req  = (rq_fifo_cnt_q != '0);
   assign rq_wr_addr = rq_fifo[rq_fifo_rd_q][63:32];
   assign rq_wr_data = rq_fifo[rq_fifo_rd_q][31:0];
-  assign rq_fifo_pop = issue_wr & (state_q == RQ_OUT);
+  assign rq_fifo_pop = issue_wr & (state_q == RQ_OUT || state_q == LN_P2);
 
   // Produce while there is room for what is in flight plus a margin.
   logic rq_last_seen_q;        // the last element has entered the pipeline
@@ -1871,6 +2039,484 @@ module student_gemm #(
       endcase
     end
   end
+
+  // -------------------------------------------------------------- LayerNorm
+  //
+  // CTRL.ln, phase A: token parameters in the parameter RAM (RQ_LOAD_P),
+  // gamma and beta in four LUT RAMs, even and odd channels (LN_LOAD_G,
+  // LN_LOAD_B), the tile holds N_ROWS tokens of K_LEN channels (ST_LOAD_A).
+  // LN_P1 walks the tile channel pair by channel pair (word w outer, token t
+  // inner) and writes zq = sat14(round(x * mult_t / 2^sh_t) + bias_t) back
+  // in place. At each pair's last token the pair's extremes go to the Y
+  // unit: y = ((z * (gamma_c * ZS)) >>> 31) + beta_c at z = lo and hi, and
+  // LN_YMAX keeps the largest |y|. The next pair starts when the pipeline
+  // and the Y unit are idle (about 15 cycles per pair).
+  //
+  // CTRL.ln | CTRL.lnb, phase B (the tile, the LUT RAMs and N_ROWS, K_LEN
+  // as phase A left them): LN_PAR makes G_c = mulh(gamma_c << 12, FM) >>> rr
+  // and B_c = (mulh(beta_c, INVM) + 2^(bsr-1)) >>> bsr in place, then LN_P2
+  // walks the tile token by token (w inner) and writes
+  // out[t][c] = sat14(round(zq * G_c / 2^shift) + B_c), two channels per
+  // word, at C_ADDR + t*C_STRIDE + 4w, through the output FIFO.
+  //
+  // The element pipeline has two lanes (channels 2w and 2w+1):
+  //   L0 issue: tile word w, parameter RAM (token) / LUT RAMs (pair w)
+  //   L1 the tile word and the parameters arrive
+  //   L2 the token's word selected, operands registered
+  //   L3 products (DSP), L4 registered again
+  //   L5 + rounding constant, L6 arithmetic shift
+  //   L7 + bias, saturated to 14 bits; then written back (A) or queued (B)
+  logic [24:0]    ln_zs_q;
+  logic [31:0]    ln_fm_q, ln_invm_q;
+  logic [5:0]     ln_shift_q;
+  logic [4:0]     ln_rr_q, ln_bsr_q;
+  always_ff @(posedge clk_i) begin
+    if (state_q == ST_IDLE && start_strobe) begin
+      ln_zs_q    <= reg2hw.ln_zs.q[24:0];
+      ln_fm_q    <= reg2hw.ln_fm.q;
+      ln_invm_q  <= reg2hw.ln_invm.q;
+      ln_shift_q <= reg2hw.ln_sh.q[5:0];
+      ln_rr_q    <= reg2hw.ln_sh.q[12:8];
+      ln_bsr_q   <= reg2hw.ln_sh.q[20:16];
+    end
+  end
+
+  // gamma / beta, then G / B: 1024 words each, in LUTs
+  (* ram_style = "distributed" *) logic [31:0] ln_ge [KWORDS];
+  (* ram_style = "distributed" *) logic [31:0] ln_go [KWORDS];
+  (* ram_style = "distributed" *) logic [31:0] ln_be [KWORDS];
+  (* ram_style = "distributed" *) logic [31:0] ln_bo [KWORDS];
+  logic [AW-1:0]  ln_raddr, ln_waddr;
+  logic [31:0]    ln_wdata;
+  logic [3:0]     ln_we;                 // ge, go, be, bo
+  logic [31:0]    ln_ge_rd, ln_go_rd, ln_be_rd, ln_bo_rd;
+  logic [AW-1:0]  ly_w_q, par_w_q;
+  logic           par_v4;
+  logic [1:0]     par_j4;
+  logic [AW-1:0]  par_w4;
+  logic [31:0]    par_res4;
+  assign ln_raddr = (state_q == LN_P1) ? ly_w_q : (state_q == LN_PAR) ? par_w_q : ln_w_q;
+  assign ln_ge_rd = ln_ge[ln_raddr];
+  assign ln_go_rd = ln_go[ln_raddr];
+  assign ln_be_rd = ln_be[ln_raddr];
+  assign ln_bo_rd = ln_bo[ln_raddr];
+  assign ln_ld_done = (state_q == LN_LOAD_G || state_q == LN_LOAD_B) & rd_valid
+                    & (ln_cnt_q == 12'(k_len_q - 1'b1));
+  always_comb begin
+    ln_we    = '0;
+    ln_waddr = AW'(ln_cnt_q >> 1);
+    ln_wdata = rd_data;
+    if (state_q == LN_LOAD_G && rd_valid) ln_we[ln_cnt_q[0]] = 1'b1;
+    if (state_q == LN_LOAD_B && rd_valid) ln_we[2 + ln_cnt_q[0]] = 1'b1;
+    if (par_v4) begin
+      ln_waddr = par_w4;
+      ln_wdata = par_res4;
+      ln_we[par_j4] = 1'b1;
+    end
+  end
+  always_ff @(posedge clk_i) begin
+    if (ln_we[0]) ln_ge[ln_waddr] <= ln_wdata;
+    if (ln_we[1]) ln_go[ln_waddr] <= ln_wdata;
+    if (ln_we[2]) ln_be[ln_waddr] <= ln_wdata;
+    if (ln_we[3]) ln_bo[ln_waddr] <= ln_wdata;
+  end
+
+  // ---- element pipeline
+  logic           ln_all_q;                // every element has been issued
+  logic           ln_v1, ln_v2, ln_v3, ln_v4, ln_v5, ln_v6;
+  logic           ln_pipe_busy;
+  assign ln_pipe_busy = ln_v1 | ln_v2 | ln_v3 | ln_v4 | ln_v5 | ln_v6 | ln_v7;
+  assign ln_issue = ~ln_all_q & (
+        ((state_q == LN_P1) & ~((ln_t_q == '0) & (ln_pipe_busy | ly_busy)))
+      | ((state_q == LN_P2)
+         & (rq_fifo_cnt_q < ($clog2(RQ_FIFO_D)+1)'(RQ_FIFO_D - 12))));
+  // No reset: ln_w_q and ln_t_q address block RAMs (DRC REQP-1840); every
+  // state other than the two passes clears them, and ST_IDLE comes first.
+  always_ff @(posedge clk_i) begin
+    if (state_q != LN_P1 && state_q != LN_P2) begin
+      ln_w_q <= '0; ln_t_q <= '0; ln_all_q <= 1'b0;
+    end else if (ln_issue) begin
+      if (state_q == LN_P1) begin            // token inner
+        if (ln_t_q == n_rows_q - 1'b1) begin
+          ln_t_q <= '0;
+          if (ln_w_q == k_words - 1'b1) ln_all_q <= 1'b1;
+          else                          ln_w_q   <= ln_w_q + 1'b1;
+        end else begin
+          ln_t_q <= ln_t_q + 1'b1;
+        end
+      end else begin                          // pair inner
+        if (ln_w_q == k_words - 1'b1) begin
+          ln_w_q <= '0;
+          if (ln_t_q == n_rows_q - 1'b1) ln_all_q <= 1'b1;
+          else                           ln_t_q   <= ln_t_q + 1'b1;
+        end else begin
+          ln_w_q <= ln_w_q + 1'b1;
+        end
+      end
+    end
+  end
+
+  logic [RW-1:0]  ln_t1, ln_t2, ln_t3, ln_t4, ln_t5, ln_t6;
+  logic [AW-1:0]  ln_w1, ln_w2, ln_w3, ln_w4, ln_w5, ln_w6;
+  logic           ln_p2_1, ln_p2_2, ln_p2_3, ln_p2_4, ln_p2_5, ln_p2_6;
+  logic           ln_f1, ln_f2, ln_f3, ln_f4, ln_f5, ln_f6, ln_f7;   // first token of the pair
+  logic           ln_l1, ln_l2, ln_l3, ln_l4, ln_l5, ln_l6, ln_l7;   // last token of the pair
+  logic           ln_e1, ln_e2, ln_e3, ln_e4, ln_e5, ln_e6, ln_e7;   // last word of the row (B)
+  logic signed [31:0] ln_ge1, ln_go1, ln_be1, ln_bo1;
+  logic signed [15:0] ln_xe2, ln_xo2;
+  logic signed [31:0] ln_me2, ln_mo2, ln_bie2, ln_bio2, ln_bie3, ln_bio3, ln_bie4, ln_bio4;
+  logic signed [31:0] ln_bie5, ln_bio5, ln_bie6, ln_bio6;
+  logic [5:0]         ln_sh2, ln_sh3, ln_sh4, ln_sh5;
+  (* use_dsp = "yes" *) logic signed [47:0] ln_pe3, ln_po3, ln_pe4, ln_po4;
+  logic signed [63:0] ln_re5, ln_ro5, ln_se6, ln_so6;
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      ln_v1 <= 1'b0; ln_v2 <= 1'b0; ln_v3 <= 1'b0; ln_v4 <= 1'b0;
+      ln_v5 <= 1'b0; ln_v6 <= 1'b0; ln_v7 <= 1'b0;
+    end else begin
+      ln_v1 <= ln_issue;
+      ln_v2 <= ln_v1; ln_v3 <= ln_v2; ln_v4 <= ln_v3; ln_v5 <= ln_v4; ln_v6 <= ln_v5; ln_v7 <= ln_v6;
+    end
+  end
+  always_ff @(posedge clk_i) begin
+    // L1: the tile word (a_q) and the parameters arrive
+    ln_t1   <= ln_t_q[RW-1:0];
+    ln_w1   <= ln_w_q;
+    ln_p2_1 <= (state_q == LN_P2);
+    ln_f1   <= (ln_t_q == '0);
+    ln_l1   <= (ln_t_q == n_rows_q - 1'b1);
+    ln_e1   <= (ln_w_q == k_words - 1'b1);
+    ln_ge1  <= ln_ge_rd;  ln_go1 <= ln_go_rd;  ln_be1 <= ln_be_rd;  ln_bo1 <= ln_bo_rd;
+    // L2: the token's word, the lane operands
+    ln_xe2  <= $signed(a_q[ln_t1][15:0]);
+    ln_xo2  <= $signed(a_q[ln_t1][31:16]);
+    ln_me2  <= ln_p2_1 ? ln_ge1 : rq_mult1;
+    ln_mo2  <= ln_p2_1 ? ln_go1 : rq_mult1;
+    ln_sh2  <= ln_p2_1 ? ln_shift_q : rq_sh1;
+    ln_bie2 <= ln_p2_1 ? ln_be1 : rq_bias1;
+    ln_bio2 <= ln_p2_1 ? ln_bo1 : rq_bias1;
+    ln_t2 <= ln_t1; ln_w2 <= ln_w1; ln_p2_2 <= ln_p2_1; ln_f2 <= ln_f1; ln_l2 <= ln_l1; ln_e2 <= ln_e1;
+    // L3: products
+    ln_pe3  <= ln_xe2 * ln_me2;
+    ln_po3  <= ln_xo2 * ln_mo2;
+    ln_sh3  <= ln_sh2;  ln_bie3 <= ln_bie2;  ln_bio3 <= ln_bio2;
+    ln_t3 <= ln_t2; ln_w3 <= ln_w2; ln_p2_3 <= ln_p2_2; ln_f3 <= ln_f2; ln_l3 <= ln_l2; ln_e3 <= ln_e2;
+    // L4: the DSP output register
+    ln_pe4  <= ln_pe3;
+    ln_po4  <= ln_po3;
+    ln_sh4  <= ln_sh3;  ln_bie4 <= ln_bie3;  ln_bio4 <= ln_bio3;
+    ln_t4 <= ln_t3; ln_w4 <= ln_w3; ln_p2_4 <= ln_p2_3; ln_f4 <= ln_f3; ln_l4 <= ln_l3; ln_e4 <= ln_e3;
+    // L5: rounding
+    ln_re5  <= 64'(ln_pe4) + ((ln_sh4 != 6'd0) ? (64'sd1 <<< (ln_sh4 - 6'd1)) : 64'sd0);
+    ln_ro5  <= 64'(ln_po4) + ((ln_sh4 != 6'd0) ? (64'sd1 <<< (ln_sh4 - 6'd1)) : 64'sd0);
+    ln_sh5  <= ln_sh4;  ln_bie5 <= ln_bie4;  ln_bio5 <= ln_bio4;
+    ln_t5 <= ln_t4; ln_w5 <= ln_w4; ln_p2_5 <= ln_p2_4; ln_f5 <= ln_f4; ln_l5 <= ln_l4; ln_e5 <= ln_e4;
+    // L6: shift
+    ln_se6  <= ln_re5 >>> ln_sh5;
+    ln_so6  <= ln_ro5 >>> ln_sh5;
+    ln_bie6 <= ln_bie5;  ln_bio6 <= ln_bio5;
+    ln_t6 <= ln_t5; ln_w6 <= ln_w5; ln_p2_6 <= ln_p2_5; ln_f6 <= ln_f5; ln_l6 <= ln_l5; ln_e6 <= ln_e5;
+    // L7: bias, 14-bit saturation (as the requantisation's q6)
+    begin
+      logic signed [32:0] se, so;
+      se = 33'($signed(ln_se6[31:0])) + 33'(ln_bie6);
+      so = 33'($signed(ln_so6[31:0])) + 33'(ln_bio6);
+      ln_ve7 <= (se > 33'sd8191) ? 32'sd8191 : (se < -33'sd8191) ? -32'sd8191 : 32'(se);
+      ln_vo7 <= (so > 33'sd8191) ? 32'sd8191 : (so < -33'sd8191) ? -32'sd8191 : 32'(so);
+    end
+    ln_t7 <= ln_t6; ln_w7 <= ln_w6; ln_p2_7 <= ln_p2_6; ln_f7 <= ln_f6; ln_l7 <= ln_l6; ln_e7 <= ln_e6;
+  end
+
+  // ---- phase A: channel extremes of zq, and the Y unit
+  logic signed [15:0] ln_loe_q, ln_hie_q, ln_loo_q, ln_hio_q;
+  logic signed [15:0] ly_z_q [4];          // lo_e, hi_e, lo_o, hi_o of pair ly_w_q
+  logic               ly_go_q;             // a pair is waiting for the Y unit
+  logic [2:0]         ly_j_q;              // product being issued, 4 = none
+  logic               ly_v1, ly_v2, ly_v3, ly_v4, ly_v5, ly_v6;
+  logic signed [15:0] ly_z1, ly_z2, ly_z3;
+  logic signed [31:0] ly_g1, ly_b1, ly_b2, ly_b3, ly_b4, ly_b5;
+  (* use_dsp = "yes" *) logic signed [57:0] ly_G2, ly_G3;
+  (* use_dsp = "yes" *) logic signed [73:0] ly_p4, ly_p5;
+  logic signed [63:0] ly_y6;
+  logic [63:0]        ly_max_q;
+  assign ly_busy = ly_go_q | (ly_j_q != 3'd4) | ly_v1 | ly_v2 | ly_v3 | ly_v4 | ly_v5 | ly_v6;
+  always_ff @(posedge clk_i) begin
+    if (ln_wb) begin
+      logic signed [15:0] ve, vo;
+      ve = ln_ve7[15:0];
+      vo = ln_vo7[15:0];
+      ln_loe_q <= (ln_f7 || ve < ln_loe_q) ? ve : ln_loe_q;
+      ln_hie_q <= (ln_f7 || ve > ln_hie_q) ? ve : ln_hie_q;
+      ln_loo_q <= (ln_f7 || vo < ln_loo_q) ? vo : ln_loo_q;
+      ln_hio_q <= (ln_f7 || vo > ln_hio_q) ? vo : ln_hio_q;
+      if (ln_l7) begin
+        ly_z_q[0] <= (ln_f7 || ve < ln_loe_q) ? ve : ln_loe_q;
+        ly_z_q[1] <= (ln_f7 || ve > ln_hie_q) ? ve : ln_hie_q;
+        ly_z_q[2] <= (ln_f7 || vo < ln_loo_q) ? vo : ln_loo_q;
+        ly_z_q[3] <= (ln_f7 || vo > ln_hio_q) ? vo : ln_hio_q;
+        ly_w_q    <= ln_w7;
+      end
+    end
+    // Y1: operands (the LUT RAMs are read at ly_w_q)
+    ly_z1 <= ly_z_q[ly_j_q[1:0]];
+    ly_g1 <= ly_j_q[1] ? ln_go_rd : ln_ge_rd;
+    ly_b1 <= ly_j_q[1] ? ln_bo_rd : ln_be_rd;
+    // Y2, Y3: G = gamma * ZS, registered twice
+    ly_G2 <= ly_g1 * $signed({1'b0, ln_zs_q});
+    ly_G3 <= ly_G2;
+    ly_z2 <= ly_z1;  ly_z3 <= ly_z2;
+    ly_b2 <= ly_b1;  ly_b3 <= ly_b2;  ly_b4 <= ly_b3;  ly_b5 <= ly_b4;
+    // Y4, Y5: z * G, registered twice
+    ly_p4 <= ly_z3 * ly_G3;
+    ly_p5 <= ly_p4;
+    // Y6: y
+    ly_y6 <= 64'(ly_p5 >>> 31) + 64'(ly_b5);
+  end
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      ly_go_q <= 1'b0;
+      ly_j_q  <= 3'd4;
+      ly_v1 <= 1'b0; ly_v2 <= 1'b0; ly_v3 <= 1'b0; ly_v4 <= 1'b0; ly_v5 <= 1'b0; ly_v6 <= 1'b0;
+      ly_max_q <= '0;
+    end else begin
+      if (ln_wb && ln_l7) ly_go_q <= 1'b1;
+      if (ly_go_q && ly_j_q == 3'd4) begin
+        ly_go_q <= 1'b0;
+        ly_j_q  <= 3'd0;
+      end else if (ly_j_q != 3'd4) begin
+        ly_j_q  <= ly_j_q + 1'b1;
+      end
+      ly_v1 <= (ly_j_q != 3'd4);
+      ly_v2 <= ly_v1; ly_v3 <= ly_v2; ly_v4 <= ly_v3; ly_v5 <= ly_v4; ly_v6 <= ly_v5;
+      if (state_q == ST_IDLE && start_strobe && start_ln && !start_lnb) begin
+        ly_max_q <= '0;
+      end else if (ly_v6) begin
+        logic [63:0] ay;
+        ay = (ly_y6 < 0) ? 64'(-ly_y6) : 64'(ly_y6);
+        if (ay > ly_max_q) ly_max_q <= ay;
+      end
+    end
+  end
+  assign hw2reg.ln_ymax_lo.d = ly_max_q[31:0];
+  assign hw2reg.ln_ymax_hi.d = ly_max_q[63:32];
+  assign ln_p1_done = (state_q == LN_P1) & ln_all_q & ~ln_pipe_busy & ~ly_busy;
+
+  // ---- phase B: channel multipliers and biases (LN_PAR), one product per
+  // cycle: j = 0, 1 G of the even / odd channel, j = 2, 3 B
+  logic               par_all_q;
+  logic [1:0]         par_j_q;
+  logic               par_v1, par_v2, par_v3;
+  logic [1:0]         par_j1, par_j2, par_j3;
+  logic [AW-1:0]      par_w1, par_w2, par_w3;
+  logic signed [31:0] par_a1, par_m1;
+  (* use_dsp = "yes" *) logic signed [63:0] par_p2, par_p3;
+  assign par_busy = par_v1 | par_v2 | par_v3 | par_v4;
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      par_w_q <= '0; par_j_q <= '0; par_all_q <= 1'b0;
+      par_v1 <= 1'b0; par_v2 <= 1'b0; par_v3 <= 1'b0; par_v4 <= 1'b0;
+    end else begin
+      if (state_q != LN_PAR) begin
+        par_w_q <= '0; par_j_q <= '0; par_all_q <= 1'b0;
+      end else if (!par_all_q) begin
+        par_j_q <= par_j_q + 1'b1;
+        if (par_j_q == 2'd3) begin
+          if (par_w_q == k_words - 1'b1) par_all_q <= 1'b1;
+          else                           par_w_q   <= par_w_q + 1'b1;
+        end
+      end
+      par_v1 <= (state_q == LN_PAR) & ~par_all_q;
+      par_v2 <= par_v1; par_v3 <= par_v2; par_v4 <= par_v3;
+    end
+  end
+  always_ff @(posedge clk_i) begin
+    // PA1: operands
+    unique case (par_j_q)
+      2'd0:    par_a1 <= ln_ge_rd << 12;
+      2'd1:    par_a1 <= ln_go_rd << 12;
+      2'd2:    par_a1 <= ln_be_rd;
+      default: par_a1 <= ln_bo_rd;
+    endcase
+    par_m1 <= par_j_q[1] ? ln_invm_q : ln_fm_q;
+    par_j1 <= par_j_q;  par_w1 <= par_w_q;
+    // PA2, PA3: the product, registered twice
+    par_p2 <= par_a1 * par_m1;
+    par_p3 <= par_p2;
+    par_j2 <= par_j1;  par_w2 <= par_w1;
+    par_j3 <= par_j2;  par_w3 <= par_w2;
+    // PA4: mulh, then the shift (and rounding for B)
+    begin
+      logic signed [63:0] h;
+      h = par_p3 >>> 32;
+      par_res4 <= !par_j3[1] ? 32'(h >>> ln_rr_q)
+                             : 32'((h + (64'sd1 <<< (ln_bsr_q - 5'd1))) >>> ln_bsr_q);
+    end
+    par_j4 <= par_j3;  par_w4 <= par_w3;
+  end
+  assign ln_par_done = (state_q == LN_PAR) & par_all_q & ~par_busy;
+
+  // ---- phase B: output addresses, in the order the words are queued
+  logic [31:0] ln_orow_q;
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      ln_optr_q <= '0;
+      ln_orow_q <= '0;
+    end else if (state_q != LN_P2) begin
+      ln_optr_q <= c_ptr_q;
+      ln_orow_q <= c_ptr_q;
+    end else if (ln_push) begin
+      if (ln_e7) begin
+        ln_optr_q <= ln_orow_q + c_stride_q;
+        ln_orow_q <= ln_orow_q + c_stride_q;
+      end else begin
+        ln_optr_q <= ln_optr_q + 32'd4;
+      end
+    end
+  end
+  assign ln_p2_done = (state_q == LN_P2) & ln_all_q & ~ln_pipe_busy & (rq_fifo_cnt_q == '0);
+
+  // ------------------------------------------------------------ range table
+  //
+  // S and B hold each weight row's scale and bias mantissa at the common
+  // exponents (CTRL.rng_load). The GEMM's range unit (CTRL.rng) and the
+  // requantisation's parameter unit (CTRL.dpar) read them.
+  localparam int unsigned RNGD = 2048;                 // weight rows
+  (* ram_style = "distributed" *) logic [31:0] rng_S [RNGD];
+  (* ram_style = "distributed" *) logic [31:0] rng_B [RNGD];
+  logic signed [15:0] rng_es_q, rng_eb_q;
+  logic signed [31:0] rng_beta_m_q;
+  logic [4:0]         rng_beta_sh_q;
+  logic signed [31:0] dp_fk_q, dp_gb_q;
+  logic [4:0]         dp_r_q, dp_k_q;
+  logic               dp_nob_q;
+  logic [10:0]        dp_m0_q;
+  always_ff @(posedge clk_i) begin
+    if (state_q == ST_IDLE && start_strobe) begin
+      if (start_rng & start_rng_load) begin
+        rng_es_q <= reg2hw.rng_e.q[15:0];
+        rng_eb_q <= reg2hw.rng_e.q[31:16];
+      end
+      rng_beta_m_q  <= reg2hw.rng_beta_m.q;
+      rng_beta_sh_q <= reg2hw.rng_beta_sh.q[4:0];
+      dp_fk_q    <= reg2hw.dp_fk.q;
+      dp_gb_q    <= reg2hw.dp_gb.q;
+      dp_shift_q <= reg2hw.dp_sh.q[5:0];
+      dp_r_q     <= reg2hw.dp_sh.q[12:8];
+      dp_k_q     <= reg2hw.dp_sh.q[20:16];
+      dp_nob_q   <= reg2hw.dp_sh.q[24];
+      dp_m0_q    <= reg2hw.dp_m0.q[10:0];
+    end
+  end
+
+  // table load: word 2i is row i's m, word 2i+1 its sh
+  logic signed [31:0] rng_mtmp_q;
+  logic signed [31:0] rng_d;               // sh - e
+  logic signed [31:0] rng_al;              // the aligned mantissa
+  assign rng_ld_done = (state_q == RNG_LOAD_S || state_q == RNG_LOAD_B) & rd_valid
+                     & (rng_cnt_q == 13'(m_len_q) * 13'd2 - 1'b1);
+  assign rng_d  = $signed(rd_data) - ((state_q == RNG_LOAD_S) ? 32'(rng_es_q) : 32'(rng_eb_q));
+  assign rng_al = (rng_d > 32'sd31) ? (rng_mtmp_q < 0 ? -32'sd1 : 32'sd0)
+                : (rng_d < 32'sd0)  ? 32'sd0
+                                    : (rng_mtmp_q >>> rng_d[4:0]);
+  always_ff @(posedge clk_i) begin
+    if ((state_q == RNG_LOAD_S || state_q == RNG_LOAD_B) && rd_valid && !rng_cnt_q[0])
+      rng_mtmp_q <= $signed(rd_data);
+    if (state_q == RNG_LOAD_S && rd_valid && rng_cnt_q[0]) rng_S[rng_cnt_q[11:1]] <= rng_al;
+    if (state_q == RNG_LOAD_B && rd_valid && rng_cnt_q[0]) rng_B[rng_cnt_q[11:1]] <= rng_al;
+  end
+
+  // one read port per table: the range unit (weight row m_q), or RQ_DPAR
+  logic [10:0]        rng_raddr;
+  logic signed [31:0] rng_S_rd, rng_B_rd;
+  logic [AW-1:0]      dp_i_q;
+  assign rng_raddr = (state_q == RQ_DPAR) ? 11'(dp_m0_q + 11'(dp_i_q)) : m_q[10:0];
+  assign rng_S_rd  = rng_S[rng_raddr];
+  assign rng_B_rd  = rng_hasb_q ? rng_B[rng_raddr] : 32'sd0;
+
+  // ---- the range unit: one row per cycle at most
+  //   G1 the row's max, min and table entries   G2, G3 products (DSP)
+  //   G4 mulh, bias shift   G5 sums   G6 RNG_VMAX, RNG_VMIN
+  logic               rng_v1, rng_v2, rng_v3, rng_v4, rng_v5;
+  logic signed [31:0] rng_mx1, rng_mn1, rng_s1, rng_b1;
+  (* use_dsp = "yes" *) logic signed [63:0] rng_pb2, rng_ph2, rng_pl2, rng_pb3, rng_ph3, rng_pl3;
+  logic signed [31:0] rng_bv4, rng_hh4, rng_ll4;
+  logic signed [63:0] rng_hv5, rng_lv5;
+  logic signed [63:0] rng_vmax_q, rng_vmin_q;
+  assign rng_busy = rng_v1 | rng_v2 | rng_v3 | rng_v4 | rng_v5;
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      rng_v1 <= 1'b0; rng_v2 <= 1'b0; rng_v3 <= 1'b0; rng_v4 <= 1'b0; rng_v5 <= 1'b0;
+      rng_vmax_q <= '0; rng_vmin_q <= '0;
+    end else begin
+      rng_v1 <= rng_q & (state_q == ST_DRAIN) & (t_q == n_wr);
+      rng_v2 <= rng_v1; rng_v3 <= rng_v2; rng_v4 <= rng_v3; rng_v5 <= rng_v4;
+      if (state_q == ST_IDLE && start_strobe && start_rng && start_rng_load
+          && !start_requant && !start_ln && !start_lerp) begin
+        rng_vmax_q <= '0;
+        rng_vmin_q <= '0;
+      end else if (rng_v5) begin
+        if (rng_hv5 > rng_vmax_q) rng_vmax_q <= rng_hv5;
+        if (rng_lv5 < rng_vmin_q) rng_vmin_q <= rng_lv5;
+      end
+    end
+  end
+  always_ff @(posedge clk_i) begin
+    rng_mx1 <= acc_max_q;
+    rng_mn1 <= acc_min_q;
+    rng_s1  <= rng_S_rd;
+    rng_b1  <= rng_B_rd;
+    rng_pb2 <= rng_b1 * rng_beta_m_q;
+    rng_ph2 <= rng_mx1 * rng_s1;
+    rng_pl2 <= rng_mn1 * rng_s1;
+    rng_pb3 <= rng_pb2;  rng_ph3 <= rng_ph2;  rng_pl3 <= rng_pl2;
+    rng_bv4 <= 32'(rng_pb3 >>> 32) >>> rng_beta_sh_q;
+    rng_hh4 <= 32'(rng_ph3 >>> 32);
+    rng_ll4 <= 32'(rng_pl3 >>> 32);
+    rng_hv5 <= 64'(rng_hh4) + 64'(rng_bv4);
+    rng_lv5 <= 64'(rng_ll4) + 64'(rng_bv4);
+  end
+  assign hw2reg.rng_vmax_lo.d = rng_vmax_q[31:0];
+  assign hw2reg.rng_vmax_hi.d = rng_vmax_q[63:32];
+  assign hw2reg.rng_vmin_lo.d = rng_vmin_q[31:0];
+  assign hw2reg.rng_vmin_hi.d = rng_vmin_q[63:32];
+
+  // ---- the parameter unit (RQ_DPAR): one row per cycle
+  //   D1 table entries   D2, D3 products (DSP)   D4 parameters, written
+  logic               dp_all_q, dp_v1, dp_v2, dp_v3;
+  logic [AW-1:0]      dp_i1, dp_i2, dp_i3;
+  logic signed [31:0] dp_s1, dp_b1;
+  (* use_dsp = "yes" *) logic signed [63:0] dp_pm2, dp_pb2, dp_pm3, dp_pb3;
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      dp_i_q <= '0; dp_all_q <= 1'b0;
+      dp_v1 <= 1'b0; dp_v2 <= 1'b0; dp_v3 <= 1'b0; dp_v4 <= 1'b0;
+    end else begin
+      if (state_q != RQ_DPAR) begin
+        dp_i_q <= '0; dp_all_q <= 1'b0;
+      end else if (!dp_all_q) begin
+        if (dp_i_q == rq_mlen - 1'b1) dp_all_q <= 1'b1;
+        else                          dp_i_q   <= dp_i_q + 1'b1;
+      end
+      dp_v1 <= (state_q == RQ_DPAR) & ~dp_all_q;
+      dp_v2 <= dp_v1; dp_v3 <= dp_v2; dp_v4 <= dp_v3;
+    end
+  end
+  always_ff @(posedge clk_i) begin
+    dp_s1  <= rng_S_rd;
+    dp_b1  <= rng_B_rd;
+    dp_i1  <= dp_i_q;
+    dp_pm2 <= dp_s1 * dp_fk_q;
+    dp_pb2 <= dp_b1 * dp_gb_q;
+    dp_i2  <= dp_i1;
+    dp_pm3 <= dp_pm2;
+    dp_pb3 <= dp_pb2;
+    dp_i3  <= dp_i2;
+    dp_mult4 <= 32'(dp_pm3 >>> 32) >>> dp_r_q;
+    dp_bias4 <= dp_nob_q ? 32'd0
+              : 32'((64'(32'(dp_pb3 >>> 32)) + (64'sd1 <<< (dp_k_q - 5'd1))) >>> dp_k_q);
+    dp_i4    <= dp_i3;
+  end
+  assign dp_done = (state_q == RQ_DPAR) & dp_all_q & ~dp_v1 & ~dp_v2 & ~dp_v3 & ~dp_v4;
 
   // Diagnostics: what the FSM is waiting on. Declared here, after the signals
   // it samples, so the testbench compiler accepts it.
@@ -1938,7 +2584,8 @@ module student_gemm #(
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       stall_cnt <= 0;
-    end else if (state_q == ST_IDLE || issue_rd || issue_wr || rsp_rd || rsp_wr || adv) begin
+    end else if (state_q == ST_IDLE || issue_rd || issue_wr || rsp_rd || rsp_wr || adv
+                 || ln_issue || ly_busy || par_busy || rng_busy || state_q == RQ_DPAR) begin
       stall_cnt <= 0;
     end else begin
       stall_cnt <= stall_cnt + 1;

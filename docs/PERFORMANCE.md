@@ -1,4 +1,4 @@
-# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 1.44 s (estimated)
+# Performance — how one frame went from 93.6 s to 7.2 s (measured) and about 1.35 s (estimated)
 
 This is the record of the speed-up work: what was measured, what each change
 did, and what is left. Every step kept the FPGA output **bit-exact with the
@@ -1314,6 +1314,99 @@ no errors, every output within 1.3·10⁻⁴ of the reference (1 − r).
 Model: v^T on the CPU 2.2 → 0 Mcycles (1.0 now waits for the job), block
 +0.8 (transpose), block idle before attention GEMMs 5.1 → 2.6; frame
 76.1 → 75.0 Mcycles, **about 1.44 s**. About 2021 jobs per frame.
+
+### Round thirty — the LayerNorm job (hardware; estimated, not yet measured)
+
+LayerNorm ran as two int16-input requantisation jobs with CPU work in
+between: after the first job, the CPU took each channel's zq extremes,
+computed the exact range of y = zq · gamma · zs + beta over all channels
+(64-bit products), the output scale, and each channel's multiplier and
+bias. The block waited for it (8.4 Mcycles before the int16 jobs), and
+the second job transposed the data back.
+
+**`CTRL.ln`**, phase A: one job loads the per-token parameters (the CPU
+still computes them from the row sums), gamma and beta into four LUT RAMs
+(even and odd channels, 1024 words each), and the tile with the tokens as
+rows (82 of 128, 384 channels of 2048). A two-lane pipeline (7 stages,
+two DSP products per lane) writes zq back in place, channel pair by
+channel pair. At each pair's last token the pair's extremes go to a Y
+unit: G = gamma · ZS (58 bits), then z · G (74 bits), y = (z G >> 31) +
+beta, and `LN_YMAX` keeps the largest |y|. The CPU reads it and computes
+the output scale and six scalars (`ln_out_scale`, shared with the old
+path). **`CTRL.lnb`**, phase B: a parameter unit makes G_c = mulh(gamma
+<< 12, FM) >> rr and B_c = (mulh(beta, INVM) + 2^(bsr−1)) >> bsr in place
+(one product per cycle), then the same pipeline writes out[t][c] =
+sat14(round(zq G_c / 2^shift) + B_c) token by token through the
+requantisation's output FIFO, and `RQ_AMAX` is the largest |out|. These
+are the old jobs' and the CPU's formulas, so the output is the same.
+CAPS bit 23 announces the job (the KMAX field keeps 15 bits); a boot
+self-test ("LayerNorm self-test ok") checks both phases on 5 tokens of 12
+channels. On a decline or a failure the old path runs (x is intact).
+
+Checks: `student_gemm_tb` (encoder shape, other strides, 1 × 2, 3 × 6,
+128 × 512, 4 × 2048; LN_YMAX, every output, the gaps, RQ_AMAX). The
+testbench's reference needed a workaround: xsim widens an element of a
+nested dynamic array to longint with wrong upper bits. Same output, bit
+for bit (11 images; emulator without the job). Bus errors injected into
+each of the first 200 jobs, with AddressSanitizer and UBSan: no errors.
+Bitstream: timing met, WNS +0.216 ns (DDR3 controller), worst `sys_clk`
+path +0.769 ns, WHS +0.030 ns; LUT 32.7 % (LUTRAM 9.5 %), BRAM 91.6 %,
+DSP 40.0 %. New warnings: DPOP-1/2 on the new wide products (as the old
+`rq_prod2`), and REQP-1840 on the pm RAM address from the token counter;
+round thirty-one removes that counter's reset.
+
+Model: frame 75.0 → 71.4 Mcycles. The block now idles 6.7 Mcycles before
+the LayerNorm jobs: 2.9 for the CPU's per-token statistics, 2.8 for the
+token embedding before block 1, 0.4 for the name lookups of each block's
+weights.
+
+### Round thirty-one — the range unit and derived parameters (hardware; estimated, not yet measured)
+
+After each GEMM the CPU computed the output range (per row: the
+extremes, the aligned scale and bias, three 32-bit products; 10.6
+Mcycles per frame) and then the requantisation parameters (per row, 3.4
+Mcycles). Both were the largest CPU items of the frame.
+
+**`CTRL.rng`**: the operation's first job (`CTRL.rng_load`) loads a table
+before its A tile: each weight row's scale and bias as {m, sh}, aligned
+to the common exponents as they arrive (two LUT RAMs of 2048 rows). After
+each weight row's drain a pipelined unit (three DSP products) makes hv =
+mulh(max, S) + bv and lv = mulh(min, S) + bv with bv = mulh(B, beta) >>
+beta_sh, and `RNG_VMAX`, `RNG_VMIN` keep the extremes over all rows and
+tiles. The CPU's formula, the same result. **`CTRL.dpar`**: a
+requantisation job derives each row's parameters from the table (two DSP
+products per row, one row per cycle) instead of reading three words per
+row. The residual add and the column extremes need each row's
+requantised extremes: they come from a small requantisation job of their
+own over the rows' {max, min} (a 2-column matrix) with the same derived
+parameters; its RQ_AMAX is the add's largest |h|. The common exponents
+are kept per weight (`qgemm_exps`), since the weights are fixed. CAPS bit
+22; a boot self-test ("range self-test ok") runs a 20 × 64 × 30 GEMM
+with the table and its requantisation in two chunks.
+
+A bug found on the way: the requantisation passed its epilogue only when
+add, ReLU, table, statistics or the result RAM was on; a plain job with
+`dpar` then read the empty parameter array. The epilogue now also goes
+with `dpar`.
+
+Checks: `student_gemm_tb`: five range cases (encoder shape, two tiles,
+M = 2048, on chip, with the table), each RNG_VMAX/VMIN and every output.
+PASSED, 878,828 words. Same output, bit for bit (11 images; emulators
+without the unit). Bus errors injected into each of the first 260 jobs,
+with AddressSanitizer and UBSan: no errors. Bitstream (rounds thirty and
+thirty-one together): timing met, WNS +0.395 ns (DDR3 controller), worst
+`sys_clk` path +0.893 ns, WHS +0.031 ns; LUT 37.4 % (LUTRAM 15.6 %), BRAM
+92.3 %, DSP 42.7 %. The REQP-1840 of round thirty is gone; the other
+warnings are the earlier kinds (DPIP/DPOP and SYNTH-10 wide multipliers,
+now also on the new 32-bit products, which meet timing). The cycle model got a
+section that does not count cycles (a stub's own bookkeeping) and a
+report of block idle time by the call site that starts the next job.
+
+Model: CPU range and parameters 14.0 → 0.8 Mcycles; the frame gains only
+0.9 Mcycles (71.4 → 70.5, **about 1.35 s**), because the CPU did most of
+this work while the GEMM ran. The block now waits mostly for the token
+embedding, the LayerNorm statistics, the gaps between requantisation
+chunks and the attention's softmax on the CPU.
 
 ## 7. What is left, in order of expected gain
 

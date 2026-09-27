@@ -150,6 +150,31 @@
           desc: "LERP job (not requant, not gather): N_ROWS = 2 rows of K_LEN int16 are loaded as an A tile (A_ADDR, A_STRIDE); word j of the output at C_ADDR + 4j is, per int16 lane, t + (((b - t) * w) >> 8) (arithmetic) with t from row 0, b from row 1 and w = ADD_MULT_X[8:0]. No CAPS bit: the driver's self-test finds out whether it exists."
         }
         {
+          bits: 20
+          name: "ln"
+          desc: "LayerNorm job, phase A (not requant, not gather, not lerp; without lnb): the per-token parameter table (3 words per token, P_ADDR, M_LEN = N_ROWS tokens), gamma (K_LEN int32 at W_ADDR) and beta (K_LEN int32 at X_ADDR) are loaded, then the tile: N_ROWS tokens of K_LEN int16 channels (A_ADDR, A_STRIDE). Every element becomes zq = sat14(round(x * mult_t / 2^shift_t) + bias_t) in the tile; per channel c the extremes lo, hi of zq give y = ((z * (gamma_c * LN_ZS)) >> 31) + beta_c at z = lo and z = hi, and LN_YMAX is the largest |y|. Nothing is written. Present when CAPS bit 23 is set."
+        }
+        {
+          bits: 21
+          name: "lnb"
+          desc: "With ln: phase B, which must follow phase A with no other job in between. Per channel G_c = mulh(gamma_c << 12, LN_FM) >> LN_SH.rr and B_c = (mulh(beta_c, LN_INVM) + 2^(LN_SH.bsr - 1)) >> LN_SH.bsr; then out[t][c] = sat14(round(zq * G_c / 2^LN_SH.shift) + B_c), written row by row at C_ADDR + t*C_STRIDE (two channels per word). RQ_AMAX is the largest |out|."
+        }
+        {
+          bits: 22
+          name: "rng"
+          desc: "GEMM job: after draining weight row m (max and min of its accumulators), hv = mulh(max, S_m) + bv_m and lv = mulh(min, S_m) + bv_m with S_m = align(s_m, ES), B_m = align(b_m, EB), bv_m = mulh(B_m, RNG_BETA.m) >> RNG_BETA.sh; RNG_VMAX = max(0, all hv), RNG_VMIN = min(0, all lv). align(x, e) = x.m >> (x.sh - e), 0 or -1 for shifts over 31. Present when CAPS bit 22 is set."
+        }
+        {
+          bits: 23
+          name: "rng_load"
+          desc: "With rng: first load the table: M_LEN {m, sh} pairs at RNG_S_ADDR, and at RNG_B_ADDR (0 = no bias), aligned to RNG_E; and start RNG_VMAX, RNG_VMIN from 0."
+        }
+        {
+          bits: 24
+          name: "dpar"
+          desc: "Requantisation job: the parameters of chunk row i are derived from table row DP_M0 + i instead of read from P_ADDR: mult = mulh(S, DP_FK) >> DP_SH.r, shift = DP_SH.shift, bias = (mulh(B, DP_GB) + 2^(DP_SH.k - 1)) >> DP_SH.k, or 0 with DP_SH.nobias."
+        }
+        {
           bits: 2
           name: "gather"
           desc: "GEMM job only: 1 - the A tile is gathered from an NHWC int16 image as im2col would lay it out (G_ADDR, G_GEOM, G_CHAN, G_CONV, G_START), instead of read from A_ADDR. K_LEN must equal kpos_count * C. C must be even."
@@ -551,6 +576,278 @@
       desc: "Requantisation job with CTRL.lut_load: byte address of the lookup table, 8192 words. 4-byte aligned."
       swaccess: rw
       hwaccess: hro
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: ln_zs
+      desc: "LayerNorm phase A: ZS, the scale of zq times 2^32 (unsigned, below 2^25)."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: ln_fm
+      desc: "LayerNorm phase B: the multiplier F.m of the channel multipliers."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: ln_invm
+      desc: "LayerNorm phase B: the multiplier inv.m of the channel biases."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: ln_sh
+      desc: "LayerNorm phase B: shift (bits 5:0), rr (bits 12:8), bsr (bits 20:16, 1..30)."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: ln_ymax_lo
+      desc: "LayerNorm phase A: largest |y|, bits 31:0."
+      swaccess: ro
+      hwaccess: hwo
+      hwext: "true"
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: ln_ymax_hi
+      desc: "LayerNorm phase A: largest |y|, bits 63:32."
+      swaccess: ro
+      hwaccess: hwo
+      hwext: "true"
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: rng_s_addr
+      desc: "CTRL.rng_load: the scales, M_LEN {m, sh} int32 pairs."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: rng_b_addr
+      desc: "CTRL.rng_load: the biases, M_LEN {m, sh} int32 pairs; 0 = no bias."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: rng_e
+      desc: "CTRL.rng_load: ES (bits 15:0) and EB (bits 31:16), signed."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: rng_beta_m
+      desc: "CTRL.rng: the bias factor's multiplier."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: rng_beta_sh
+      desc: "CTRL.rng: the bias factor's shift (bits 4:0)."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: dp_fk
+      desc: "CTRL.dpar: the multiplier factor FK."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: dp_gb
+      desc: "CTRL.dpar: the bias factor GB."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: dp_sh
+      desc: "CTRL.dpar: shift (bits 5:0), r (bits 12:8), k (bits 20:16, 1..31), nobias (bit 24)."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: dp_m0
+      desc: "CTRL.dpar: the table row of the chunk's first row."
+      swaccess: rw
+      hwaccess: hro
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: rng_vmax_lo
+      desc: "CTRL.rng: RNG_VMAX bits 31:0."
+      swaccess: ro
+      hwaccess: hwo
+      hwext: "true"
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: rng_vmax_hi
+      desc: "CTRL.rng: RNG_VMAX bits 63:32."
+      swaccess: ro
+      hwaccess: hwo
+      hwext: "true"
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: rng_vmin_lo
+      desc: "CTRL.rng: RNG_VMIN bits 31:0."
+      swaccess: ro
+      hwaccess: hwo
+      hwext: "true"
+      fields:
+      [
+        {
+          bits: 31:0
+          name: "val"
+          desc: ""
+        }
+      ]
+    }
+    {
+      name: rng_vmin_hi
+      desc: "CTRL.rng: RNG_VMIN bits 63:32."
+      swaccess: ro
+      hwaccess: hwo
+      hwext: "true"
       fields:
       [
         {

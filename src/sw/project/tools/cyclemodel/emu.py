@@ -25,7 +25,9 @@ Usage (Unicorn and pyelftools: pip install unicorn pyelftools):
 
 Harness protocol: a write to 0x10000000 marks a phase; reads of
 0x10000004/8 return the cycle counter (dav2_cycles); writes to
-0x1000000c/10 report a counter id and value; 0x10000014 an output hash.
+0x1000000c/10 report a counter id and value; 0x10000014 an output hash;
+0x10000018 adds cycles; 0x1000001c = 1 / 0 starts / ends a section whose
+cycles are not counted (a stub's own bookkeeping).
 """
 import sys
 from unicorn import Uc, UC_ARCH_RISCV, UC_MODE_RISCV32, UC_HOOK_CODE, UC_HOOK_MEM_READ, UC_HOOK_MEM_WRITE
@@ -71,6 +73,9 @@ def run(elf_path, limit=4_000_000_000, profile_phase=-1, files=()):
     def mmio_write(uc, off, size, value, ud):
         if off == 24:
             st["cyc"] += value                  # a stubbed job's estimated time
+        if off == 28:                           # 1: a free section starts, 0: it ends
+            if value: st["free"] = st["cyc"]
+            else:     st["cyc"] = st["free"]
         if off == 20:
             print("output hash %08x" % value)
         if off == 12:
@@ -188,8 +193,12 @@ if __name__ == "__main__":
                 "att prep v", "att softmax", "att normalise", "att wait", "gelu table"]
         kn = ["GEMM (encoder)", "GEMM (convolutions)", "GEMM (attention)", "requant",
               "requant + add", "requant int16 in", "requant context", "requant exp", "lerp",
-              "transpose"]
+              "transpose", "layernorm"]
+        by_site = {}
         for d, v in sub:
+            if d >= 0x1000:                     # block idle by the job's call site
+                by_site[d] = by_site.get(d, 0) + v
+                continue
             if d >= 300:
                 print("  block idle before %-17s %8.1f Mcycles" % (kn[d - 300], v / 1e6))
             elif d >= 200:
@@ -198,6 +207,19 @@ if __name__ == "__main__":
                 print("  accelerator %-20s %8.1f Mcycles busy" % (kn[d - 100], v / 1e6))
             else:
                 print("  %-14s %8.1f Mcycles" % (pn[d], v / 1e6))
+        if by_site and os.environ.get("IDLE_SITES"):
+            import subprocess, shutil, glob
+            a2l = shutil.which("riscv-none-elf-addr2line") or sorted(glob.glob(
+                os.path.expanduser("~/Public/xpack-riscv-none-elf-gcc-*/bin/riscv-none-elf-addr2line")))[-1]
+            top = sorted(by_site.items(), key=lambda kv: -kv[1])[:int(os.environ["IDLE_SITES"])]
+            out = subprocess.run([a2l, "-f", "-i", "-e", sys.argv[1]] + ["%x" % (a - 2) for a, _ in top],
+                                 capture_output=True, text=True).stdout.split("\n")
+            print("block idle by the call site that started the next job:")
+            k = 0
+            for a, v in top:
+                # addr2line -i prints the inline chain; its last pair is the outer function
+                print("  %8.2f Mcycles  %s" % (v / 1e6, " / ".join(out[k:k + 2])))
+                k += 2
         if ph >= 0:
             line_profile(sys.argv[1], run.prof, 30)
         sys.exit(0)

@@ -251,6 +251,29 @@ upsamplings. The
 driver uses them only when the bit is set and its boot self-test passes;
 otherwise the same arithmetic runs on the CPU.
 
+The **LayerNorm job** (**`CTRL.ln`**, CAPS bit 23) has two phases. Phase
+A loads the per-token parameters, gamma and beta (four LUT RAMs, even and
+odd channels) and the tile, with the tokens as tile rows. It turns every
+element into zq = sat14(round(x · mult_t / 2^shift_t) + bias_t) in place,
+two channels per cycle, and a small unit computes each channel's range of
+y = zq · gamma · zs + beta from the channel's extremes; `LN_YMAX` keeps the
+largest |y|. The CPU derives the output scale from it. Phase B
+(**`CTRL.lnb`**) makes each channel's multiplier and bias from gamma and
+beta and writes out[t][c] row by row. This is the arithmetic of the two
+earlier int16-input jobs and the CPU pass between them, so the result is
+the same.
+
+The **range unit** (**`CTRL.rng`**, CAPS bit 22) computes a GEMM's output
+range in the block. The operation's first job loads a table: each weight
+row's scale and bias mantissa, aligned to common exponents (two LUT RAMs
+of 2048 rows). After each row's drain, three multipliers turn the row's
+accumulator extremes into its range, and `RNG_VMAX`/`RNG_VMIN` keep the
+extremes over all rows and tiles. With **`CTRL.dpar`** a requantisation
+job derives its parameters from the same table (one row per cycle)
+instead of reading them. The row extremes that the residual add and the
+column extremes need go through a small requantisation of their own, a
+2-column matrix, with the same derived parameters.
+
 The add needs the output scale of *h* before any *h* exists. Per row,
 requantisation is non-decreasing in the accumulator, so the row's largest
 |h| is reached at its largest or smallest accumulator, which the drain

@@ -11,6 +11,8 @@
 # FRAME_FLAGS=-DLERP_C=0 models the block without the LERP job (round twenty-six).
 # FRAME_FLAGS=-DATTCR_C=0 models the attention's S and C in DDR3 (round twenty-seven).
 # FRAME_FLAGS=-DTP_C=0 models v^T made by the CPU (round twenty-eight).
+# FRAME_FLAGS=-DLN_C=0 models the block without the LayerNorm job (round twenty-nine).
+# FRAME_FLAGS=-DRNG_C=0 models the block without the range unit and CTRL.dpar (round thirty).
 HERE=$(cd "$(dirname "$0")" && pwd)
 SRC=${1:-$HERE/../..}
 GCC=$(command -v riscv-none-elf-gcc || ls ~/Public/xpack-riscv-none-elf-gcc-*/bin/riscv-none-elf-gcc | tail -1)

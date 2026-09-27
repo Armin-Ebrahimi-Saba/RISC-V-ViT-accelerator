@@ -137,6 +137,14 @@ typedef struct {
     /* with lut: the table is the 257-point interpolating one (CTRL.lutint,
      * 256 words, word i = {L[i+1], L[i]}); see dav2_accel_lutint_ok */
     int            lut_int;
+    /* CTRL.dpar: the parameters of row m (m0 + i of the chunk) are derived
+     * from the range table the last GEMM loaded (dav2_accel_rng_next):
+     * mult = mulh(S_m, dp_fk) >> dp_r, shift = dp_shift, bias =
+     * (mulh(B_m, dp_gb) + 2^(dp_k-1)) >> dp_k, or 0 with dp_nob; the
+     * parameter array is not read */
+    int            dpar;
+    int32_t        dp_fk, dp_gb;
+    int            dp_shift, dp_r, dp_k, dp_nob;
 } dav2_rq_epi_t;
 /* A GEMM whose int32 result stays in the block's result RAM (CTRL.onchip,
  * CAPS bit 28): N <= CAPS.NROWS, N*M <= DAV2_ACCEL_CR_WORDS. Only the row
@@ -206,6 +214,41 @@ int dav2_accel_requant_stride_cr_async(uint32_t cr_base, int N, int M, const int
  * Left running (dav2_accel_finish); 0 when declined. */
 int dav2_accel_transpose16_async(const int16_t *in, uint32_t in_pitch, int N, int M,
                                  int16_t *out, int out_stride);
+/* The LayerNorm job (CTRL.ln, CAPS bit 23), in two phases that must run
+ * one right after the other. Phase A: N tokens (N <= CAPS.NROWS) of C
+ * int16 channels (C even, <= KMAX) at x, rows x_pitch bytes apart; per
+ * token {mult, shift, bias} in tokpar; gamma g and beta b, C int32 each.
+ * zq = sat14(round(x mult / 2^shift) + bias) stays in the block; ymax is
+ * the largest |((z (g_c zs)) >> 31) + b_c| over each channel's extremes
+ * z of zq (zs < 2^25). Phase B: G_c = mulh(g_c << 12, fm) >> rr,
+ * B_c = (mulh(b_c, invm) + 2^(bsr-1)) >> bsr, out[t][c] = sat14(round(zq
+ * G_c / 2^shift) + B_c), rows out_pitch bytes apart; amax the largest
+ * |out|. Both wait for the job; 0 when declined or failed (then nothing
+ * of the output may be used). */
+int dav2_accel_ln_ok(void);
+/* The range unit (CTRL.rng, CAPS bit 22). Armed for the next GEMM
+ * operation (dav2_accel_qgemm_async, _onchip_async, dav2_accel_conv_async,
+ * _onchip_async); its first job loads the table: per weight row the
+ * scale s and the bias b as {m, sh} pairs, aligned to the exponents es,
+ * eb (align(x, e) = x.m >> (x.sh - e)); every row's accumulator extremes
+ * then give hv = mulh(max, S) + bv, lv = mulh(min, S) + bv with
+ * bv = mulh(B, beta_m) >> beta_sh. dav2_accel_rng_get, after the
+ * operation has finished: vmax = max(0, all hv), vmin = min(0, all lv);
+ * 0 when the operation did not run with the range unit (declined, M over
+ * 2048, a split convolution). */
+typedef struct {
+    const dav2_xf_t *s, *b;         /* b may be NULL */
+    int              es, eb;
+    int32_t          beta_m;
+    int              beta_sh;       /* 0..31 */
+} dav2_accel_rng_t;
+int  dav2_accel_rng_ok(void);
+void dav2_accel_rng_next(const dav2_accel_rng_t *r);
+int  dav2_accel_rng_get(int64_t *vmax, int64_t *vmin);
+int dav2_accel_ln_a(const int16_t *x, uint32_t x_pitch, int N, int C, const int32_t *tokpar,
+                    const int32_t *g, const int32_t *b, uint32_t zs, uint64_t *ymax);
+int dav2_accel_ln_b(int N, int C, int16_t *out, uint32_t out_pitch, int32_t fm, int32_t invm,
+                    int shift, int rr, int bsr, int32_t *amax);
 int dav2_accel_lerp_async(const int16_t *t, uint32_t row_stride, int16_t *out, int n, int w);
 /* dav2_accel_requant with output rows out_stride int16 apart (instead of
  * M): writes into a slice of a wider tensor. */
